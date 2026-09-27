@@ -166,7 +166,7 @@ graph TD
 | 28 | u32 | info_slices | metadata slices at the arena start. The page walk begins after them. |
 | 32 | u32 | numa_node | `arena->numa_node` (i32, `-1` = any) |
 | 36 | u8, u8, u8[2] | pinned, exclusive, pad | `memid.is_pinned`, `is_exclusive` |
-| 40 | bitmap ×3 | committed, free, purge | `slices_committed`, `slices_free` (a `mi_bbitmap_t`), `slices_purge` |
+| 40 | bitmap ×3 | committed, free, purge | `slices_committed`, `slices_free` (a `mi_bbitmap_t`), `slices_purge`: the long-window queue only; since #506 the short-window `slices_purge_short` and both `_aged` bitmaps are not written, so "purge" undercounts slices queued from small and medium pages |
 
 A **bitmap** is `u32 chunk_count | u32 chunk_bytes | chunk_count × chunk_bytes bytes`.
 `chunk_bytes` is `MI_BCHUNK_SIZE` in bytes, which is 64 (512 bits) on 64-bit. A
