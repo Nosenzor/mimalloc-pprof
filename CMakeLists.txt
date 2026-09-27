@@ -1196,6 +1196,28 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-profile-race-scavenger COMMAND mimalloc-test-profile-race)
     set_tests_properties(test-profile-race-scavenger PROPERTIES TIMEOUT 300
                          ENVIRONMENT "MIMALLOC_PURGE_DELAY=1;MIMALLOC_SCAVENGER=1")
+
+    # Sampled blocks that die with their heap (mi_heap_destroy, mi_subproc_destroy) must take
+    # their records with them; mi_heap_delete must keep them. The accum variant covers
+    # `_mi_prof_stack_release`'s keep-until-reset branch. The TIMEOUT turns a regression of
+    # the lock-owner path (a destroy inside mi_prof_visit) from a hang into a prompt failure.
+    add_executable(mimalloc-test-profile-heap-destroy test/test-profile-heap-destroy.c)
+    target_compile_definitions(mimalloc-test-profile-heap-destroy PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-profile-heap-destroy PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-profile-heap-destroy PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-profile-heap-destroy PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-profile-heap-destroy PRIVATE mimalloc ${mi_libraries})
+    endif()
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-profile-heap-destroy PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-profile-heap-destroy COMMAND mimalloc-test-profile-heap-destroy)
+    add_test(NAME test-profile-heap-destroy-accum COMMAND mimalloc-test-profile-heap-destroy)
+    set_tests_properties(test-profile-heap-destroy PROPERTIES TIMEOUT 120)
+    set_tests_properties(test-profile-heap-destroy-accum PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_PROF_ACCUM=1")
   endif()
 
   # Memory + counter regression gate (issue #63). Emits JSON for CI baseline
