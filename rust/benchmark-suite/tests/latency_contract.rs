@@ -135,7 +135,7 @@ fn diagnostic_sample(
         control.scheduling.thread_count = count;
         control.scheduling.physical_cores = 8;
         control.scheduling.logical_cores = 8;
-        control.scheduling.affinity_policy = "linux:unrestricted".into();
+        control.scheduling.affinity_policy = "unrestricted".into();
         control.scheduling.actual_cpu_ids = vec![Some(0); count as usize];
     }
     LatencyDiagnosticSample {
@@ -301,8 +301,8 @@ fn exact_128k_one_and_eight_worker_cells_are_opt_in() {
             logical_cores: 8,
             target: "x86_64-unknown-linux-gnu".into(),
             transparent_hugepage: "[madvise] always never".into(),
-            affinity_policy: "linux:unrestricted".into(),
-            affinity_logical_cpu_ids: (0..8).collect(),
+            affinity_policy: "unrestricted".into(),
+            affinity_logical_cpu_ids: Vec::new(),
             isolation_claim: LATENCY_DIAGNOSTIC_ISOLATION_CLAIM.into(),
         },
         old_fork: LatencyDiagnosticSource {
@@ -323,7 +323,7 @@ fn exact_128k_one_and_eight_worker_cells_are_opt_in() {
     let mut oversubscribed = run.clone();
     oversubscribed.host.physical_cores = 2;
     oversubscribed.host.logical_cores = 4;
-    oversubscribed.host.affinity_logical_cpu_ids = (0..4).collect();
+    oversubscribed.host.affinity_logical_cpu_ids = Vec::new();
     for row in &mut oversubscribed.samples {
         for response in [&mut row.sample.measured, &mut row.sample.control] {
             response.scheduling.physical_cores = 2;
@@ -331,6 +331,10 @@ fn exact_128k_one_and_eight_worker_cells_are_opt_in() {
         }
     }
     validate_latency_diagnostic_run(&oversubscribed, 2).unwrap();
+
+    let mut pinned_without_cpus = oversubscribed.clone();
+    pinned_without_cpus.host.affinity_policy = "pinned".into();
+    assert!(validate_latency_diagnostic_run(&pinned_without_cpus, 2).is_err());
 
     let mut impossible_topology = oversubscribed;
     impossible_topology.host.logical_cores = 0;

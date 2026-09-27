@@ -521,8 +521,10 @@ pub fn validate_latency_diagnostic_run(
         || run.host.physical_cores > run.host.logical_cores
         || run.host.target.trim().is_empty()
         || run.host.transparent_hugepage.trim().is_empty()
-        || run.host.affinity_policy.trim().is_empty()
-        || run.host.affinity_logical_cpu_ids.is_empty()
+        || !matches!(run.host.affinity_policy.as_str(), "unrestricted" | "pinned")
+        || (run.host.affinity_policy == "unrestricted"
+            && !run.host.affinity_logical_cpu_ids.is_empty())
+        || (run.host.affinity_policy == "pinned" && run.host.affinity_logical_cpu_ids.is_empty())
         || run.host.isolation_claim != LATENCY_DIAGNOSTIC_ISOLATION_CLAIM
         || run.old_fork.source_sha == run.candidate.source_sha
         || !is_lower_hex(&run.old_fork.source_sha, 40)

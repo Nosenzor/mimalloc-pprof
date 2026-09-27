@@ -178,7 +178,8 @@ class TailLatencyEffect:
 @dataclass(frozen=True)
 class CombinedAssessment:
     decision: str
-    latency_tail_regression: bool
+    latency_tail_regression: bool | None
+    latency_control_valid: bool
     tail_effects: tuple[TailLatencyEffect, ...]
     span_cpu_direction: str
     span_rss_direction: str
@@ -360,7 +361,6 @@ def _parse_allocator_summary(value: object, label: str) -> AllocatorSummary:
         control=_parse_distribution(raw.get("control"), f"{label} control"),
         overhead_valid=cast(bool, valid),
     )
-    _require(result.overhead_valid, f"{label} measured/control overhead is invalid")
     _require(
         result.measured.count == result.control.count,
         f"{label} measured/control observation counts differ",
@@ -577,10 +577,6 @@ def _linked_cells(span: span_model.RawRun, latency: LatencyRaw) -> tuple[LinkedC
             f"trace-checksum mismatch for {workload_id}",
         )
         _require(cell.thread_point == str(workers), f"thread-point mismatch for {workload_id}")
-        _require(
-            cell.old_fork.overhead_valid and cell.candidate.overhead_valid,
-            f"measured/control overhead invalid for {workload_id}",
-        )
         blocks = cell.paired_summaries[0].summary.block_count
         _require(
             all(item.summary.block_count == blocks for item in cell.paired_summaries),
@@ -680,14 +676,22 @@ def _linked_cells(span: span_model.RawRun, latency: LatencyRaw) -> tuple[LinkedC
                 candidate=cell.candidate,
                 paired_summaries=cell.paired_summaries,
                 sample_coverage=tuple(coverage),
-                assessment=_combined_assessment(span, identity, cell.paired_summaries),
+                assessment=_combined_assessment(
+                    span,
+                    identity,
+                    cell.paired_summaries,
+                    cell.old_fork.overhead_valid and cell.candidate.overhead_valid,
+                ),
             )
         )
     return tuple(links)
 
 
 def _combined_assessment(
-    raw: span_model.RawRun, identity: SpanIdentity, latency: tuple[QuantileSummary, ...]
+    raw: span_model.RawRun,
+    identity: SpanIdentity,
+    latency: tuple[QuantileSummary, ...],
+    latency_control_valid: bool,
 ) -> CombinedAssessment:
     report = span_model.summarize(raw)
     span_cell = next(item for item in report.cells if item.name == identity.cell_name)
@@ -696,8 +700,10 @@ def _combined_assessment(
     p50 = next(item for item in latency if item.quantile == "p50")
     p95 = next(item for item in latency if item.quantile == "p95")
     p99 = next(item for item in latency if item.quantile == "p99")
-    tail_regression = (
-        p95.summary.confidence_interval.upper < 1.0 or p99.summary.confidence_interval.upper < 1.0
+    tail_regression: bool | None = (
+        (p95.summary.confidence_interval.upper < 1.0 or p99.summary.confidence_interval.upper < 1.0)
+        if latency_control_valid
+        else None
     )
     decision = "REGRESSION" if tail_regression else span_cell.assessment
     tail_effects = tuple(
@@ -712,6 +718,7 @@ def _combined_assessment(
     return CombinedAssessment(
         decision=decision,
         latency_tail_regression=tail_regression,
+        latency_control_valid=latency_control_valid,
         tail_effects=tail_effects,
         span_cpu_direction=cpu.direction,
         span_rss_direction=rss.direction,
@@ -722,7 +729,8 @@ def _combined_assessment(
         metric_scope_note=(
             "Latency is paired per-operation timing; CPU/op and peak RSS are #543 process/work "
             "metrics. Scopes remain separate. A confident p95 or p99 latency increase is a "
-            "regression even when span RSS improves."
+            "regression even when span RSS improves, but latency is excluded from the "
+            "decision when either arm exceeds the control-overhead limit."
         ),
     )
 
@@ -732,7 +740,12 @@ def render_linked_summary(linked: LinkedArtifact) -> str:
         "#543 matched latency + process diagnostic",
         f"baseline SHA: {linked.baseline_sha}",
         f"candidate SHA: {linked.candidate_sha}",
-        f"acceptance eligible: {'yes' if linked.acceptance_eligible else 'no (smoke/context only)'}",
+        "acceptance eligible: "
+        + (
+            "yes"
+            if linked.acceptance_eligible
+            else "no (host identity/isolation or latency control limit)"
+        ),
         f"host identity: {linked.host_match.identity_limitation}",
         "Metric scopes: latency is paired per-operation timing; CPU/op and peak RSS are #543 "
         "process/work metrics. These are separate measurements, not a merged metric.",
@@ -768,6 +781,13 @@ def render_linked_summary(linked: LinkedArtifact) -> str:
                 f"(overhead_valid={cell.old_fork.overhead_valid}); candidate "
                 f"{cell.candidate.control.p50_ns:.4g} ns "
                 f"(overhead_valid={cell.candidate.overhead_valid})",
+                "  latency interpretation: "
+                + (
+                    "eligible for the combined assessment"
+                    if assessment.latency_control_valid
+                    else "unavailable: control overhead exceeded the protocol limit; "
+                    "tail effect estimates are descriptive only"
+                ),
                 "  raw timed sample coverage: "
                 f"old-fork {old_coverage.sample_count} samples/{old_coverage.measured_observations} "
                 f"measured observations/{old_coverage.control_observations} control observations; "
@@ -828,7 +848,14 @@ def link_artifacts(span_path: Path, latency_path: Path) -> LinkedArtifact:
             "Latency and process CPU remain separate metrics with separate timing boundaries; "
             "scopes remain separate and are not a merged measurement."
         ),
-        acceptance_eligible=host.identity_comparable and span.host.isolation == "isolated",
+        acceptance_eligible=(
+            host.identity_comparable
+            and span.host.isolation == "isolated"
+            and all(
+                cell.old_fork.overhead_valid and cell.candidate.overhead_valid
+                for cell in latency.cells
+            )
+        ),
         cells=cells,
     )
 
