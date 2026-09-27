@@ -322,6 +322,24 @@ terms of the MIT license. A copy of the license can be found in the file
 #define MI_ARENA_PURGE_MULT_DEFAULT       (4)
 #endif
 
+// #506: ... but only a freed range of MORE than this many slices (a large or singleton page) gets
+// that long window. A range of at most this many (default: a small or medium page, 1 or 8 slices)
+// keeps the short one of one to two `purge_delay`s, as before #486: a server workload (larson:
+// 8-1000 B blocks freed by other threads) churns small pages through the arena, and holding each
+// one four times longer raised its peak RSS 10-30% over Bun's mimalloc, while #486's refaults were
+// all large ones (the bursty row). 0 gives every range the long window (the #486 behaviour).
+#ifndef MI_ARENA_RETAIN_SHORT_MAX_SLICES
+#define MI_ARENA_RETAIN_SHORT_MAX_SLICES  (MI_MEDIUM_PAGE_SIZE / MI_ARENA_SLICE_SIZE)
+#endif
+// #506: ... and so does the singleton page a growing realloc moved its block out of
+// (`_mi_realloc_free_old`): a Vec that doubles never asks for the size it outgrew, and holding
+// each outgrown buffer for the long window kept a growing buffer's peak at three times its size
+// instead of two (+10-18% peak RSS on perf-ab's larson rows, whose per-table log grows so). 0 gives
+// the outgrown buffer the long window (the #486 behaviour).
+#ifndef MI_REALLOC_RETAIN_SHORT
+#define MI_REALLOC_RETAIN_SHORT           (1)
+#endif
+
 // #493 (strategy 9): a new page first tries to claim free slices that are still resident (queued
 // for purge, see above) before the plain free-slice search, which knows nothing of residency and
 // would often fault in fresh or purged memory instead. At most this many queued runs long enough
@@ -330,6 +348,70 @@ terms of the MIT license. A copy of the license can be found in the file
 // mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
 #ifndef MI_RESIDENT_FIRST_MAX_TRIES
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
+#endif
+
+// #517: resident-first (#493) is only tried for claims of at least this many slices (default 16
+// = 1 MiB with 64 KiB slices: large and singleton pages). A small or medium page taking the first
+// queued run that fits bypasses the size-binned chunk layout of the plain search, so other size
+// classes' reusable runs are consumed and those classes spill into fresh chunks: the memory gate
+// peak rose 58.2 -> 61-63.7 MB (#514). Measured: >=16 restores 58.3 MB; #501's short-lived-thread
+// win comes from 4 MiB large pages (64 slices), which stay covered.
+#ifndef MI_RESIDENT_FIRST_MIN_SLICES
+#define MI_RESIDENT_FIRST_MIN_SLICES      (16)
+#endif
+
+// #532: a large page (blocks of ~84-512 KiB) is sized from what its size class ("bin") demands on
+// the theap that creates it, not fixed at MI_LARGE_PAGE_SIZE (src/large-span.c). Every thread used
+// to hold one 4 MiB page per large bin it touched, 98-99% of it never formed (#529, E4): about
+// 44 MiB per worker whatever its live bytes. A bin's page starts at a compact span; the span grows
+// geometrically up to MI_LARGE_PAGE_SIZE while that theap keeps filling the bin's pages, and decays
+// again when it stops. The accounting is per theap and per bin, kept in slow paths only (page full,
+// page creation); no thread count and no clock go into it. Compile-time opt-out: MI_LARGE_SPAN=0;
+// run-time: `mi_option_large_span` (MIMALLOC_LARGE_SPAN=0). Both give every large page 4 MiB.
+#ifndef MI_LARGE_SPAN
+#define MI_LARGE_SPAN                     (MI_ENABLE_LARGE_PAGES)
+#endif
+// the span of a bin's page before the theap has shown any demand beyond one page: 16 slices is
+// 1 MiB with 64 KiB slices (= MI_RESIDENT_FIRST_MIN_SLICES, so resident-first still applies), which
+// two blocks of every large bin fit in (see MI_LARGE_SPAN_MIN_BLOCKS)
+#ifndef MI_LARGE_SPAN_COMPACT_SLICES
+#define MI_LARGE_SPAN_COMPACT_SLICES      (16)
+#endif
+// each demand step multiplies the span by 2^MI_LARGE_SPAN_GROW_SHIFT (1: 1 -> 2 -> 4 MiB)
+#ifndef MI_LARGE_SPAN_GROW_SHIFT
+#define MI_LARGE_SPAN_GROW_SHIFT          (1)
+#endif
+// A page request comes when a bin has no page with a free block left on the theap. It is "full"
+// when a page of the bin filled up since the previous request (demand beyond what the theap holds)
+// and "quiet" otherwise (the bin's last page emptied and went away). The bin keeps a pressure
+// count, +1 per full and -1 per quiet request: the span steps up once it reaches
+// MI_LARGE_SPAN_GROW_REQUESTS and down once it reaches -MI_LARGE_SPAN_DECAY_REQUESTS. So a bin
+// that keeps filling its pages grows (every second request), while a single overflow -- one more
+// live block than a compact page holds, once -- does not (#532: on perf-ab's large-class rows the
+// top bins, two blocks per compact page, grew to 4 MiB on every such blip). At most 7 and 8.
+#ifndef MI_LARGE_SPAN_GROW_REQUESTS
+#define MI_LARGE_SPAN_GROW_REQUESTS       (2)
+#endif
+#ifndef MI_LARGE_SPAN_DECAY_REQUESTS
+#define MI_LARGE_SPAN_DECAY_REQUESTS      (4)
+#endif
+// a span always holds at least this many blocks, even when the page meta and a guard page sit in
+// it (an OS-allocated fallback page, MI_SECURE>=5): a page with one block would be a singleton
+#ifndef MI_LARGE_SPAN_MIN_BLOCKS
+#define MI_LARGE_SPAN_MIN_BLOCKS          (2)
+#endif
+// capacity of the per-theap table (the large bins: 11 with 64 KiB slices, fewer on 32-bit); a bin
+// past it just gets MI_LARGE_PAGE_SIZE
+#define MI_LARGE_SPAN_BINS                (16)
+
+#if MI_LARGE_SPAN
+// The demand accounting of one large bin on one theap (src/large-span.c), packed in one byte:
+// bits 0-2 the level (the span is MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT),
+// capped at MI_LARGE_PAGE_SIZE), bit 3 "a page of the bin filled up since the last page request",
+// bits 4-7 the pressure count, 4-bit two's complement (see MI_LARGE_SPAN_GROW_REQUESTS; 0 = none). One byte because
+// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes
+// keep it there, 64 would not.
+typedef uint8_t mi_large_span_bin_t;
 #endif
 
 
@@ -730,6 +812,9 @@ struct mi_theap_s {
   mi_page_queue_t       pages[MI_BIN_COUNT];                 // queue of pages for each size class (or "bin")
   mi_memid_t            memid;                               // provenance of the theap struct itself (meta or os)
   mi_stats_t            stats;                               // thread-local statistics
+  #if MI_LARGE_SPAN
+  mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
+  #endif
 };
 
 
@@ -1008,7 +1093,8 @@ typedef struct mi_arena_s {
   bool                is_exclusive;         // only allow allocations if specifically for this arena
   bool                is_auto_reserved;     // created by mi_arena_reserve, not a public reserve/manage API
   mi_decl_align(8)                          // needed on some 32-bit platforms
-  _Atomic(mi_msecs_t) purge_expire;         // expiration time when slices can be purged from `slices_purge`.
+  _Atomic(mi_msecs_t) purge_expire;         // the next purge pass: every `purge_delay` while anything is queued for purge
+  _Atomic(mi_msecs_t) purge_long_expire;    // #506: the deadline of the long-window queue (`slices_purge` / `_aged`), `arena_purge_mult` x `purge_delay` apart
   mi_commit_fun_t*    commit_fun;           // custom commit/decommit memory
   void*               commit_fun_arg;       // user argument for a custom commit function
 
@@ -1018,8 +1104,10 @@ typedef struct mi_arena_s {
   mi_bbitmap_t*       slices_free;          // is the slice free? (a binned bitmap with size classes)
   mi_bitmap_t*        slices_committed;     // is the slice committed? (i.e. accessible)
   mi_bitmap_t*        slices_dirty;         // is the slice potentially non-zero?
-  mi_bitmap_t*        slices_purge;         // slices that can be purged
+  mi_bitmap_t*        slices_purge;         // slices that can be purged (long window: large and singleton pages, #486)
   mi_bitmap_t*        slices_purge_aged;    // #457: ... and were already queued at the previous purge deadline
+  mi_bitmap_t*        slices_purge_short;   // #506: slices that can be purged (short window: small and medium pages, outgrown realloc buffers)
+  mi_bitmap_t*        slices_purge_short_aged; // #506: ... and were already queued at the previous purge pass
   mi_page_t*          pages_meta;           // pre-allocated `slice_count` page meta info -- only used if `MI_PAGE_META_IS_SEPARATED!=0`
   mi_arena_pages_t    pages_main;           // arena page bitmaps for the main heap are allocated up front as well
 

@@ -90,6 +90,7 @@ set(mi_sources
     src/alloc-posix.c
     src/arena.c
     src/arena-reclaim.c
+    src/arena-layout.c
     src/bitmap.c
     src/heap.c
     src/heap-dump.c
@@ -103,6 +104,7 @@ set(mi_sources
     src/page.c
     src/page-map.c
     src/page-holes.c
+    src/large-span.c
     src/purge-all.c
     src/profile.c
     src/random.c
@@ -486,7 +488,8 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   set(mi_strict_fork_sources "")
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
-                      src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c)
+                      src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
+                      src/arena-layout.c src/large-span.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()
@@ -851,7 +854,10 @@ if(MI_USE_CXX)
   # target this), and keeps the CMake shape identical to Bun's should this tree's extern "C"
   # wrapping ever change.
   # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c PROPERTIES LANGUAGE CXX )
+  # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
+  # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
+  # test-large-span.c (#532): reads `_mi_ptr_page` / `mi_page_t` from internal.h, the same case.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-large-span.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2074,6 +2080,19 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-arena-retention PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
   endif()
 
+  # test-arena-retention-short (#506): small pages freed by another thread go back within the short
+  # retention window, while a large block freed with them keeps the long one. Scavenger off: only
+  # the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-retention-short test/test-arena-retention-short.c)
+    target_compile_definitions(mimalloc-test-arena-retention-short PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-retention-short PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-retention-short PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-retention-short PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-retention-short COMMAND mimalloc-test-arena-retention-short)
+    set_tests_properties(test-arena-retention-short PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=100;MIMALLOC_SCAVENGER=0")
+  endif()
+
   # test-resident-first (#493, strategy 9): a new page claims free arena slices that are still
   # resident (queued for purge) before purged ones. Single-threaded; the scavenger is off so only
   # the test's collects purge.
@@ -2085,6 +2104,57 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-resident-first PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-resident-first COMMAND mimalloc-test-resident-first)
     set_tests_properties(test-resident-first PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
+  # test-large-span (#532): a large page's span comes from its bin's demand on the theap -- compact
+  # for a lightly used bin, growing to the full 4 MiB for a busy one -- and an abandoned compact page
+  # is reclaimed and validated over its own span. Structural checks only (no RSS, no timing); the
+  # scavenger and the hole sweep are off so no background pass holds an abandoned page meanwhile.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-large-span test/test-large-span.c)
+    target_compile_definitions(mimalloc-test-large-span PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-large-span PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-large-span PRIVATE include)
+    target_link_libraries(mimalloc-test-large-span PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-large-span PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-large-span COMMAND mimalloc-test-large-span)
+    set_tests_properties(test-large-span PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
+  endif()
+
+  # test-resident-first-churn (#517): the memory gate's thread-churn scenario must not claim
+  # never-dirty (fresh) arena slices once warmed up; small/medium claims taking resident-first
+  # runs did (#514). Asserts on the MI_DIAGNOSTICS claim counters, so it needs that build.
+  # (MIMALLOC_PURGE_ZEROES=0: a purge that zeroes a range clears its dirty bits, which would
+  # make its next claim count as fresh.)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN AND MI_DIAGNOSTICS)
+    add_executable(mimalloc-test-resident-first-churn test/test-resident-first-churn.c)
+    target_compile_definitions(mimalloc-test-resident-first-churn PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-resident-first-churn PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-resident-first-churn PRIVATE include)
+    target_link_libraries(mimalloc-test-resident-first-churn PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-resident-first-churn PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-resident-first-churn COMMAND mimalloc-test-resident-first-churn)
+    set_tests_properties(test-resident-first-churn PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
+  endif()
+
+  # test-arena-layout (#519): the arena layout walk behind `mi_purge_holes_report`. Built in
+  # EVERY configuration: with MI_DIAGNOSTICS it checks the walk's exact counts on an exclusive
+  # arena; without it, that the stub zeroes the layout. (MIMALLOC_PURGE_ZEROES=0: a purge that
+  # zeroes a range clears its dirty bits, turning the purged run fresh instead of dirty.)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-layout test/test-arena-layout.c)
+    target_compile_definitions(mimalloc-test-arena-layout PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-layout PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-layout PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-layout PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-layout COMMAND mimalloc-test-arena-layout)
+    set_tests_properties(test-arena-layout PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
   endif()
 
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of

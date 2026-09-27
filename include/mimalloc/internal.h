@@ -443,10 +443,15 @@ void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /
 void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 bool          _mi_arenas_page_reserve(mi_page_t* page, mi_theap_t* current_theap);   // #493: keep an empty large page for the next thread; false: the caller frees it
+void          _mi_realloc_free_old(const mi_page_t* page, void* p, bool grown);        // #506: free the block a moving realloc left behind
 bool          _mi_arenas_release_reserved(mi_heap_t* heap, bool force);             // #493: free the reserved pages past their window (all if `force`); true while one is not
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
 void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);  // Bun parity P10b, #317: frees the on-demand abandoned bitmaps then `arena_pages` itself
+
+// "large-span.c" (#532): demand-sized large-page spans (stubs when MI_LARGE_SPAN=0)
+size_t        _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead);  // the span of the theap's next page of this large bin (a page request)
+void          _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page);             // a page of the theap filled up
 
 // "page-map.c"
 bool          _mi_page_map_init(void);
@@ -1358,6 +1363,21 @@ void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner rese
 void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
 long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
+
+// #517: arena slice claims by kind, counted process-wide in `mi_arena_try_alloc_at` when
+// MI_DIAGNOSTICS=1. `plain_fresh` is a plain-search claim that includes at least one slice that
+// was never dirty (never handed out before); its `_slices` counts only those never-dirty slices.
+typedef struct mi_arena_claim_counters_s {
+  size_t resident_first_claims;
+  size_t resident_first_slices;
+  size_t plain_reused_claims;
+  size_t plain_reused_slices;
+  size_t plain_fresh_claims;
+  size_t plain_fresh_slices;
+} mi_arena_claim_counters_t;
+bool          _mi_arena_claim_counters(mi_arena_claim_counters_t* out);   // false (and *out zeroed) when not compiled in (MI_DIAGNOSTICS=0)
+void          _mi_arena_claim_counters_reset(void);
+
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
@@ -1381,6 +1401,53 @@ void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG 
    with a live block cannot be discarded, and this says how much of that there is and how
    few live blocks are holding it down.
    ------------------------------------------------------ */
+
+/* ------------------------------------------------------
+   Arena layout walk (#519, the rest of #517 item 2; `src/arena-layout.c`)
+
+   Per arena chunk: every data slice classified by the `slices_free` / `slices_dirty` /
+   `slices_purge` / `slices_purge_aged` bitmaps, and the maximal runs of each class inside the
+   chunk, summarised by the chunk's size class (`mi_chunkbin_t`, the bin the `slices_free`
+   bbitmap assigned it) with power-of-two run-length histograms. It is the table that located
+   #514 (small claims spilling into fresh chunks). Read-only, no memory, relaxed bitmap reads
+   only; compiled in with MI_DIAGNOSTICS=1, otherwise the walk zeroes its output and returns false.
+   ------------------------------------------------------ */
+
+typedef enum mi_arena_layout_kind_e {
+  MI_ARENA_LAYOUT_IN_USE,        // not in `slices_free`: a page (or a direct arena allocation) holds it
+  MI_ARENA_LAYOUT_FRESH,         // free and never dirty: costs nothing
+  MI_ARENA_LAYOUT_FREE_DIRTY,    // free, dirty, not queued for purge (purged earlier by reset, or never purgeable)
+  MI_ARENA_LAYOUT_QUEUED,        // free and queued for purge (`slices_purge`): still resident
+  MI_ARENA_LAYOUT_QUEUED_AGED,   // free and queued since the previous purge deadline (`slices_purge_aged`)
+  MI_ARENA_LAYOUT_KIND_COUNT
+} mi_arena_layout_kind_t;
+
+// Run lengths in slices, one power of two per bucket: 1, 2-3, 4-7, ..., up to MI_BCHUNK_BITS
+// (a run never crosses a chunk, so the last bucket holds exactly the whole-chunk runs).
+#define MI_ARENA_LAYOUT_RUN_BUCKETS  (MI_BCHUNK_BITS_SHIFT + 1)
+
+typedef struct mi_arena_layout_class_s {
+  size_t chunks;                                          // chunks in this size class
+  size_t slices[MI_ARENA_LAYOUT_KIND_COUNT];              // data slices of each kind
+  size_t committed_slices[MI_ARENA_LAYOUT_KIND_COUNT];    // of those, in `slices_committed` (address space on POSIX, see below)
+  size_t runs[MI_ARENA_LAYOUT_KIND_COUNT];                // maximal runs of each kind inside a chunk
+  size_t max_run[MI_ARENA_LAYOUT_KIND_COUNT];             // the longest such run, in slices
+  size_t run_hist[MI_ARENA_LAYOUT_KIND_COUNT][MI_ARENA_LAYOUT_RUN_BUCKETS];   // runs by floor(log2(length))
+} mi_arena_layout_class_t;
+
+typedef struct mi_arena_layout_s {
+  size_t arenas;                                  // arenas walked
+  size_t chunks;                                  // chunks walked (all classes)
+  size_t meta_slices;                             // the arenas' own info slices: not classified
+  mi_arena_layout_class_t cls[MI_CBIN_COUNT];     // by the chunk's size class, `mi_chunkbin_t` order
+} mi_arena_layout_t;
+
+// Walk every arena of `subproc` (or only `arena`, when not NULL) into `*out` (zeroed first).
+// Returns false when not compiled in (MI_DIAGNOSTICS=0). The caller must keep the arenas alive:
+// be inside the allocator (as `_mi_purge_holes_report_collect` is) or know no reclaim can run.
+bool          _mi_arena_layout_walk(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_layout_t* out);
+size_t        _mi_arena_layout_bucket(size_t run_slices);   // the `run_hist` bucket of a run length
+void          _mi_arena_layout_print(const mi_arena_layout_t* layout);
 
 #define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
 #define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
@@ -1430,6 +1497,10 @@ typedef struct mi_holes_report_s {
   size_t arena_free_dirty_bytes;     // slices in NO page that were touched at least once: the UPPER bound on arena slack still resident
   size_t arena_purge_pending_bytes;  // slices in NO page, scheduled for purge but not purged yet: definitely still resident (the purge delay)
   size_t arena_meta_bytes;           // the arenas' own bitmaps (`info_slices`) -- ROUGH: excludes the `mi_meta` heaps
+
+  // #519: the arena layout walk -- the slack above, broken down per chunk size class into runs.
+  // All zero unless MI_DIAGNOSTICS=1.
+  mi_arena_layout_t arena_layout;
 } mi_holes_report_t;
 
 size_t        mi_holes_granularity(size_t g);

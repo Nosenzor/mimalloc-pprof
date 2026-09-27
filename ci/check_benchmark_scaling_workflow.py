@@ -25,6 +25,10 @@ from benchmark_report import (
     SCALING_RSS_SCHEMA,
     SCALING_SCHEMA,
     SCALING_THREAD_POINTS,
+    THREAD_CHURN_OFFSETS_MS,
+    THREAD_CHURN_RELEASE_TOLERANCE_BYTES,
+    THREAD_CHURN_SCHEMA,
+    THREAD_CHURN_THREADS,
 )
 from check_benchmark_workflow import check_action_ref
 
@@ -50,6 +54,24 @@ JOBS = {
 MAXIMUM_BUILD_TIMEOUT_MINUTES = 30
 MEASURE_TIMEOUT_MINUTES = 120  # #424: approved single-host measurement envelope.
 EXPECTED_BLOCKS = 3
+# #528: the diagnostic dispatch inputs, and the steps that must stay behind `mode: full`.
+DIAGNOSTIC_INPUTS = (
+    "diagnostic_env",
+    "diagnostic_cppdefs",
+    "diagnostic_patterns",
+    "diagnostic_threads",
+)
+INPUTS = {"mode", "run_seed", "blocks", *DIAGNOSTIC_INPUTS}
+MODES = ["full", "smoke", "diagnostic"]
+FULL_ONLY = "(inputs.mode || 'full') == 'full'"
+FULL_ONLY_STEPS = (
+    "validate and overlay complete scaling report",
+    "render sealed site",
+    "upload validation artifact",
+    "upload site artifact",
+)
+PUBLISH_ELIGIBLE = "needs.assemble.outputs.publish_eligible == 'true'"
+PUBLISH_JOBS = ("publish-branch", "package-pages", "deploy-pages", "publication-audit")
 
 
 class ScalingWorkflowError(RuntimeError):
@@ -98,11 +120,15 @@ def validate(workflow: Mapping[str, object]) -> None:
         fail("workflow.on.schedule: expected daily cron '23 7 * * *' (#208)")
     dispatch = mapping(triggers.get("workflow_dispatch"), "workflow.on.workflow_dispatch")
     inputs = mapping(dispatch.get("inputs"), "workflow.on.workflow_dispatch.inputs")
-    if set(inputs) != {"mode", "run_seed", "blocks"}:
-        fail("workflow dispatch inputs must be exactly mode/run_seed/blocks")
+    if set(inputs) != INPUTS:
+        fail(f"workflow dispatch inputs must be exactly {sorted(INPUTS)}")
     mode = mapping(inputs["mode"], "workflow input mode")
-    if mode.get("options") != ["full", "smoke"] or mode.get("default") != "full":
-        fail("workflow input mode must default to full with full/smoke choices")
+    if mode.get("options") != MODES or mode.get("default") != "full":
+        fail(f"workflow input mode must default to full with {MODES} choices")
+    for name in DIAGNOSTIC_INPUTS:
+        value = mapping(inputs[name], f"workflow input {name}")
+        if value.get("type") != "string" or value.get("default") != "":
+            fail(f"workflow input {name} must be a string defaulting to empty")
     blocks_input = mapping(inputs["blocks"], "workflow input blocks")
     if blocks_input.get("default") != EXPECTED_BLOCKS:
         fail(f"workflow input blocks must default to {EXPECTED_BLOCKS}")
@@ -149,19 +175,12 @@ def validate(workflow: Mapping[str, object]) -> None:
         fail("scaling measurement must execute the prebuilt binary directly")
     if " &" in run or "parallel" in run or "xargs" in run:
         fail("scaling allocators must execute sequentially")
-    for step_name in (
-        "determine run seed",
-        "run sparse scaling sweep",
-        "compute publication eligibility",
-    ):
-        owner = (
-            build_steps
-            if step_name == "determine run seed"
-            else (measure_steps if step_name == "run sparse scaling sweep" else assemble_steps)
-        )
-        step = mapping(owner.get(step_name), step_name)
-        if "${{ inputs." in str(step.get("run", "")):
-            fail(f"{step_name}: workflow inputs must enter shell through env, not source text")
+    # Every step, not a named few: the #528 diagnostic inputs are free text.
+    for job_name, value in jobs.items():
+        for step_name, step in steps_by_name(mapping(value, job_name)).items():
+            if "${{ inputs." in str(step.get("run", "")):
+                fail(f"{step_name}: workflow inputs must enter shell through env, not source text")
+    validate_diagnostic_mode(build, build_steps, measure_steps, assemble_steps)
     seed_step = mapping(build_steps.get("determine run seed"), "determine run seed")
     seed_env = mapping(seed_step.get("env"), "determine run seed.env")
     if "INPUT_RUN_SEED" not in seed_env or "*[!0-9]*" not in str(seed_step.get("run", "")):
@@ -211,9 +230,22 @@ def validate(workflow: Mapping[str, object]) -> None:
     eligibility_run = eligibility.get("run")
     if not isinstance(eligibility_run, str):
         fail("eligibility step needs a shell policy")
-    for required in ("refs/heads/main", "full", f"-eq {EXPECTED_BLOCKS}"):
+    for required in ("refs/heads/main", '[ "$SCALING_MODE" = "full" ]', f"-eq {EXPECTED_BLOCKS}"):
         if required not in eligibility_run:
             fail(f"eligibility step is missing {required!r}")
+    # #528: validation, rendering and the site artifact are `mode: full` only, so a
+    # diagnostic (or smoke) run can produce nothing the publication jobs could consume.
+    for step_name in FULL_ONLY_STEPS:
+        condition = mapping(assemble_steps.get(step_name), step_name).get("if")
+        if not isinstance(condition, str) or not condition.startswith(FULL_ONLY):
+            fail(f"{step_name} must run only in mode: full ({FULL_ONLY})")
+    audit_job = mapping(jobs["artifact-audit"], "artifact-audit")
+    if audit_job.get("if") != "needs.assemble.outputs.mode == 'full'":
+        fail("artifact-audit must run only in mode: full")
+    for job_name in PUBLISH_JOBS:
+        condition = mapping(jobs[job_name], job_name).get("if")
+        if not isinstance(condition, str) or not condition.startswith(PUBLISH_ELIGIBLE):
+            fail(f"{job_name} must be gated on {PUBLISH_ELIGIBLE}")
 
     publish = mapping(jobs["publish-branch"], "publish-branch")
     if mapping(publish.get("permissions"), "publish permissions") != {"contents": "write"}:
@@ -241,6 +273,72 @@ def validate(workflow: Mapping[str, object]) -> None:
             fail(f"publication audit is missing {required}")
 
 
+def validate_diagnostic_mode(
+    build: Mapping[str, object],
+    build_steps: Mapping[str, dict[str, object]],
+    measure_steps: Mapping[str, dict[str, object]],
+    assemble_steps: Mapping[str, dict[str, object]],
+) -> None:
+    """#528: the diagnostic inputs are validated before any build, reach only the
+    mimalloc-pprof build and child, and never share the allocator cache."""
+
+    check = mapping(build_steps.get("validate dispatch inputs"), "validate dispatch inputs")
+    check_env = mapping(check.get("env"), "validate dispatch inputs.env")
+    check_run = str(check.get("run", ""))
+    if "ci/scaling_diagnostic.py validate" not in check_run:
+        fail("validate dispatch inputs must run ci/scaling_diagnostic.py validate")
+    for name in DIAGNOSTIC_INPUTS:
+        if f"${{{{ inputs.{name} }}}}" not in check_env.values():
+            fail(f"validate dispatch inputs must receive {name} through env")
+    names = [
+        str(mapping(step, "build step").get("name", ""))
+        for step in cast(list[object], build["steps"])
+    ]
+    if names.index("validate dispatch inputs") > names.index("build native allocator libraries"):
+        fail("dispatch inputs must be validated before the allocators are built")
+
+    native = mapping(
+        build_steps.get("build native allocator libraries"), "build native allocator libraries"
+    )
+    native_env = mapping(native.get("env"), "build native allocator libraries.env")
+    if native_env.get("DIAGNOSTIC_CPPDEFS") != "${{ inputs.diagnostic_cppdefs }}" or (
+        '--fork-cppdefs "$DIAGNOSTIC_CPPDEFS"' not in str(native.get("run", ""))
+    ):
+        fail("diagnostic_cppdefs must reach the builder as --fork-cppdefs through env")
+    cache = next(
+        (
+            step
+            for step in cast(list[object], build["steps"])
+            if "actions/cache@" in str(mapping(step, "build step").get("uses", ""))
+        ),
+        None,
+    )
+    cache_with = mapping(mapping(cache, "allocator cache").get("with"), "allocator cache.with")
+    if "${{ inputs.diagnostic_cppdefs }}" not in str(cache_with.get("key", "")):
+        fail("the allocator cache key must include diagnostic_cppdefs")
+
+    sweep = mapping(measure_steps.get("run sparse scaling sweep"), "run sparse scaling sweep")
+    sweep_env = mapping(sweep.get("env"), "run sparse scaling sweep.env")
+    sweep_run = str(sweep.get("run", ""))
+    for variable, name, flag in (
+        ("DIAGNOSTIC_ENV", "diagnostic_env", "--diagnostic-env"),
+        ("DIAGNOSTIC_PATTERNS", "diagnostic_patterns", "--patterns"),
+        ("DIAGNOSTIC_THREADS", "diagnostic_threads", "--thread-points"),
+    ):
+        if sweep_env.get(variable) != f"${{{{ inputs.{name} }}}}" or (
+            f'{flag} "${variable}"' not in sweep_run
+        ):
+            fail(f"{name} must reach benchmark-scaling-run as {flag} through env")
+    if "--diagnostic " not in sweep_run or '[ "$MODE" = "diagnostic" ]' not in sweep_run:
+        fail("the sweep must pass --diagnostic exactly when mode is diagnostic")
+
+    summary = mapping(assemble_steps.get("summarize diagnostic run"), "summarize diagnostic run")
+    if summary.get("if") != "(inputs.mode || 'full') == 'diagnostic'" or (
+        "ci/scaling_diagnostic.py summarize" not in str(summary.get("run", ""))
+    ):
+        fail("a diagnostic run must be summarized, and only a diagnostic run")
+
+
 RUST_THREAD_POINTS = re.compile(
     r"pub const SCALING_THREAD_POINTS:\s*\[u32;\s*(?P<length>\d+)\]\s*=\s*\[(?P<points>[^\]]*)\];"
 )
@@ -261,6 +359,59 @@ RUST_PATTERN_NAMES = re.compile(
     re.DOTALL,
 )
 RUST_PATTERN_ARM = re.compile(r'Self::(\w+)\s*=>\s*"([^"]+)"')
+# #508: the thread-churn side-car's protocol, declared on both sides as well.
+RUST_THREAD_CHURN_SCHEMA = re.compile(
+    r'pub const THREAD_CHURN_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";'
+)
+RUST_THREAD_CHURN_THREADS = re.compile(
+    r"pub const THREAD_CHURN_THREADS:\s*u32\s*=\s*(?P<threads>\d+);"
+)
+RUST_THREAD_CHURN_OFFSETS = re.compile(
+    r"pub const THREAD_CHURN_POST_DRAIN_OFFSETS_MS:\s*\[u64;\s*(?P<length>\d+)\]\s*=\s*"
+    r"\[(?P<offsets>[^\]]*)\];"
+)
+RUST_THREAD_CHURN_TOLERANCE = re.compile(
+    r"pub const THREAD_CHURN_RELEASE_TOLERANCE_BYTES:\s*u64\s*=\s*"
+    r"(?:(?P<base>\d+)\s*<<\s*(?P<shift>\d+)|(?P<literal>[\d_]+));"
+)
+
+
+def validate_thread_churn_contract(source: str) -> None:
+    """The thread-churn constants the Rust producer emits and Python validates."""
+
+    schema = RUST_THREAD_CHURN_SCHEMA.search(source)
+    if schema is None or schema.group("schema") != THREAD_CHURN_SCHEMA:
+        fail(f"scaling.rs: THREAD_CHURN_SCHEMA_VERSION must be {THREAD_CHURN_SCHEMA!r}")
+    threads = RUST_THREAD_CHURN_THREADS.search(source)
+    if threads is None or int(threads.group("threads")) != THREAD_CHURN_THREADS:
+        fail(f"scaling.rs: THREAD_CHURN_THREADS must be {THREAD_CHURN_THREADS}")
+    if THREAD_CHURN_THREADS not in SCALING_THREAD_POINTS:
+        fail("benchmark_report.py: THREAD_CHURN_THREADS must be a declared thread point")
+    offsets = RUST_THREAD_CHURN_OFFSETS.search(source)
+    if offsets is None:
+        fail("scaling.rs: THREAD_CHURN_POST_DRAIN_OFFSETS_MS is missing or not a [u64; N] literal")
+    raw_offsets = [item.strip() for item in offsets.group("offsets").split(",") if item.strip()]
+    if not all(item.isdigit() for item in raw_offsets):
+        fail("scaling.rs: THREAD_CHURN_POST_DRAIN_OFFSETS_MS must be literal milliseconds")
+    values = tuple(int(item) for item in raw_offsets)
+    if int(offsets.group("length")) != len(values) or values != THREAD_CHURN_OFFSETS_MS:
+        fail(
+            f"scaling.rs: THREAD_CHURN_POST_DRAIN_OFFSETS_MS is {list(values)} but "
+            f"benchmark_report.py declares {list(THREAD_CHURN_OFFSETS_MS)}"
+        )
+    tolerance = RUST_THREAD_CHURN_TOLERANCE.search(source)
+    if tolerance is None:
+        fail("scaling.rs: THREAD_CHURN_RELEASE_TOLERANCE_BYTES is missing")
+    declared = (
+        int(tolerance.group("base")) << int(tolerance.group("shift"))
+        if tolerance.group("base") is not None
+        else int(tolerance.group("literal").replace("_", ""))
+    )
+    if declared != THREAD_CHURN_RELEASE_TOLERANCE_BYTES:
+        fail(
+            f"scaling.rs: THREAD_CHURN_RELEASE_TOLERANCE_BYTES must be "
+            f"{THREAD_CHURN_RELEASE_TOLERANCE_BYTES}"
+        )
 
 
 def validate_source_contract(source: str) -> None:
@@ -332,6 +483,7 @@ def validate_source_contract(source: str) -> None:
             "scaling.rs: SCALING_PATTERNS is "
             f"{ordered_names} but benchmark_report.py declares {list(SCALING_PATTERN_IDS)}"
         )
+    validate_thread_churn_contract(source)
 
 
 def load(path: Path) -> dict[str, object]:
@@ -388,7 +540,12 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
         0
     ].__setitem__("uses", "actions/checkout@v4"),
     "setup-soldr cache preset weakened": lambda wf: cast(
-        dict[str, Any], cast(list[dict[str, Any]], _build_job(wf)["steps"])[1]["with"]
+        dict[str, Any],
+        next(
+            step
+            for step in cast(list[dict[str, Any]], _build_job(wf)["steps"])
+            if "setup-soldr@" in str(step.get("uses", ""))
+        )["with"],
     ).__setitem__("cache-preset", "foundation"),
     "allocators run in parallel": lambda wf: _step(
         wf, "run sparse scaling sweep", "measure"
@@ -427,6 +584,67 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "publication audit weakened": lambda wf: _step(
         wf, "audit scaling publication", "publication-audit"
     ).__setitem__("run", "echo ok"),
+    # #528: a diagnostic run must never reach publication.
+    "diagnostic mode made publication-eligible": lambda wf: _step(
+        wf, "compute publication eligibility", "assemble"
+    ).__setitem__(
+        "run",
+        str(_step(wf, "compute publication eligibility", "assemble")["run"]).replace(
+            '[ "$SCALING_MODE" = "full" ]', '[ "$SCALING_MODE" != "smoke" ]'
+        ),
+    ),
+    "site rendered in diagnostic mode": lambda wf: _step(
+        wf, "render sealed site", "assemble"
+    ).__setitem__("if", "(inputs.mode || 'full') != 'smoke'"),
+    "site artifact uploaded in diagnostic mode": lambda wf: _step(
+        wf, "upload site artifact", "assemble"
+    ).__setitem__("if", "success()"),
+    "artifact audit runs in every mode": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "artifact-audit"
+    ].pop("if"),
+    "publish job ungated": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "publish-branch"
+    ].__setitem__("if", "always()"),
+    "diagnostic mode choice removed": lambda wf: cast(
+        dict[str, Any],
+        cast(dict[str, Any], _triggers(wf)["workflow_dispatch"])["inputs"]["mode"],
+    ).__setitem__("options", ["full", "smoke"]),
+    "diagnostic env input dropped": lambda wf: cast(
+        dict[str, Any], cast(dict[str, Any], _triggers(wf)["workflow_dispatch"])["inputs"]
+    ).pop("diagnostic_env"),
+    "diagnostic inputs not validated": lambda wf: _build_job(wf).__setitem__(
+        "steps",
+        [
+            step
+            for step in cast(list[dict[str, Any]], _build_job(wf)["steps"])
+            if step.get("name") != "validate dispatch inputs"
+        ],
+    ),
+    "fork cppdefs interpolated into shell": lambda wf: _step(
+        wf, "build native allocator libraries"
+    ).__setitem__(
+        "run",
+        "python3 ci/build_benchmark_allocators.py --fork-cppdefs ${{ inputs.diagnostic_cppdefs }}",
+    ),
+    "allocator cache shared across cppdefs": lambda wf: cast(
+        dict[str, Any],
+        next(
+            step
+            for step in cast(list[dict[str, Any]], _build_job(wf)["steps"])
+            if "actions/cache@" in str(step.get("uses", ""))
+        )["with"],
+    ).__setitem__("key", "benchmark-allocators-${{ runner.os }}"),
+    "diagnostic env not passed to the runner": lambda wf: _step(
+        wf, "run sparse scaling sweep", "measure"
+    ).__setitem__(
+        "run",
+        str(_step(wf, "run sparse scaling sweep", "measure")["run"]).replace(
+            '--diagnostic-env "$DIAGNOSTIC_ENV" ', ""
+        ),
+    ),
+    "diagnostic run not summarized": lambda wf: _step(
+        wf, "summarize diagnostic run", "assemble"
+    ).__setitem__("if", "always()"),
 }
 
 
@@ -447,7 +665,7 @@ SOURCE_MUTATIONS: dict[str, Callable[[str], str]] = {
     ),
     "rss schema renamed on one side": lambda text: text.replace(
         f'SCALING_RSS_SCHEMA_VERSION: &str = "{SCALING_RSS_SCHEMA}"',
-        'SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v2"',
+        'SCALING_RSS_SCHEMA_VERSION: &str = "throughput-scaling-rss-v3"',
     ),
     "thread points declared out of order": lambda text: text.replace(
         f"[{', '.join(str(p) for p in SCALING_THREAD_POINTS)}]",
@@ -467,6 +685,21 @@ SOURCE_MUTATIONS: dict[str, Callable[[str], str]] = {
     "pattern renamed": lambda text: text.replace('"larson"', '"larson-v2"'),
     "pattern array length lies": lambda text: text.replace(
         f"[ScalingPattern; {len(SCALING_PATTERN_IDS)}]", "[ScalingPattern; 99]"
+    ),
+    "thread-churn schema renamed on one side": lambda text: text.replace(
+        f'THREAD_CHURN_SCHEMA_VERSION: &str = "{THREAD_CHURN_SCHEMA}"',
+        'THREAD_CHURN_SCHEMA_VERSION: &str = "thread-churn-rss-v2"',
+    ),
+    "thread-churn worker count diverges": lambda text: text.replace(
+        f"THREAD_CHURN_THREADS: u32 = {THREAD_CHURN_THREADS};", "THREAD_CHURN_THREADS: u32 = 4;"
+    ),
+    "thread-churn offsets diverge": lambda text: text.replace(
+        f"[{', '.join(str(offset) for offset in THREAD_CHURN_OFFSETS_MS)}]",
+        f"[{', '.join(str(offset) for offset in THREAD_CHURN_OFFSETS_MS[:-1])}, 5000]",
+    ),
+    "thread-churn tolerance diverges": lambda text: text.replace(
+        "THREAD_CHURN_RELEASE_TOLERANCE_BYTES: u64 = 1 << 20;",
+        "THREAD_CHURN_RELEASE_TOLERANCE_BYTES: u64 = 1 << 22;",
     ),
 }
 

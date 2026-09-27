@@ -203,6 +203,7 @@ fn checked_in_schemas_are_valid_strict_json() {
         include_str!("../schema/history-v1.schema.json"),
         include_str!("../schema/memory-v1.schema.json"),
         include_str!("../schema/latency-v1.schema.json"),
+        include_str!("../schema/latency-diagnostic-v1.schema.json"),
         include_str!("../schema/scaling-v1.schema.json"),
         include_str!("../schema/pprof-tax-v1.schema.json"),
     ] {

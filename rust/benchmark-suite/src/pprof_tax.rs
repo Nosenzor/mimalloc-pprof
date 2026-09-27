@@ -169,6 +169,7 @@ pub fn minimum_request_bytes(scenario_id: &str) -> Result<u64, String> {
     let definition = card(card_id);
     Ok(match definition.size_distribution() {
         SizeDistribution::Fixed(size) => size as u64,
+        SizeDistribution::UniformRange { min, .. } => min as u64,
         SizeDistribution::LogParetoLike { min, .. } => min as u64,
         SizeDistribution::AlignedRange { min_alignment, .. } => min_alignment as u64,
         // Both weighted mixes bottom out at the shared small-object draw,

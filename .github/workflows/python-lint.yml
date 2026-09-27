@@ -59,6 +59,7 @@ jobs:
           python3 ci/check_benchmark_memory_workflow.py --selftest
           python3 ci/check_benchmark_latency_workflow.py --selftest
           python3 ci/check_benchmark_scaling_workflow.py --selftest
+          python3 ci/check_large_span_diagnostic_workflow.py --selftest
           python3 ci/check_benchmark_pprof_tax_workflow.py --selftest
           python3 ci/build_pprof_tax_configurations.py --selftest
           python3 ci/check_scaling_parity.py --selftest
@@ -96,6 +97,8 @@ jobs:
           set -euo pipefail
           python3 ci/check_macos_labels.py --selftest
           python3 ci/macos_lane_decide.py --selftest
+      - name: Minimal-lane memory gate decision (#518)
+        run: python3 ci/memory_gate_lane_decide.py --selftest
 
       # The committed chart SVGs under .github/assets must still re-render
       # byte-for-byte from the committed CSV/JSON they name. `--check` re-renders and
