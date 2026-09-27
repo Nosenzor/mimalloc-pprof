@@ -578,6 +578,9 @@ bool        _mi_prof_maps_append(_mi_prof_dump_append_fun* append, void* arg);
 bool        _mi_prof_maps_visit(mi_prof_module_visit_fun* visitor, void* arg);
 void        _mi_prof_process_init(void);
 void        _mi_prof_process_done(void);
+// #550: drop the sample records of a heap whose pages are released without per-block frees
+// (`_mi_heap_force_destroy`), like `_mi_dhat_forget_heap`. Takes `prof_lock`; allocates nothing.
+void        _mi_prof_forget_heap(mi_heap_t* heap);
 // #270: fork-safety -- quiesce/reset `prof_lock` around fork(). Child-side policy:
 // continue (profiler records are ordinary process memory, safe copy-on-write across
 // fork; only the lock itself needs resetting). See fork.c's lock-order block.
