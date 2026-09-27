@@ -247,6 +247,15 @@ static bool mi_dump_complete(const mi_dump_ctx_t* ctx) {
   return (ctx->coverage.skipped_pages == 0 && ctx->coverage.busy_theaps == 0);
 }
 
+// Did the attempt miss anything a retry could still capture? A miss whose owner is a fork
+// orphan cannot be: in a forked child that tld stays RUNNING for good (src/fork.c), and a
+// pre-fork page it left owned stays owned (`coverage.orphaned`, src/diagnostic-walk.c). So an
+// attempt that missed only those is final, and it stays `complete: false`, just as
+// `mi_purge_all_ex` reports orphans without waiting on them.
+static bool mi_dump_retry_can_help(const mi_dump_ctx_t* ctx) {
+  return (ctx->coverage.skipped_pages + ctx->coverage.busy_theaps > ctx->coverage.orphaned);
+}
+
 char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept {
   mi_theap_t* self = _mi_theap_default();
   if (!mi_theap_is_initialized(self)) { self = _mi_thread_init(); }
@@ -267,7 +276,7 @@ char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait
     MI_GATE_ENTER(self);
     captured = mi_subproc_visit_heaps(mi_subproc_current(), &mi_dump_capture_heap, &ctx);
     MI_GATE_LEAVE(self->tld);
-    if (!captured || mi_dump_complete(&ctx)) break;
+    if (!captured || mi_dump_complete(&ctx) || !mi_dump_retry_can_help(&ctx)) break;
     #if MI_OWNER_GATE
     const mi_msecs_t now = _mi_clock_now();
     const uintmax_t elapsed = (now > started ? (uintmax_t)now - (uintmax_t)started : 0);
