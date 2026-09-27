@@ -98,7 +98,10 @@ not, by itself, an acceptance-grade host identity.
 For GitHub Actions, the identifier is scoped to one Ubuntu job VM, and the
 entire old/candidate pair sequence must remain in that one job. It does not
 identify stable physical hardware across workflow runs or rule out hypervisor
-noise; interpret small effects accordingly.
+noise; interpret small effects accordingly. The opt-in diagnostic preserves
+the requested eight-worker traces on a four-logical-CPU hosted VM, records
+the VM's actual topology, and therefore measures an oversubscribed workload;
+the default publication suite's topology rules are unchanged.
 
 For same-host allocator references, run the existing five-allocator scaling
 diagnostic on that host with the candidate build and pinned jemalloc/TCMalloc

@@ -90,6 +90,25 @@ fn opt_in_large_object_diagnostic_is_exact_128_kib_on_one_and_eight_workers() {
 }
 
 #[test]
+fn diagnostic_eight_workers_can_oversubscribe_without_changing_host_topology() {
+    let smaller_host = Topology {
+        physical_cores: 2,
+        logical_cores: 4,
+    };
+    for diagnostic in [
+        CardId::LargeObject128KiB,
+        CardId::RandomLargeBursty,
+        CardId::LargeClassPersistent,
+    ] {
+        let cell = ScenarioCell::new(diagnostic, ThreadPoint::Eight, smaller_host, 1, 1).unwrap();
+        assert_eq!(cell.threads, 8);
+    }
+    assert_eq!(smaller_host.physical_cores, 2);
+    assert_eq!(smaller_host.logical_cores, 4);
+    assert!(smaller_host.resolve(ThreadPoint::Eight).is_err());
+}
+
+#[test]
 fn matching_seed_means_matching_worker_requests_and_checksum() {
     for definition in cards() {
         for &point in definition.thread_points {

@@ -517,7 +517,7 @@ pub fn validate_latency_diagnostic_run(
         || !is_lower_hex(&run.host.runner_fingerprint_sha256, 64)
         || run.host.cpu_model.trim().is_empty()
         || run.host.physical_cores == 0
-        || run.host.logical_cores < 8
+        || run.host.logical_cores == 0
         || run.host.physical_cores > run.host.logical_cores
         || run.host.target.trim().is_empty()
         || run.host.transparent_hugepage.trim().is_empty()

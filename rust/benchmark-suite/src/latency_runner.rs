@@ -484,7 +484,9 @@ fn run_large_object_diagnostic(
     let mut samples = Vec::<LatencyDiagnosticSample>::new();
     let mut cells = Vec::new();
     for (card, point, definition) in crate::latency::latency_diagnostic_scenario_cells(topology)? {
-        let thread_count = topology.resolve(point).map_err(|error| error.to_string())?;
+        let thread_count = ScenarioCell::new(card, point, topology, 1, 1)
+            .map_err(|error| error.to_string())?
+            .threads;
         let workload = crate::perf_ab_trace::workload(card, thread_count)
             .ok_or("diagnostic scenario has no pinned perf-ab workload")?;
         let trace_checksum = crate::perf_ab_trace::trace_checksum(workload, thread_count);
