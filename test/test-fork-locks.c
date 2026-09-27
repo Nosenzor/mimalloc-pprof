@@ -216,10 +216,12 @@ static int wait_child_with_timeout(pid_t pid, const char* what, int* pexit_code)
 // the "continue" child-side policy means: the records are ordinary process memory that
 // survives fork by copy-on-write, so only the lock needed resetting). Where a subsystem
 // is off (e.g. an MI_PPROF=0 build, so `mi_prof_start` returned false), `false` is the
-// correct answer and is not asserted.
+// correct answer and is not asserted. In the *-env variants the subsystem is already
+// running from process init, so the start call returns false there too -- the
+// `is_enabled` half keeps the dump asserted in that case (#549 made MIMALLOC_DHAT=1 work).
 static int check_dump_in_child(void) {
-  const bool started_prof = mi_prof_start(0);   // no-op / returns false when MI_PPROF=0; harmless either way
-  const bool started_dhat = mi_dhat_start();
+  const bool prof_on = mi_prof_start(0) || mi_prof_is_enabled();   // both false when MI_PPROF=0
+  const bool dhat_on = mi_dhat_start() || mi_dhat_is_enabled();
   for (int i = 0; i < 64; i++) { void* p = mi_malloc(256 + (size_t)i); mi_free(p); }
 
   const pid_t pid = fork();
@@ -233,12 +235,12 @@ static int check_dump_in_child(void) {
     const bool prof_ok = mi_prof_dump(path);
     const bool dhat_ok = mi_dhat_dump(path);
     unlink(path);
-    if (started_prof && !prof_ok) {
-      fprintf(stderr, "FAIL: mi_prof_dump failed in the child although profiling was started in the parent\n");
+    if (prof_on && !prof_ok) {
+      fprintf(stderr, "FAIL: mi_prof_dump failed in the child although profiling was running in the parent\n");
       _exit(4);
     }
-    if (started_dhat && !dhat_ok) {
-      fprintf(stderr, "FAIL: mi_dhat_dump failed in the child although DHAT was started in the parent\n");
+    if (dhat_on && !dhat_ok) {
+      fprintf(stderr, "FAIL: mi_dhat_dump failed in the child although DHAT was running in the parent\n");
       _exit(5);
     }
     _exit(0);

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8b2641e0 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d13914d8 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -21661,8 +21661,11 @@ void* mi_unwrapped_realloc(void* p, size_t new_size, size_t alignment) mi_attr_n
    runs/tests, not production profiling. It is independent of MI_PPROF and of
    mi_memory_set_callbacks: both observers can run simultaneously.
 
-   Start explicitly with mi_dhat_start(), or set MIMALLOC_DHAT=1 before process
-   initialization. MIMALLOC_DHAT_DUMP_AT_EXIT=<path> writes a standard DHAT v2
+   Start explicitly with mi_dhat_start(), or set MIMALLOC_DHAT=1 (any non-empty
+   value not starting with '0') before process initialization, where it is read
+   once. Builds that predate issue #549, including every release up to 1.0.0,
+   ignore MIMALLOC_DHAT: call mi_dhat_start() there.
+   MIMALLOC_DHAT_DUMP_AT_EXIT=<path> writes a standard DHAT v2
    JSON report at process exit. MIMALLOC_DHAT_MAX_BYTES bounds raw-OS-backed
    collector state (default 64 MiB); exhaustion is fail-soft and is exposed via
    incomplete/dropped in mi_dhat_stats_t and mi_dhat_incomplete in the JSON.
@@ -21727,6 +21730,15 @@ mi_decl_nodiscard mi_decl_export bool mi_dhat_dump(const char* path) mi_attr_noe
 #define DHAT_CHUNK_SIZE (64*1024)
 #define DHAT_DEFAULT_BUDGET (64*1024*1024)
 #define DHAT_BUCKETS 4096
+/* #549: result buffer for a short environment value (MIMALLOC_DHAT, MIMALLOC_DHAT_MAX_BYTES).
+   `_mi_getenv` (src/libc.c, upstream) refuses any buffer under 64 bytes with ENOENT, the
+   same code as "not set", so a smaller buffer silently ignores the variable. */
+#ifndef MI_DHAT_ENV_VALUE_SIZE
+#define MI_DHAT_ENV_VALUE_SIZE 64
+#endif
+#if MI_DHAT_ENV_VALUE_SIZE < 64
+#error "MI_DHAT_ENV_VALUE_SIZE must be at least 64: _mi_getenv (src/libc.c) treats a smaller buffer as an unset variable"
+#endif
 
 typedef struct dhat_chunk_s {
   struct dhat_chunk_s* next;
@@ -22015,7 +22027,7 @@ static void dhat_commit_resize_locked(dhat_event_t* ev) {
 }
 
 static bool dhat_env_size(const char* name, size_t* out) {
-  char buf[64];
+  char buf[MI_DHAT_ENV_VALUE_SIZE];
   if (_mi_getenv(name, buf, sizeof(buf)) != 0 || buf[0] == 0) return false;
   char* end = NULL;
   const unsigned long long v = strtoull(buf, &end, 10);
@@ -22040,7 +22052,7 @@ static void dhat_publish_armed(size_t state) {
 
 static void dhat_resolve_env(void) {
   if (_mi_atomic_once_enter(&dhat_once)) {
-    char value[8] = { 0 };
+    char value[MI_DHAT_ENV_VALUE_SIZE] = { 0 };
     /* DHAT has its own opt-in switch; it must never inherit the unrelated
        MIMALLOC_MEMORY_EVENTS activation state. */
     const bool env_enabled = (_mi_getenv("MIMALLOC_DHAT", value, sizeof(value)) == 0 && value[0] != 0 && value[0] != '0');
@@ -29333,6 +29345,15 @@ mi_decl_export size_t  mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept;
 #if MI_PPROF
 
 #define MI_PROF_CHUNK_SIZE (64*1024)
+/* #549: result buffer for a short environment value (a decimal size, a format name).
+   `_mi_getenv` (src/libc.c, upstream) refuses any buffer under 64 bytes with ENOENT, the
+   same code as "not set", so a smaller buffer silently ignores the variable. */
+#ifndef MI_PROF_ENV_VALUE_SIZE
+#define MI_PROF_ENV_VALUE_SIZE 64
+#endif
+#if MI_PROF_ENV_VALUE_SIZE < 64
+#error "MI_PROF_ENV_VALUE_SIZE must be at least 64: _mi_getenv (src/libc.c) treats a smaller buffer as an unset variable"
+#endif
 
 typedef struct mi_prof_chunk_s {
   struct mi_prof_chunk_s* next;
@@ -29405,14 +29426,16 @@ static inline size_t prof_max(size_t x, size_t y) { return (x > y ? x : y); }
 
 /* ---- small helpers shared by mi_prof_start_ex's env/struct precedence resolution -----------
    (see mi_prof_config_t's mode documentation in profile.h for the FALLBACK/OVERRIDE contract). */
+/* #549: a value that does not fit the buffer reads as absent, so the probe must hold the
+   longest value it checks -- the MIMALLOC_PROF_DUMP_AT_EXIT path. */
 static bool prof_env_present(const char* name) {
-  char buf[64];
+  char buf[sizeof(prof_dump_at_exit)];
   return (_mi_getenv(name, buf, sizeof(buf)) == 0);
 }
 /* Tiny local decimal parser (mirrors options.c's mi_option_init, minus the KiB-suffix and
    boolean-string handling those don't apply to a raw byte count like MIMALLOC_PROF_SAMPLE_INTERVAL). */
 static bool prof_env_get_size(const char* name, size_t* out) {
-  char buf[64];
+  char buf[MI_PROF_ENV_VALUE_SIZE];
   if (_mi_getenv(name, buf, sizeof(buf)) != 0) return false;
   if (buf[0] == 0) return false;
   char* end = buf;
@@ -29673,7 +29696,7 @@ bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
       prof_dump_at_exit_format = config->dump_format;
     }
     else if (env_present) {
-      char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
+      char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
       if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
     }
   }
@@ -30209,7 +30232,7 @@ static void prof_auto_start(void) {
     if (mi_option_is_enabled(mi_option_prof)) { const bool started = mi_prof_start(0); MI_UNUSED(started); }
     (void)_mi_getenv("MIMALLOC_PROF_DUMP_AT_EXIT", prof_dump_at_exit, sizeof(prof_dump_at_exit));
     /* So pure-env users (no mi_prof_start_ex call at all) still get profile.proto exit dumps. */
-    char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
+    char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
     if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
   }
 }

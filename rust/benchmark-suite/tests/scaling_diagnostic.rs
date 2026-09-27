@@ -212,7 +212,12 @@ fn spawned_children_see_the_diagnostic_environment_only_on_the_fork() {
 
     let directory = scratch("spawn");
     let script = directory.join("print-environment");
-    std::fs::write(&script, "#!/bin/sh\n/usr/bin/env 1>&2\nexit 3\n").unwrap();
+    // Drain the request before exiting so the parent can finish its write.
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n/bin/cat >/dev/null\n/usr/bin/env 1>&2\nexit 3\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut programs = children(script);
     let environment = parse_diagnostic_environment("MIMALLOC_PURGE_DELAY=10").unwrap();

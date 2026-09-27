@@ -61,6 +61,14 @@ MIMALLOC_PROF_SAMPLE_INTERVAL=524288 \
 `MIMALLOC_PROF_SAMPLE_RATE` remains a compatibility alias for
 `MIMALLOC_PROF_SAMPLE_INTERVAL`; when both are set, `..._INTERVAL` wins.
 
+Builds without the [#549](https://github.com/zackees/mimalloc-pprof/issues/549) fix,
+which includes every release up to 1.0.0, ignore `MIMALLOC_PROF_DUMP_FORMAT`, so an
+environment-driven exit dump is always text. With those, set
+`dump_format = MI_PROF_FORMAT_PROTO` in an `MI_PROF_CONFIG_OVERRIDE` config for
+`mi_prof_start_ex`, or call `mi_prof_dump_proto` yourself. The same builds also let a
+FALLBACK config's `dump_at_exit` win over a `MIMALLOC_PROF_DUMP_AT_EXIT` path of 64 or
+more characters.
+
 **What `MIMALLOC_PROF_SEED` guarantees.** Two runs of the same workload with the same
 seed sample at the same points, **provided the threads are created in the same order** —
 each thread's stream is derived from the seed and its creation ordinal. It does not make

@@ -14,6 +14,15 @@
 #if MI_PPROF
 
 #define MI_PROF_CHUNK_SIZE (64*1024)
+/* #549: result buffer for a short environment value (a decimal size, a format name).
+   `_mi_getenv` (src/libc.c, upstream) refuses any buffer under 64 bytes with ENOENT, the
+   same code as "not set", so a smaller buffer silently ignores the variable. */
+#ifndef MI_PROF_ENV_VALUE_SIZE
+#define MI_PROF_ENV_VALUE_SIZE 64
+#endif
+#if MI_PROF_ENV_VALUE_SIZE < 64
+#error "MI_PROF_ENV_VALUE_SIZE must be at least 64: _mi_getenv (src/libc.c) treats a smaller buffer as an unset variable"
+#endif
 
 typedef struct mi_prof_chunk_s {
   struct mi_prof_chunk_s* next;
@@ -86,14 +95,16 @@ static inline size_t prof_max(size_t x, size_t y) { return (x > y ? x : y); }
 
 /* ---- small helpers shared by mi_prof_start_ex's env/struct precedence resolution -----------
    (see mi_prof_config_t's mode documentation in profile.h for the FALLBACK/OVERRIDE contract). */
+/* #549: a value that does not fit the buffer reads as absent, so the probe must hold the
+   longest value it checks -- the MIMALLOC_PROF_DUMP_AT_EXIT path. */
 static bool prof_env_present(const char* name) {
-  char buf[64];
+  char buf[sizeof(prof_dump_at_exit)];
   return (_mi_getenv(name, buf, sizeof(buf)) == 0);
 }
 /* Tiny local decimal parser (mirrors options.c's mi_option_init, minus the KiB-suffix and
    boolean-string handling those don't apply to a raw byte count like MIMALLOC_PROF_SAMPLE_INTERVAL). */
 static bool prof_env_get_size(const char* name, size_t* out) {
-  char buf[64];
+  char buf[MI_PROF_ENV_VALUE_SIZE];
   if (_mi_getenv(name, buf, sizeof(buf)) != 0) return false;
   if (buf[0] == 0) return false;
   char* end = buf;
@@ -354,7 +365,7 @@ bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
       prof_dump_at_exit_format = config->dump_format;
     }
     else if (env_present) {
-      char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
+      char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
       if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
     }
   }
@@ -890,7 +901,7 @@ static void prof_auto_start(void) {
     if (mi_option_is_enabled(mi_option_prof)) { const bool started = mi_prof_start(0); MI_UNUSED(started); }
     (void)_mi_getenv("MIMALLOC_PROF_DUMP_AT_EXIT", prof_dump_at_exit, sizeof(prof_dump_at_exit));
     /* So pure-env users (no mi_prof_start_ex call at all) still get profile.proto exit dumps. */
-    char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
+    char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
     if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
   }
 }

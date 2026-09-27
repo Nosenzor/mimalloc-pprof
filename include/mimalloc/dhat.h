@@ -3,8 +3,11 @@
    runs/tests, not production profiling. It is independent of MI_PPROF and of
    mi_memory_set_callbacks: both observers can run simultaneously.
 
-   Start explicitly with mi_dhat_start(), or set MIMALLOC_DHAT=1 before process
-   initialization. MIMALLOC_DHAT_DUMP_AT_EXIT=<path> writes a standard DHAT v2
+   Start explicitly with mi_dhat_start(), or set MIMALLOC_DHAT=1 (any non-empty
+   value not starting with '0') before process initialization, where it is read
+   once. Builds that predate issue #549, including every release up to 1.0.0,
+   ignore MIMALLOC_DHAT: call mi_dhat_start() there.
+   MIMALLOC_DHAT_DUMP_AT_EXIT=<path> writes a standard DHAT v2
    JSON report at process exit. MIMALLOC_DHAT_MAX_BYTES bounds raw-OS-backed
    collector state (default 64 MiB); exhaustion is fail-soft and is exposed via
    incomplete/dropped in mi_dhat_stats_t and mi_dhat_incomplete in the JSON.

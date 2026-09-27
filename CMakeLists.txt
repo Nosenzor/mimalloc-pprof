@@ -1171,6 +1171,16 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-profile-accum PROPERTIES ENVIRONMENT "MIMALLOC_PROF_ACCUM=1")
     add_test(NAME test-profile-auto COMMAND mimalloc-test-profile)
     set_tests_properties(test-profile-auto PROPERTIES ENVIRONMENT "MIMALLOC_PROF=1")
+    # #549: MIMALLOC_PROF_DUMP_FORMAT and a long MIMALLOC_PROF_DUMP_AT_EXIT were silently ignored
+    # (_mi_getenv reads a value that does not fit its buffer as unset). Each case re-runs the
+    # binary as a child that sets the variables up and exits normally, then reads back the dump
+    # the child's exit wrote (see the modes above main in test-profile.c). That exit dump is
+    # exactly what MI_NO_PROCESS_DETACH skips, so the cases need it off.
+    if(NOT MI_NO_PROCESS_DETACH)
+      add_test(NAME test-profile-env-dump-format COMMAND mimalloc-test-profile --env-dump-format-check)
+      add_test(NAME test-profile-start-ex-dump-format COMMAND mimalloc-test-profile --start-ex-dump-format-check)
+      add_test(NAME test-profile-start-ex-long-env-path COMMAND mimalloc-test-profile --start-ex-long-env-path-check)
+    endif()
 
     # Adversarial concurrency coverage for the v3 engine (issue #43): thread
     # bootstrap race, cross-thread free, snapshot stability under mutation.
@@ -1774,6 +1784,9 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-dhat PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-dhat COMMAND mimalloc-test-dhat)
+  # #549: MIMALLOC_DHAT=1 alone must start DHAT -- the mode never calls mi_dhat_start().
+  add_test(NAME test-dhat-env-enabled COMMAND mimalloc-test-dhat --env-enabled-check)
+  set_tests_properties(test-dhat-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_DHAT=1")
   endif()
 
   # mi_heap_dump_json / mi_heap_get_seq (issue #269, Bun parity P4): backs bun:jsc
