@@ -91,7 +91,11 @@ python3 ci/large_span_latency_link.py \
 The sidecar retains raw transaction durations, instrumentation controls and
 p50/p95/p99. The linker checks source SHAs, worker counts, operation counts,
 seeds, trace checksums and raw sample coverage. A confident p95/p99 increase
-is a regression even if RSS improves. It does not equate CPU timing with
+is a regression even if RSS improves, but only when both arms pass the existing
+control-overhead limit. Fast operations can exceed that limit: the linker still
+publishes their raw timings, quantiles and control overhead, marks their latency
+conclusion unavailable, excludes latency from the combined decision, and marks
+the whole link acceptance-ineligible. It does not equate CPU timing with
 transaction latency, and its link is smoke-only unless both artifacts report
 the same explicit stable-host identifier. A host name or matching CPU model is
 not, by itself, an acceptance-grade host identity.

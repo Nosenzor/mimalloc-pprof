@@ -424,15 +424,44 @@ def test_rejects_workload_operation_or_trace_mismatch(tmp_path: Path) -> None:
         link.link_artifacts(span_path, latency_path)
 
 
-def test_rejects_invalid_overhead_effects_and_missing_samples(tmp_path: Path) -> None:
+def test_invalid_overhead_is_published_without_a_latency_decision(tmp_path: Path) -> None:
     raw = latency_raw()
+    first = raw.cells[0]
+    tail_quantiles = tuple(
+        replace(
+            item,
+            summary=replace(
+                item.summary,
+                effect=0.8,
+                confidence_interval=link.ConfidenceInterval(0.7, 0.9, 0.95),
+            ),
+        )
+        if item.quantile in ("p95", "p99")
+        else item
+        for item in first.paired_summaries
+    )
     cells = (
-        replace(raw.cells[0], candidate=replace(raw.cells[0].candidate, overhead_valid=False)),
+        replace(
+            first,
+            candidate=replace(first.candidate, overhead_valid=False),
+            paired_summaries=tail_quantiles,
+        ),
         *raw.cells[1:],
     )
     span_path, latency_path = write_inputs(tmp_path, latency=replace(raw, cells=cells))
-    with pytest.raises(link.LinkError, match="overhead is invalid"):
-        link.link_artifacts(span_path, latency_path)
+    result = link.link_artifacts(span_path, latency_path)
+    assessment = result.cells[0].assessment
+    assert not result.acceptance_eligible
+    assert not assessment.latency_control_valid
+    assert assessment.latency_tail_regression is None
+    assert assessment.decision == span_model.summarize(span_raw()).cells[0].assessment
+    summary = link.render_linked_summary(result)
+    assert "tail effect estimates are descriptive only" in summary
+    assert "overhead_valid=False" in summary
+
+
+def test_rejects_missing_latency_samples(tmp_path: Path) -> None:
+    raw = latency_raw()
 
     raw = latency_raw()
     samples = tuple(
