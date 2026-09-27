@@ -1386,6 +1386,21 @@ claim owners, **not** the work or OS calls after a claim succeeds.
 | [readme-upstream.md](readme-upstream.md) | Upstream mimalloc documentation (build modes, overrides, options) |
 | [MIMALLOC_FORKS.md](MIMALLOC_FORKS.md) | Survey of other mimalloc forks and what was (not) adopted |
 
+**Internals.** How each fork-owned subsystem works, written for contributors: data
+structures, hook sites, locks and memory orders, known defects and accepted limits, and the
+tests and CI gates that cover it.
+
+| Document | Contents |
+|---|---|
+| [docs/profiler-internals.md](docs/profiler-internals.md) | Sampled pprof profiler: per-thread sampling, sample records and the stack intern table, stack capture and module mappings per platform, the `profile.proto` encoder |
+| [docs/memory-events-internals.md](docs/memory-events-internals.md) | Memory events: the one-line hook sites, the observer word tested first, the `_slow` bodies, dispatch, counters and the callback contract |
+| [docs/dhat-internals.md](docs/dhat-internals.md) | Exact DHAT profiler: raw-OS bump arena, program-point and live-record tables, per-platform stacks, the DHAT v2 JSON field by field |
+| [docs/page-holes.md](docs/page-holes.md) | Page hole purging: the OS-page purged bitmap, the sweep, unformed-tail and slack discards, who drives it |
+| [docs/scavenger-and-idle-handoff.md](docs/scavenger-and-idle-handoff.md) | The background scavenger thread and the idle-handoff (park) protocol: states, claims, the two doors, memory orders |
+| [docs/fork-safety.md](docs/fork-safety.md) | `fork()` safety: the `pthread_atfork` handlers, the 15-level lock order, what the child resets, orphans and the fork generation |
+| [docs/heap-snapshot.md](docs/heap-snapshot.md) | Binary heap snapshots: format version 1 record by record, the writer, `mi-heapview` and the Python reference reader |
+| [docs/heap-dump-and-diagnostics.md](docs/heap-dump-and-diagnostics.md) | Live heap JSON dump (`MI_DIAGNOSTICS`), the diagnostic walk, and the `MI_DEBUG_FULL` lock diagnostics |
+
 Design history and milestone decisions are in
 [issue #2](https://github.com/zackees/mimalloc-pprof/issues/2).
 
