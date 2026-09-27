@@ -194,7 +194,6 @@ fn run(options: Options) -> Result<(), String> {
             old_fork,
             options.run_seed,
             options.blocks,
-            options.warmup_transactions,
             options.initial_transactions,
             options.timeout,
             topology,
@@ -472,7 +471,6 @@ fn run_large_object_diagnostic(
     old_fork: &crate::orchestration::ChildProgram,
     run_seed: u64,
     blocks: u32,
-    warmup_transactions: u64,
     _initial_transactions: u64,
     timeout: Duration,
     topology: Topology,
@@ -507,7 +505,9 @@ fn run_large_object_diagnostic(
             physical_cores: topology.physical_cores as u32,
             logical_cores: topology.logical_cores as u32,
             transactions_per_worker: workload.operations_per_worker,
-            warmup_transactions_per_worker: warmup_transactions,
+            // Pinned stateful traces cannot be replayed as a one-operation
+            // prefix. A fresh child per arm matches perf-ab's cold start.
+            warmup_transactions_per_worker: 0,
             reproduction_command: format!(
                 "opt-in matched old-fork/candidate perf-ab trace {}",
                 workload.workload_id
@@ -661,7 +661,7 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
     let mut blocks = 15;
     let mut run_seed = 0x6c_61_74_65_6e_63_79;
     let mut timeout_secs = 30;
-    let mut warmup_transactions = 1;
+    let mut warmup_transactions = None;
     let mut initial_transactions = 1;
     let mut physical_cores = None;
     let mut logical_cores = None;
@@ -705,7 +705,7 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
             "--blocks" => blocks = parse_number(flag, value)?,
             "--run-seed" => run_seed = parse_number(flag, value)?,
             "--timeout-secs" => timeout_secs = parse_number(flag, value)?,
-            "--warmup-transactions" => warmup_transactions = parse_number(flag, value)?,
+            "--warmup-transactions" => warmup_transactions = Some(parse_number(flag, value)?),
             "--initial-transactions" => initial_transactions = parse_number(flag, value)?,
             "--physical-cores" => physical_cores = Some(parse_number(flag, value)?),
             "--logical-cores" => logical_cores = Some(parse_number(flag, value)?),
@@ -722,6 +722,14 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
     if diagnostic_stable_host_id.is_some() && !diagnostic_large_object {
         return Err("--stable-host-id is only valid with --diagnostic-large-object".into());
     }
+    let warmup_transactions = if diagnostic_large_object {
+        if warmup_transactions.is_some_and(|count| count != 0) {
+            return Err("large-object diagnostic does not support prefix warmup".into());
+        }
+        0
+    } else {
+        warmup_transactions.unwrap_or(1)
+    };
     let provenance = provenance
         .or_else(|| build_root.map(|root| root.join("allocator-provenance.json")))
         .ok_or("--provenance or --build-root is required")?;
@@ -820,6 +828,7 @@ mod tests {
         ])
         .unwrap();
         assert!(validate_block_count(&diagnostic).is_ok());
+        assert_eq!(diagnostic.warmup_transactions, 0);
 
         let publication = options(&[
             "--provenance",
@@ -834,6 +843,20 @@ mod tests {
             validate_block_count(&publication).unwrap_err(),
             "complete latency runs require --blocks at least 15",
         );
+        assert_eq!(publication.warmup_transactions, 1);
+
+        assert!(options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--warmup-transactions",
+            "1",
+        ])
+        .is_err());
 
         let diagnostic_six = options(&[
             "--provenance",

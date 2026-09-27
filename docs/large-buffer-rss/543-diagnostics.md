@@ -101,7 +101,9 @@ identify stable physical hardware across workflow runs or rule out hypervisor
 noise; interpret small effects accordingly. The opt-in diagnostic preserves
 the requested eight-worker traces on a four-logical-CPU hosted VM, records
 the VM's actual topology, and therefore measures an oversubscribed workload;
-the default publication suite's topology rules are unchanged.
+the default publication suite's topology rules are unchanged. Each diagnostic
+arm starts in a fresh child with no prefix warmup, matching the perf-ab trace;
+the pinned stateful trace cannot be warmed up with only one operation.
 
 For same-host allocator references, run the existing five-allocator scaling
 diagnostic on that host with the candidate build and pinned jemalloc/TCMalloc

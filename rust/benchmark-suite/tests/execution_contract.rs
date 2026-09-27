@@ -7,6 +7,10 @@ use std::sync::Mutex;
 use benchmark_suite::execution::{
     execute_cell, execute_child_request, expected_touch_checksum, AllocatorAdapter,
 };
+use benchmark_suite::latency::{
+    execute_latency_child_request, LatencyChildRequest, LATENCY_CHILD_PROTOCOL_VERSION,
+    LATENCY_SCHEMA_VERSION,
+};
 use benchmark_suite::model::{
     AllocatorIdentity, BenchmarkChildRequest, RunnerMetadata, ToolchainMetadata,
     CHILD_PROTOCOL_VERSION,
@@ -363,4 +367,71 @@ fn realloc_preservation_is_checked_after_the_allocator_returns() {
     .unwrap();
     let error = execute_cell(&adapter, &cell).unwrap_err();
     assert!(error.contains("preserve"), "unexpected error: {error}");
+}
+
+#[test]
+fn stateful_diagnostic_latency_child_runs_without_prefix_warmup() {
+    let adapter = TestAdapter::new();
+    let workload = benchmark_suite::perf_ab_trace::workload(CardId::RandomLargeBursty, 8).unwrap();
+    let request = LatencyChildRequest {
+        protocol_version: LATENCY_CHILD_PROTOCOL_VERSION.into(),
+        metric_schema_version: LATENCY_SCHEMA_VERSION.into(),
+        sample_denominator: 32,
+        expected_trace_checksum: Some(benchmark_suite::perf_ab_trace::trace_checksum(workload, 8)),
+        control: false,
+        runner_class: "test".into(),
+        affinity_policy: "linux:unrestricted".into(),
+        benchmark: BenchmarkChildRequest {
+            protocol_version: CHILD_PROTOCOL_VERSION.into(),
+            schema_version: RAW_SCHEMA_VERSION.into(),
+            suite_version: CORE_SUITE_VERSION.into(),
+            run_kind: "headline".into(),
+            execution_mode: "normal".into(),
+            run_seed: 543,
+            block_id: 0,
+            ordinal: 0,
+            workload_seed: benchmark_suite::perf_ab_trace::PERF_AB_STREAM_SEED_BASE,
+            allocator: AllocatorIdentity {
+                allocator_id: "tcmalloc".into(),
+                allocator_version: "test".into(),
+                source_sha: "a".repeat(40),
+                library_sha256: "b".repeat(64),
+                child_binary_sha256: "c".repeat(64),
+            },
+            scenario_id: CardId::RandomLargeBursty.as_str().into(),
+            scenario_version: CORE_SUITE_VERSION.into(),
+            thread_point: "8".into(),
+            physical_cores: 2,
+            logical_cores: 4,
+            transactions_per_worker: workload.operations_per_worker,
+            warmup_transactions_per_worker: 0,
+            reproduction_command: "stateful diagnostic test".into(),
+            runner: RunnerMetadata {
+                os: "linux".into(),
+                architecture: "x86_64".into(),
+                physical_cores: 2,
+                logical_cores: 4,
+            },
+            toolchain: ToolchainMetadata {
+                rustc: "test".into(),
+                target: "x86_64-unknown-linux-gnu".into(),
+                compiler: "cc".into(),
+                linker: "cc".into(),
+            },
+        },
+    };
+    let response = execute_latency_child_request(&adapter, request.clone()).unwrap();
+    response.validate_against(&request).unwrap();
+    assert_eq!(response.scheduling.thread_count, 8);
+    assert_eq!(response.scheduling.logical_cores, 4);
+    assert_eq!(
+        response.completed_transactions,
+        workload.operations_per_worker * 8
+    );
+
+    let mut control_request = request;
+    control_request.control = true;
+    let control = execute_latency_child_request(&adapter, control_request.clone()).unwrap();
+    control.validate_against(&control_request).unwrap();
+    assert_eq!(control.checksum, 1);
 }
