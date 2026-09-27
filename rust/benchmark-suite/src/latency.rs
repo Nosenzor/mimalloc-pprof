@@ -32,6 +32,7 @@ pub const LATENCY_MIN_SAMPLES: usize = 10_000;
 pub const LATENCY_INITIAL_SAMPLE_DENOMINATOR: u64 = 1024;
 pub const LATENCY_BOOTSTRAP_RESAMPLES: u32 = 10_000;
 const REFERENCE_ALLOCATOR: &str = "upstream-mimalloc";
+pub const LARGE_OBJECT_DIAGNOSTIC_THREAD_POINT: &str = "8";
 const ALLOCATOR_IDS: [&str; 5] = [
     "tcmalloc",
     "jemalloc",
@@ -97,6 +98,8 @@ pub struct LatencyChildRequest {
     pub protocol_version: String,
     pub metric_schema_version: String,
     pub sample_denominator: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_trace_checksum: Option<u64>,
     pub control: bool,
     pub runner_class: String,
     pub affinity_policy: String,
@@ -114,6 +117,18 @@ impl LatencyChildRequest {
             return Err("unsupported latency child protocol, schema, or sample rate".into());
         }
         self.benchmark.validate()?;
+        let card = CardId::parse(&self.benchmark.scenario_id)
+            .ok_or_else(|| "latency child scenario is unknown".to_string())?;
+        let workload = crate::perf_ab_trace::workload(
+            card,
+            self.benchmark
+                .thread_point
+                .parse::<usize>()
+                .unwrap_or_default(),
+        );
+        if workload.is_some() != self.expected_trace_checksum.is_some() {
+            return Err("diagnostic trace checksum presence does not match the scenario".into());
+        }
         latency_cell(
             &self.benchmark.scenario_id,
             &self.benchmark.thread_point,
@@ -167,6 +182,8 @@ impl LatencyChildResponse {
             .collect::<Vec<_>>();
         let expected_checksum = if request.control {
             1
+        } else if let Some(trace_checksum) = request.expected_trace_checksum {
+            trace_checksum
         } else {
             expected_touch_checksum(&cell)?
         };
@@ -224,6 +241,87 @@ pub struct LatencyRawRun {
     pub calibrations: Vec<CellCalibration>,
     pub sampling_denominators: BTreeMap<String, u64>,
     pub samples: Vec<LatencyRawSample>,
+}
+
+/// Opt-in diagnostic data is stored beside, and never folded into, the
+/// publication matrix. It replays three named perf-ab large-object traces, with
+/// exact 128 KiB at one and eight workers and the two eight-worker stress traces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LatencyDiagnosticRun {
+    pub metric_schema_version: String,
+    pub status: String,
+    pub run_seed: u64,
+    pub measurement_scope: String,
+    pub host: LatencyDiagnosticHost,
+    pub old_fork: LatencyDiagnosticSource,
+    pub candidate: LatencyDiagnosticSource,
+    pub cells: Vec<LatencyDiagnosticCell>,
+    pub samples: Vec<LatencyDiagnosticSample>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LatencyDiagnosticHost {
+    pub stable_host_id: String,
+    pub stable_host_identity_status: String,
+    pub stable_host_identity_source: String,
+    pub runner_fingerprint_sha256: String,
+    pub cpu_model: String,
+    pub physical_cores: u32,
+    pub logical_cores: u32,
+    pub target: String,
+    pub transparent_hugepage: String,
+    pub affinity_policy: String,
+    pub affinity_logical_cpu_ids: Vec<u32>,
+    pub isolation_claim: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LatencyDiagnosticSource {
+    pub source_sha: String,
+    pub library_sha256: String,
+    pub child_binary_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LatencyDiagnosticSample {
+    pub arm: String,
+    pub execution_order: u8,
+    pub sample: LatencyRawSample,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LatencyDiagnosticCell {
+    pub scenario_id: String,
+    pub workload_id: String,
+    pub trace_checksum: String,
+    pub thread_point: String,
+    pub thread_count: u32,
+    pub transactions_per_worker: u64,
+    pub sample_denominator: u64,
+    pub transaction_definition: String,
+    pub old_fork: LatencyDiagnosticAllocatorSummary,
+    pub candidate: LatencyDiagnosticAllocatorSummary,
+    pub paired_summaries: Vec<LatencyDiagnosticPairedSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LatencyDiagnosticAllocatorSummary {
+    pub measured: LatencyDistribution,
+    pub control: LatencyDistribution,
+    pub overhead_valid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LatencyDiagnosticPairedSummary {
+    pub quantile: String,
+    pub summary: PairedEffectSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -376,10 +474,383 @@ pub fn latency_scenario_cells(
     Ok(cells)
 }
 
+pub fn latency_diagnostic_scenario_cells(
+    topology: Topology,
+) -> Result<Vec<(CardId, ThreadPoint, &'static str)>, String> {
+    let cells = [
+        (CardId::LargeObject128KiB, ThreadPoint::One),
+        (CardId::LargeObject128KiB, ThreadPoint::Eight),
+        (CardId::RandomLargeBursty, ThreadPoint::Eight),
+        (CardId::LargeClassPersistent, ThreadPoint::Eight),
+    ]
+    .into_iter()
+    .map(|(card, point)| (card, point, transaction_definition(card)))
+    .collect::<Vec<_>>();
+    for (card, point, _) in &cells {
+        ScenarioCell::new(*card, *point, topology, 1, 1).map_err(|error| error.to_string())?;
+    }
+    Ok(cells)
+}
+
+pub fn validate_latency_diagnostic_run(
+    run: &LatencyDiagnosticRun,
+    expected_blocks: u32,
+) -> Result<(), String> {
+    if run.metric_schema_version != LATENCY_SCHEMA_VERSION
+        || run.status != "diagnostic"
+        || run.run_seed == 0
+        || run.measurement_scope != LATENCY_DIAGNOSTIC_SCOPE
+        || run.host.stable_host_identity_status
+            != if run.host.stable_host_id.is_empty() {
+                "not-provided"
+            } else {
+                "reported"
+            }
+        || run.host.stable_host_identity_source
+            != if run.host.stable_host_id.is_empty() {
+                "not-provided"
+            } else if run.host.stable_host_identity_source == "operator-override" {
+                "operator-override"
+            } else {
+                "runner-reported"
+            }
+        || !is_lower_hex(&run.host.runner_fingerprint_sha256, 64)
+        || run.host.cpu_model.trim().is_empty()
+        || run.host.physical_cores == 0
+        || run.host.logical_cores < 8
+        || run.host.physical_cores > run.host.logical_cores
+        || run.host.target.trim().is_empty()
+        || run.host.transparent_hugepage.trim().is_empty()
+        || run.host.affinity_policy.trim().is_empty()
+        || run.host.affinity_logical_cpu_ids.is_empty()
+        || run.host.isolation_claim != LATENCY_DIAGNOSTIC_ISOLATION_CLAIM
+        || run.old_fork.source_sha == run.candidate.source_sha
+        || !is_lower_hex(&run.old_fork.source_sha, 40)
+        || !is_lower_hex(&run.candidate.source_sha, 40)
+        || !is_lower_hex(&run.old_fork.library_sha256, 64)
+        || !is_lower_hex(&run.candidate.library_sha256, 64)
+        || !is_lower_hex(&run.old_fork.child_binary_sha256, 64)
+        || !is_lower_hex(&run.candidate.child_binary_sha256, 64)
+        || run.cells.len() != 4
+        || run.samples.len() != expected_blocks as usize * 8
+    {
+        return Err("large-object diagnostic identity or sample matrix is invalid".into());
+    }
+    let expected_cells = [
+        (CardId::LargeObject128KiB, "1"),
+        (CardId::LargeObject128KiB, "8"),
+        (CardId::RandomLargeBursty, "8"),
+        (CardId::LargeClassPersistent, "8"),
+    ];
+    for (cell, (card, point)) in run.cells.iter().zip(expected_cells) {
+        let count = point.parse::<u32>().map_err(|error| error.to_string())?;
+        let trace = crate::perf_ab_trace::workload(card, count as usize)
+            .ok_or("diagnostic cell has no pinned perf-ab trace")?;
+        let expected_checksum = crate::perf_ab_trace::trace_checksum(trace, count as usize);
+        if cell.thread_point != point
+            || cell.thread_count != count
+            || cell.scenario_id != card.as_str()
+            || cell.workload_id != trace.workload_id
+            || cell.trace_checksum != format!("{expected_checksum:016x}")
+            || cell.transactions_per_worker != trace.operations_per_worker
+            || cell.transactions_per_worker == 0
+            || cell.sample_denominator == 0
+            || cell.sample_denominator > LATENCY_INITIAL_SAMPLE_DENOMINATOR
+            || cell.transaction_definition != transaction_definition(card)
+        {
+            return Err("large-object diagnostic cell identity is invalid".into());
+        }
+        let rows = run
+            .samples
+            .iter()
+            .filter(|row| {
+                row.sample.thread_point == point && row.sample.scenario_id == card.as_str()
+            })
+            .collect::<Vec<_>>();
+        if rows.len() != expected_blocks as usize * 2 {
+            return Err("large-object diagnostic cell has an incomplete arm matrix".into());
+        }
+        for row in &rows {
+            let sample = &row.sample;
+            if !matches!(row.arm.as_str(), "old-fork" | "candidate")
+                || sample.metric_schema_version != LATENCY_SCHEMA_VERSION
+                || sample.scenario_id != card.as_str()
+                || sample.thread_count != count
+                || sample.workload_seed != crate::perf_ab_trace::PERF_AB_STREAM_SEED_BASE
+                || sample.sample_denominator != cell.sample_denominator
+                || sample.transaction_definition != cell.transaction_definition
+                || sample.allocator_id != "mimalloc-pprof"
+                || sample.measured.control
+                || !sample.control.control
+                || sample.measured.completed_transactions
+                    != cell.transactions_per_worker * u64::from(count)
+                || sample.control.completed_transactions != sample.measured.completed_transactions
+                || sample.measured.checksum != expected_checksum
+                || sample.control.checksum != 1
+                || sample.measured.scheduling.thread_count != count
+                || sample.control.scheduling.thread_count != count
+                || sample.measured.scheduling.physical_cores != run.host.physical_cores
+                || sample.control.scheduling.physical_cores != run.host.physical_cores
+                || sample.measured.scheduling.logical_cores != run.host.logical_cores
+                || sample.control.scheduling.logical_cores != run.host.logical_cores
+                || sample.measured.scheduling.affinity_policy != run.host.affinity_policy
+                || sample.control.scheduling.affinity_policy != run.host.affinity_policy
+                || sample.measured.scheduling.actual_cpu_ids.len() != count as usize
+                || sample.control.scheduling.actual_cpu_ids.len() != count as usize
+                || row.execution_order > 1
+            {
+                return Err("large-object diagnostic sample contradicts its declared cell".into());
+            }
+            let expected_arm = if sample.block_id % 2 == 0 {
+                "old-fork"
+            } else {
+                "candidate"
+            };
+            if (row.execution_order == 0) != (row.arm == expected_arm) {
+                return Err("diagnostic arm order does not alternate by block".into());
+            }
+            let measured = sample
+                .measured
+                .observations
+                .iter()
+                .map(|v| (v.thread_index, v.transaction_index))
+                .collect::<Vec<_>>();
+            let control = sample
+                .control
+                .observations
+                .iter()
+                .map(|v| (v.thread_index, v.transaction_index))
+                .collect::<Vec<_>>();
+            if measured != control
+                || sample
+                    .measured
+                    .observations
+                    .iter()
+                    .chain(&sample.control.observations)
+                    .any(|v| v.thread_index >= count || v.duration_ns == 0)
+                || (row.arm == "old-fork"
+                    && (sample.allocator_source_sha != run.old_fork.source_sha
+                        || sample.child_binary_sha256 != run.old_fork.child_binary_sha256))
+                || (row.arm == "candidate"
+                    && (sample.allocator_source_sha != run.candidate.source_sha
+                        || sample.child_binary_sha256 != run.candidate.child_binary_sha256))
+            {
+                return Err("large-object diagnostic observations are malformed".into());
+            }
+            for worker in 0..count {
+                let observed = measured
+                    .iter()
+                    .filter(|(thread, _)| *thread == worker)
+                    .map(|(_, index)| *index)
+                    .collect::<Vec<_>>();
+                if observed
+                    != deterministic_sample_indices(
+                        sample.workload_seed,
+                        worker,
+                        cell.transactions_per_worker,
+                        cell.sample_denominator,
+                    )?
+                {
+                    return Err("large-object diagnostic sample schedule is invalid".into());
+                }
+            }
+        }
+        for block in 0..expected_blocks {
+            let pair = rows
+                .iter()
+                .filter(|row| row.sample.block_id == block)
+                .collect::<Vec<_>>();
+            if pair.len() != 2
+                || pair[0].arm == pair[1].arm
+                || pair[0].sample.workload_seed != pair[1].sample.workload_seed
+                || pair[0].sample.measured.checksum != pair[1].sample.measured.checksum
+                || pair[0].sample.sample_denominator != pair[1].sample.sample_denominator
+            {
+                return Err("old-fork/candidate block is not a matched trace".into());
+            }
+        }
+        let rebuilt = build_latency_diagnostic_cell_summary(run.run_seed, point, &rows)?;
+        if rebuilt != *cell {
+            return Err("large-object diagnostic summaries do not match raw observations".into());
+        }
+    }
+    if run.samples.iter().any(|row| {
+        !expected_cells.iter().any(|(card, point)| {
+            row.sample.scenario_id == card.as_str() && row.sample.thread_point == *point
+        })
+    }) {
+        return Err("large-object diagnostic summary matrix is incomplete".into());
+    }
+    Ok(())
+}
+
+pub const LATENCY_DIAGNOSTIC_SCOPE: &str = "paired per-operation latency replay of the exact perf-ab seeded transaction stream; Rust child monotonic timing with sampled operations and a no-allocation control; not perf-ab aggregate CPU timing";
+pub const LATENCY_DIAGNOSTIC_ISOLATION_CLAIM: &str =
+    "old-fork and candidate arms alternate on one host; exclusive-host isolation is not claimed";
+
+pub fn build_latency_diagnostic_cell_summary(
+    run_seed: u64,
+    point: &str,
+    rows: &[&LatencyDiagnosticSample],
+) -> Result<LatencyDiagnosticCell, String> {
+    let cell_point = point.parse::<u32>().map_err(|error| error.to_string())?;
+    let mut arm_values = BTreeMap::<&str, (Vec<u64>, Vec<u64>)>::new();
+    let mut arm_blocks = BTreeMap::<&str, BTreeMap<u32, Vec<u64>>>::new();
+    for row in rows {
+        let entry = arm_values.entry(row.arm.as_str()).or_default();
+        entry.0.extend(
+            row.sample
+                .measured
+                .observations
+                .iter()
+                .map(|x| x.duration_ns),
+        );
+        entry.1.extend(
+            row.sample
+                .control
+                .observations
+                .iter()
+                .map(|x| x.duration_ns),
+        );
+        arm_blocks.entry(row.arm.as_str()).or_default().insert(
+            row.sample.block_id,
+            row.sample
+                .measured
+                .observations
+                .iter()
+                .map(|x| x.duration_ns)
+                .collect(),
+        );
+    }
+    let summarize_arm = |arm: &str| -> Result<LatencyDiagnosticAllocatorSummary, String> {
+        let (measured, control) = arm_values.get(arm).ok_or("diagnostic arm missing")?;
+        let measured = summarize_latency(measured)?;
+        let control = summarize_latency(control)?;
+        Ok(LatencyDiagnosticAllocatorSummary {
+            overhead_valid: overhead_is_valid(&measured, &control),
+            measured,
+            control,
+        })
+    };
+    let old_fork = summarize_arm("old-fork")?;
+    let candidate = summarize_arm("candidate")?;
+    let first = rows.first().ok_or("diagnostic cell has no samples")?;
+    let mut paired_summaries = Vec::new();
+    for (quantile, probability) in [("p50", 0.50), ("p95", 0.95), ("p99", 0.99)] {
+        let summary = diagnostic_block_quantile_effect(
+            run_seed,
+            &first.sample.scenario_id,
+            point,
+            probability,
+            &arm_blocks,
+        )?;
+        paired_summaries.push(LatencyDiagnosticPairedSummary {
+            quantile: quantile.into(),
+            summary,
+        });
+    }
+    Ok(LatencyDiagnosticCell {
+        scenario_id: first.sample.scenario_id.clone(),
+        workload_id: crate::perf_ab_trace::workload(
+            CardId::parse(&first.sample.scenario_id).ok_or("unknown diagnostic scenario")?,
+            cell_point as usize,
+        )
+        .ok_or("diagnostic scenario has no perf-ab trace")?
+        .workload_id
+        .into(),
+        trace_checksum: format!("{:016x}", first.sample.measured.checksum),
+        thread_point: point.into(),
+        thread_count: cell_point,
+        transactions_per_worker: first.sample.measured.completed_transactions
+            / u64::from(cell_point),
+        sample_denominator: first.sample.sample_denominator,
+        transaction_definition: first.sample.transaction_definition.clone(),
+        old_fork,
+        candidate,
+        paired_summaries,
+    })
+}
+
+fn diagnostic_block_quantile_effect(
+    run_seed: u64,
+    scenario_id: &str,
+    point: &str,
+    probability: f64,
+    blocks: &BTreeMap<&str, BTreeMap<u32, Vec<u64>>>,
+) -> Result<PairedEffectSummary, String> {
+    let quantile = match probability {
+        0.50 => "p50",
+        0.95 => "p95",
+        0.99 => "p99",
+        _ => return Err("unsupported diagnostic quantile".into()),
+    };
+    let old = blocks.get("old-fork").ok_or("old-fork blocks missing")?;
+    let candidate = blocks.get("candidate").ok_or("candidate blocks missing")?;
+    if old.len() != candidate.len() || old.keys().ne(candidate.keys()) {
+        return Err("diagnostic arms have unmatched blocks".into());
+    }
+    let pairs = old
+        .iter()
+        .map(|(block, old_values)| {
+            let candidate_values = candidate.get(block).ok_or("candidate block missing")?;
+            Ok((
+                quantile_u64(old_values, probability)?,
+                quantile_u64(candidate_values, probability)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let paired_log_effects = pairs
+        .iter()
+        .map(|(old, candidate)| (old / candidate).ln())
+        .collect::<Vec<_>>();
+    let effect = crate::stats::type7_quantile(&paired_log_effects, 0.5)
+        .map_err(|error| error.to_string())?
+        .exp();
+    let seed_material =
+        format!("latency-diagnostic-bootstrap-v1\0{run_seed}\0{scenario_id}/{point}\0{quantile}");
+    let digest = sha256_bytes(seed_material.as_bytes());
+    let seed = u64::from_str_radix(&digest[..16], 16).map_err(|error| error.to_string())?;
+    let mut rng = SplitMix64 { state: seed };
+    let mut bootstrap_effects = Vec::with_capacity(LATENCY_BOOTSTRAP_RESAMPLES as usize);
+    let mut selected = Vec::with_capacity(paired_log_effects.len());
+    for _ in 0..LATENCY_BOOTSTRAP_RESAMPLES {
+        selected.clear();
+        for _ in 0..paired_log_effects.len() {
+            let index = rng.uniform_below(paired_log_effects.len() as u64) as usize;
+            selected.push(paired_log_effects[index]);
+        }
+        selected.sort_by(f64::total_cmp);
+        bootstrap_effects.push(type7_sorted(&selected, 0.5).exp());
+    }
+    bootstrap_effects.sort_by(f64::total_cmp);
+    Ok(PairedEffectSummary {
+        candidate_id: "mimalloc-pprof-candidate".into(),
+        reference_id: "mimalloc-pprof-old-fork".into(),
+        direction: MetricDirection::LowerIsBetter,
+        block_count: pairs.len() as u64,
+        effect,
+        confidence_interval: ConfidenceInterval {
+            lower: type7_sorted(&bootstrap_effects, 0.025),
+            upper: type7_sorted(&bootstrap_effects, 0.975),
+            confidence_level: 0.95,
+        },
+        bootstrap: BootstrapMetadata {
+            seed,
+            resample_count: LATENCY_BOOTSTRAP_RESAMPLES,
+            method: "percentile-whole-block-bootstrap-of-per-block-type7-quantiles-v1".into(),
+            prng: BOOTSTRAP_PRNG.into(),
+        },
+        informational: true,
+    })
+}
+
 pub const fn transaction_definition(card: CardId) -> &'static str {
     match card {
         CardId::CrossThreadProducerConsumer => "producer allocation through consumer free completion, including queue and ownership transfer",
         CardId::LargeObjects => "allocation plus one-byte-per-page touch/checksum plus free",
+        CardId::LargeObject128KiB => "perf-ab seeded 8-slot replacement/free stream; 128 KiB allocations touch each 4 KiB page and free the replaced slot",
+        CardId::RandomLargeBursty => "perf-ab random-large-bursty seeded 8-slot stream; each 8-burst phase touches every 4 KiB page, drains slots, then idles 300 ms",
+        CardId::LargeClassPersistent => "perf-ab large-class seeded 8-slot replacement/free stream with uniform 96-512 KiB requests and per-page touches",
         CardId::TinyFixed64 | CardId::SmallLogMixed => "allocation plus required touch/checksum plus free",
         _ => "not part of transaction-latency-v1",
     }
@@ -396,9 +867,10 @@ fn latency_cell(
     let point =
         ThreadPoint::parse(point).ok_or_else(|| "unknown latency thread point".to_string())?;
     if !latency_scenario_cells(topology)?
-        .iter()
+        .into_iter()
+        .chain(latency_diagnostic_scenario_cells(topology)?)
         .any(|(candidate_card, candidate_point, _)| {
-            *candidate_card == card && *candidate_point == point
+            candidate_card == card && candidate_point == point
         })
     {
         return Err("undeclared transaction-latency-v1 cell".into());

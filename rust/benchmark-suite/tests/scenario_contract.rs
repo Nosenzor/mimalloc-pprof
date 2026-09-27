@@ -44,7 +44,49 @@ fn core_throughput_v1_has_all_and_only_the_declared_cards_and_points() {
             ("representative-mix", vec!["1", "physical-core"]),
         ]
     );
-    assert_eq!(CardId::ALL.len(), 15);
+    assert_eq!(cards().len(), 15);
+    assert_eq!(CardId::ALL.len(), 18); // 15 published cards plus three opt-in diagnostics.
+    for diagnostic in [
+        CardId::LargeObject128KiB,
+        CardId::RandomLargeBursty,
+        CardId::LargeClassPersistent,
+    ] {
+        assert!(!cards().iter().any(|definition| definition.id == diagnostic));
+    }
+}
+
+#[test]
+fn opt_in_large_object_diagnostic_is_exact_128_kib_on_one_and_eight_workers() {
+    let card = card(CardId::LargeObject128KiB);
+    assert_eq!(
+        card.size_distribution(),
+        benchmark_suite::scenarios::SizeDistribution::Fixed(
+            benchmark_suite::scenarios::LARGE_OBJECT_128K_DIAGNOSTIC_SIZE_BYTES
+        )
+    );
+    assert_eq!(card.thread_points, &[ThreadPoint::One, ThreadPoint::Eight]);
+    let cell = ScenarioCell::new(
+        CardId::LargeObject128KiB,
+        ThreadPoint::Eight,
+        TOPOLOGY,
+        2,
+        0x128,
+    )
+    .unwrap();
+    assert_eq!(cell.threads, 8);
+    let streams = cell.streams().unwrap();
+    assert_eq!(streams.len(), 8);
+    for stream in streams {
+        assert_eq!(
+            stream
+                .requests
+                .iter()
+                .filter(|request| request.kind == RequestKind::Alloc)
+                .map(|request| request.size)
+                .collect::<Vec<_>>(),
+            vec![benchmark_suite::scenarios::LARGE_OBJECT_128K_DIAGNOSTIC_SIZE_BYTES; 2]
+        );
+    }
 }
 
 #[test]

@@ -910,7 +910,7 @@ def run_lint(ctx: RunCtx) -> bool:
     rc, out = run_logged(["uv", "run", "ci/memory_gate.py"], cwd=ROOT, log=ctx.log)
     ok = ok and "Exit codes" in out
 
-    # These four import `yaml`, which python-lint.yml's job-level `pip install`
+    # These workflow checkers import `yaml`, which python-lint.yml's job-level `pip install`
     # provides for every subsequent bare `python3` call in that job. Nothing here
     # guarantees the ambient interpreter has PyYAML, so run them the same way
     # ci/tests gets it below: an ephemeral `uv run --with pyyaml==...` environment.
@@ -919,6 +919,7 @@ def run_lint(ctx: RunCtx) -> bool:
         "ci/check_benchmark_memory_workflow.py",
         "ci/check_benchmark_latency_workflow.py",
         "ci/check_benchmark_scaling_workflow.py",
+        "ci/check_large_span_diagnostic_workflow.py",
         "ci/check_benchmark_pprof_tax_workflow.py",
         "ci/build_pprof_tax_configurations.py",
         # #371 layer 3: the published-parity assertion's own parsers.

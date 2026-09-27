@@ -14,6 +14,7 @@ pub mod memory;
 pub mod memory_runner;
 pub mod model;
 pub mod orchestration;
+pub mod perf_ab_trace;
 pub mod pprof_tax;
 pub mod pprof_tax_adapter;
 pub mod pprof_tax_child;

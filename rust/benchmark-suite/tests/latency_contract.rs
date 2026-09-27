@@ -2,12 +2,18 @@ use std::collections::BTreeMap;
 
 use benchmark_suite::execution::expected_touch_checksum;
 use benchmark_suite::latency::{
-    block_bootstrap_quantile_effect, deterministic_sample_indices, overhead_is_valid,
-    summarize_latency, transaction_definition, validate_latency_raw_run, ContextSwitchCounts,
-    LatencyChildResponse, LatencyClock, LatencyObservation, LatencyRawRun, LatencyRawSample,
-    LatencyScheduling, LATENCY_CHILD_PROTOCOL_VERSION, LATENCY_SCHEMA_VERSION,
+    block_bootstrap_quantile_effect, build_latency_diagnostic_cell_summary,
+    deterministic_sample_indices, latency_diagnostic_scenario_cells, latency_scenario_cells,
+    overhead_is_valid, summarize_latency, transaction_definition, validate_latency_diagnostic_run,
+    validate_latency_raw_run, ContextSwitchCounts, LatencyChildRequest, LatencyChildResponse,
+    LatencyClock, LatencyDiagnosticHost, LatencyDiagnosticRun, LatencyDiagnosticSample,
+    LatencyDiagnosticSource, LatencyObservation, LatencyRawRun, LatencyRawSample,
+    LatencyScheduling, LATENCY_CHILD_PROTOCOL_VERSION, LATENCY_DIAGNOSTIC_ISOLATION_CLAIM,
+    LATENCY_DIAGNOSTIC_SCOPE, LATENCY_SCHEMA_VERSION,
 };
-use benchmark_suite::model::CellCalibration;
+use benchmark_suite::model::{
+    AllocatorIdentity, BenchmarkChildRequest, CellCalibration, RunnerMetadata, ToolchainMetadata,
+};
 use benchmark_suite::scenarios::{card, CardId, ScenarioCell, ThreadPoint, Topology};
 use benchmark_suite::validate::synthetic_full_fixture;
 
@@ -66,10 +72,243 @@ fn sample(block: u32, allocator: &str, measured: &[u64]) -> LatencyRawSample {
     }
 }
 
+fn diagnostic_sample(
+    block: u32,
+    ordinal: u8,
+    arm: &str,
+    card: CardId,
+    point: ThreadPoint,
+    denominator: u64,
+) -> LatencyDiagnosticSample {
+    let count = match point {
+        ThreadPoint::One => 1,
+        ThreadPoint::Eight => 8,
+        _ => unreachable!(),
+    };
+    let workload = benchmark_suite::perf_ab_trace::workload(card, count as usize).unwrap();
+    let seed = benchmark_suite::perf_ab_trace::PERF_AB_STREAM_SEED_BASE;
+    let transactions = workload.operations_per_worker;
+    let mut value = sample(block, "mimalloc-pprof", &[100]);
+    value.workload_seed = seed;
+    value.ordinal = ordinal;
+    value.scenario_id = card.as_str().into();
+    value.thread_point = point.name().into();
+    value.thread_count = count;
+    value.sample_denominator = denominator;
+    value.transaction_definition = transaction_definition(card).into();
+    value.allocator_source_sha = if arm == "old-fork" {
+        "c".repeat(40)
+    } else {
+        "a".repeat(40)
+    };
+    value.child_binary_sha256 = if arm == "old-fork" {
+        "d".repeat(64)
+    } else {
+        "b".repeat(64)
+    };
+    value.measured.checksum =
+        benchmark_suite::perf_ab_trace::trace_checksum(workload, count as usize);
+    value.control.checksum = 1;
+    for (control, response) in [(&mut value.control, true), (&mut value.measured, false)] {
+        control.completed_transactions = transactions * count as u64;
+        control.observations = (0..count)
+            .flat_map(|worker| {
+                benchmark_suite::latency::deterministic_sample_indices(
+                    seed,
+                    worker,
+                    transactions,
+                    denominator,
+                )
+                .unwrap()
+                .into_iter()
+                .map(move |transaction| LatencyObservation {
+                    thread_index: worker,
+                    transaction_index: transaction,
+                    duration_ns: if response {
+                        10
+                    } else {
+                        100 + u64::from(ordinal) * 10
+                    },
+                })
+            })
+            .collect();
+        control.scheduling.thread_count = count;
+        control.scheduling.physical_cores = 8;
+        control.scheduling.logical_cores = 8;
+        control.scheduling.affinity_policy = "linux:unrestricted".into();
+        control.scheduling.actual_cpu_ids = vec![Some(0); count as usize];
+    }
+    LatencyDiagnosticSample {
+        arm: arm.into(),
+        execution_order: ordinal,
+        sample: value,
+    }
+}
+
 #[test]
 fn reciprocal_throughput_is_not_latency_input() {
     let reciprocal = br#"{"metric_schema_version":"transaction-latency-v1","ns_per_op":12.5}"#;
     assert!(serde_json::from_slice::<benchmark_suite::latency::LatencyRawRun>(reciprocal).is_err());
+}
+
+#[test]
+fn default_latency_child_request_serialization_is_unchanged() {
+    let allocator = AllocatorIdentity {
+        allocator_id: "mimalloc-pprof".into(),
+        allocator_version: "test".into(),
+        source_sha: "a".repeat(40),
+        library_sha256: "b".repeat(64),
+        child_binary_sha256: "c".repeat(64),
+    };
+    let request = LatencyChildRequest {
+        protocol_version: LATENCY_CHILD_PROTOCOL_VERSION.into(),
+        metric_schema_version: LATENCY_SCHEMA_VERSION.into(),
+        sample_denominator: 1,
+        expected_trace_checksum: None,
+        control: false,
+        runner_class: "test".into(),
+        affinity_policy: "linux:unrestricted".into(),
+        benchmark: BenchmarkChildRequest {
+            protocol_version: "benchmark-child-v1".into(),
+            schema_version: benchmark_suite::RAW_SCHEMA_VERSION.into(),
+            suite_version: benchmark_suite::CORE_SUITE_VERSION.into(),
+            run_kind: "headline".into(),
+            execution_mode: "normal".into(),
+            run_seed: 1,
+            block_id: 0,
+            ordinal: 0,
+            workload_seed: 1,
+            allocator,
+            scenario_id: CardId::TinyFixed64.as_str().into(),
+            scenario_version: benchmark_suite::CORE_SUITE_VERSION.into(),
+            thread_point: "1".into(),
+            physical_cores: 1,
+            logical_cores: 1,
+            transactions_per_worker: 1,
+            warmup_transactions_per_worker: 1,
+            reproduction_command: "test".into(),
+            runner: RunnerMetadata {
+                os: "linux".into(),
+                architecture: "x86_64".into(),
+                physical_cores: 1,
+                logical_cores: 1,
+            },
+            toolchain: ToolchainMetadata {
+                rustc: "test".into(),
+                target: "x86_64-unknown-linux-gnu".into(),
+                compiler: "test".into(),
+                linker: "test".into(),
+            },
+        },
+    };
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["protocol_version"], "transaction-latency-child-v1");
+    assert!(value.get("expected_trace_checksum").is_none());
+}
+
+#[test]
+fn exact_128k_one_and_eight_worker_cells_are_opt_in() {
+    let topology = Topology {
+        physical_cores: 8,
+        logical_cores: 8,
+    };
+    assert_eq!(latency_scenario_cells(topology).unwrap().len(), 5);
+    let diagnostic = latency_diagnostic_scenario_cells(topology).unwrap();
+    assert_eq!(diagnostic.len(), 4);
+    assert_eq!(diagnostic[0].0, CardId::LargeObject128KiB);
+    assert_eq!(diagnostic[0].1.name(), "1");
+    assert_eq!(diagnostic[1].1.name(), "8");
+
+    let mut samples = Vec::new();
+    let mut cells = Vec::new();
+    for &(card, point, _) in &diagnostic {
+        let denominator = 1024;
+        let rows = (0..2)
+            .flat_map(|block| {
+                let first = if block % 2 == 0 {
+                    "old-fork"
+                } else {
+                    "candidate"
+                };
+                [
+                    first,
+                    if first == "old-fork" {
+                        "candidate"
+                    } else {
+                        "old-fork"
+                    },
+                ]
+                .into_iter()
+                .enumerate()
+                .map(move |(order, arm)| {
+                    diagnostic_sample(block, order as u8, arm, card, point, denominator)
+                })
+            })
+            .collect::<Vec<_>>();
+        cells.push(
+            build_latency_diagnostic_cell_summary(
+                0x543,
+                point.name(),
+                &rows.iter().collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        samples.extend(rows);
+    }
+    assert_eq!(cells[1].thread_count, 8);
+    assert_eq!(cells[0].paired_summaries.len(), 3);
+    assert!(cells[0]
+        .paired_summaries
+        .iter()
+        .all(|value| value.summary.block_count == 2));
+
+    let run = LatencyDiagnosticRun {
+        metric_schema_version: LATENCY_SCHEMA_VERSION.into(),
+        status: "diagnostic".into(),
+        run_seed: 0x543,
+        measurement_scope: LATENCY_DIAGNOSTIC_SCOPE.into(),
+        host: LatencyDiagnosticHost {
+            stable_host_id: "test-host".into(),
+            stable_host_identity_status: "reported".into(),
+            stable_host_identity_source: "runner-reported".into(),
+            runner_fingerprint_sha256: "f".repeat(64),
+            cpu_model: "test-cpu".into(),
+            physical_cores: 8,
+            logical_cores: 8,
+            target: "x86_64-unknown-linux-gnu".into(),
+            transparent_hugepage: "[madvise] always never".into(),
+            affinity_policy: "linux:unrestricted".into(),
+            affinity_logical_cpu_ids: (0..8).collect(),
+            isolation_claim: LATENCY_DIAGNOSTIC_ISOLATION_CLAIM.into(),
+        },
+        old_fork: LatencyDiagnosticSource {
+            source_sha: "c".repeat(40),
+            library_sha256: "e".repeat(64),
+            child_binary_sha256: "d".repeat(64),
+        },
+        candidate: LatencyDiagnosticSource {
+            source_sha: "a".repeat(40),
+            library_sha256: "f".repeat(64),
+            child_binary_sha256: "b".repeat(64),
+        },
+        cells,
+        samples,
+    };
+    validate_latency_diagnostic_run(&run, 2).unwrap();
+
+    let mut missing_pair = run.clone();
+    missing_pair.samples.pop();
+    assert!(validate_latency_diagnostic_run(&missing_pair, 2).is_err());
+    let mut wrong_cell = run.clone();
+    wrong_cell.cells[1].thread_count = 4;
+    assert!(validate_latency_diagnostic_run(&wrong_cell, 2).is_err());
+
+    let mut unpaired_trace = run.clone();
+    unpaired_trace.samples[1].sample.workload_seed += 1;
+    assert!(validate_latency_diagnostic_run(&unpaired_trace, 2).is_err());
+    let mut non_alternating = run;
+    non_alternating.samples[0].execution_order = 1;
+    assert!(validate_latency_diagnostic_run(&non_alternating, 2).is_err());
 }
 
 #[test]

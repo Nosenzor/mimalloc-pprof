@@ -221,7 +221,9 @@ def holes_rows(reports: dict[tuple[str, str], str]) -> list[str]:
     return rows
 
 
-def build(arm: str, ref: str, work: Path, kind: str, cppdefs: list[str]) -> Path:
+def build(
+    arm: str, ref: str, work: Path, kind: str, cppdefs: list[str], diagnostic: bool = False
+) -> Path:
     # Paths named by arm ("base"/"head") and build (BUILDS), never by ref: every
     # executable path then has the same length, and so does the process's initial stack. A
     # longer argv/environment shifts stack alignment, the likely reason identical binaries
@@ -238,6 +240,7 @@ def build(arm: str, ref: str, work: Path, kind: str, cppdefs: list[str]) -> Path
         [
             "cc",
             "-O2",
+            *(["-DPERF_AB_DIAGNOSTIC=1"] if diagnostic else []),
             "-I",
             str(tree / "include"),
             str(ROOT / "ci/perf_ab.c"),
