@@ -2,7 +2,9 @@
 """Reference reader for mimalloc's binary heap snapshot (format version 1).
 
 This is the executable format spec for `mi_heap_snapshot` / `mi_heap_snapshot_to_file`
-(src/heap-snapshot.c; Bun parity, issue #338). The layout is fixed-width little-endian:
+(src/heap-snapshot.c; Bun parity, issue #338). The layout is fixed-width; this reader decodes
+little-endian (the writer emits host byte order, little-endian on every target this fork
+builds and tests):
 
     header : u32 magic 'MIHS' (0x5348494D) | u32 version=1 | u32 ptr_size | u32 slice_size
              u32 flags | u32 reserved | u64 clock_ms | u64 writer_tid | u32 arena_count
@@ -23,7 +25,8 @@ This is the executable format spec for `mi_heap_snapshot` / `mi_heap_snapshot_to
     footer : u32 ' END' | u64 page_count
 
 The `u64 0` sentinel sits where the next page's `page_start` would be, so a page list is
-read by peeking one u64 at a time. Every integer is little-endian regardless of host.
+read by peeking one u64 at a time. Every integer is decoded little-endian regardless of the
+reading host, so a snapshot from a big-endian writer would not parse.
 
     import mi_snapshot
     snap = mi_snapshot.load("mimalloc-snapshot.1234.bin")
