@@ -31,6 +31,7 @@ use crate::scenarios::{card, ScenarioCell, Topology};
 use crate::{CORE_SUITE_VERSION, RAW_SCHEMA_VERSION};
 
 const HARD_LIMIT_SECONDS: f64 = 60.0 * 60.0;
+const DIAGNOSTIC_MIN_BLOCKS: u32 = 7;
 
 #[derive(Debug)]
 struct Options {
@@ -104,13 +105,7 @@ fn run(options: Options) -> Result<(), String> {
     }
     std::fs::create_dir_all(&options.output_dir)
         .map_err(|error| format!("create latency output: {error}"))?;
-    if options.reduced_smoke {
-        if options.blocks != 1 {
-            return Err("latency reduced smoke requires --blocks 1".into());
-        }
-    } else if options.blocks < 15 {
-        return Err("complete latency runs require --blocks at least 15".into());
-    }
+    validate_block_count(&options)?;
 
     let lock =
         AllocatorLock::parse_and_validate(include_str!("../allocators/allocator-lock.json"))?;
@@ -191,6 +186,35 @@ fn run(options: Options) -> Result<(), String> {
         physical_cores: publication_runner.physical_cores,
         logical_cores: publication_runner.logical_cores,
     };
+    if options.diagnostic_large_object {
+        let old_fork =
+            old_fork.ok_or("old-fork diagnostic provenance is missing mimalloc-pprof")?;
+        let diagnostic = run_large_object_diagnostic(
+            current_fork,
+            old_fork,
+            options.run_seed,
+            options.blocks,
+            options.warmup_transactions,
+            options.initial_transactions,
+            options.timeout,
+            topology,
+            &runner,
+            &publication_runner,
+            options.diagnostic_stable_host_id.as_deref(),
+        )?;
+        validate_latency_diagnostic_run(&diagnostic, options.blocks)?;
+        write_new_json(
+            options
+                .output_dir
+                .join("latency-large-object-diagnostic.json"),
+            &diagnostic,
+        )?;
+        println!(
+            "PASS large-object latency diagnostic: {} paired blocks",
+            options.blocks
+        );
+        return Ok(());
+    }
     let run_kind = if options.reduced_smoke {
         "reduced-smoke"
     } else {
@@ -393,29 +417,6 @@ fn run(options: Options) -> Result<(), String> {
         )?;
         return Err(reason);
     }
-    if let Some(old_fork) = old_fork {
-        let diagnostic = run_large_object_diagnostic(
-            current_fork,
-            old_fork,
-            options.run_seed,
-            options.blocks,
-            options.reduced_smoke,
-            options.warmup_transactions,
-            options.initial_transactions,
-            options.timeout,
-            topology,
-            &runner,
-            &publication_runner,
-            options.diagnostic_stable_host_id.as_deref(),
-        )?;
-        validate_latency_diagnostic_run(&diagnostic, options.blocks)?;
-        write_new_json(
-            options
-                .output_dir
-                .join("latency-large-object-diagnostic.json"),
-            &diagnostic,
-        )?;
-    }
     let raw = LatencyRawRun {
         metric_schema_version: LATENCY_SCHEMA_VERSION.into(),
         status: if options.reduced_smoke {
@@ -445,13 +446,32 @@ fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_block_count(options: &Options) -> Result<(), String> {
+    if options.diagnostic_large_object {
+        if options.reduced_smoke {
+            return Err("large-object diagnostic cannot be combined with --reduced-smoke".into());
+        }
+        if options.blocks < DIAGNOSTIC_MIN_BLOCKS {
+            return Err(format!(
+                "large-object diagnostic requires --blocks at least {DIAGNOSTIC_MIN_BLOCKS}"
+            ));
+        }
+    } else if options.reduced_smoke {
+        if options.blocks != 1 {
+            return Err("latency reduced smoke requires --blocks 1".into());
+        }
+    } else if options.blocks < 15 {
+        return Err("complete latency runs require --blocks at least 15".into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_large_object_diagnostic(
     candidate: &crate::orchestration::ChildProgram,
     old_fork: &crate::orchestration::ChildProgram,
     run_seed: u64,
     blocks: u32,
-    reduced_smoke: bool,
     warmup_transactions: u64,
     _initial_transactions: u64,
     timeout: Duration,
@@ -472,12 +492,7 @@ fn run_large_object_diagnostic(
             protocol_version: CHILD_PROTOCOL_VERSION.into(),
             schema_version: RAW_SCHEMA_VERSION.into(),
             suite_version: CORE_SUITE_VERSION.into(),
-            run_kind: if reduced_smoke {
-                "reduced-smoke"
-            } else {
-                "headline"
-            }
-            .into(),
+            run_kind: "headline".into(),
             execution_mode: "normal".into(),
             run_seed,
             block_id: 0,
@@ -740,7 +755,7 @@ fn parse_number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::parse_options;
+    use super::{parse_options, validate_block_count};
     use std::ffi::OsString;
 
     fn options(args: &[&str]) -> Result<super::Options, String> {
@@ -786,5 +801,65 @@ mod tests {
             "  ",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn diagnostic_seven_blocks_do_not_relax_publication_minimum() {
+        let diagnostic = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--blocks",
+            "7",
+        ])
+        .unwrap();
+        assert!(validate_block_count(&diagnostic).is_ok());
+
+        let publication = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--blocks",
+            "7",
+        ])
+        .unwrap();
+        assert_eq!(
+            validate_block_count(&publication).unwrap_err(),
+            "complete latency runs require --blocks at least 15",
+        );
+
+        let diagnostic_six = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--blocks",
+            "6",
+        ])
+        .unwrap();
+        assert!(validate_block_count(&diagnostic_six).is_err());
+
+        let smoke_diagnostic = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--reduced-smoke",
+            "--blocks",
+            "1",
+        ])
+        .unwrap();
+        assert!(validate_block_count(&smoke_diagnostic).is_err());
     }
 }
