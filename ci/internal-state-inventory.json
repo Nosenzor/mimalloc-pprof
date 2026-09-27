@@ -638,6 +638,26 @@
         "dhat_lock protects the arena list and bump pointer",
         "raw OS layer may lock internally"
       ]
+    },
+    {
+      "id": "dhat-dump-frame-map",
+      "path": "src/dhat.c",
+      "callee": "_mi_os_alloc",
+      "args": "_mi_subproc_main(),size,&memid",
+      "occurrence": 1,
+      "owner": "one mi_dhat_dump call's frame-table numbering (#551)",
+      "initial_owner": "unpublished process-main raw OS scratch",
+      "owner_transitions": "held in a stack-local dhat_frame_map_t for one dhat_write_json_locked call, replaced by a doubled array at half load; never published",
+      "destroyable_by": "the same dhat_write_json_locked call; never an application heap",
+      "lifetime": "one DHAT JSON dump, or until the next doubling",
+      "logical_size": "a power-of-two slot count (DHAT_FRAME_MAP_MIN_SLOTS, doubled while more than half full) times one {pc, index} entry, so beyond the first size at most four slots per distinct PC",
+      "usable_size": "map->mask + 1 entries; map->memid retains the raw OS cleanup extent",
+      "cleanup": "dhat_frame_map_free calls _mi_os_free on the outgoing array at each doubling and on the last one before the dump returns",
+      "publication": "not published; read only by the dump that allocated it, under dhat_lock",
+      "locks": [
+        "dhat_lock is held for the whole build, use and release",
+        "raw OS layer may lock internally"
+      ]
     }
   ]
 }
