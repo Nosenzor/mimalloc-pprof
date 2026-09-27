@@ -39,9 +39,13 @@ shape: its `dhat` feature always turns `memory-events` on as well.
 per allocation), `MI_DHAT_STACK_MAX` 128 (a clamp in `_mi_dhat_stack_capture` that never
 binds), `DHAT_CHUNK_SIZE` 64 KiB (minimum arena chunk), `DHAT_DEFAULT_BUDGET` 64 MiB, and
 `DHAT_BUCKETS` 4096 (both hash tables; a power of two, since the index is
-`hash & (DHAT_BUCKETS - 1)`). None has an `#ifndef` guard, so a `-D` override is a
-redefinition, short of CLAUDE.md rule 11 (newer than this file); the frame walk's 8 MiB
-limit (`8u << 20`) is inline too.
+`hash & (DHAT_BUCKETS - 1)`). The four in `src/dhat.c` are `#ifndef` guarded (CLAUDE.md
+rule 11), so a build can override them with `-D`, as can `DHAT_FRAME_MAP_MIN_SLOTS` (1024,
+the dump's first frame-map size, §5). An `#error` rejects either table size if it is not a
+power of two. `test-dhat-one-bucket` builds the collector with `-DDHAT_BUCKETS=1
+-DDHAT_FRAME_MAP_MIN_SLOTS=2` (§9). `MI_DHAT_STACK_MAX` in `src/dhat-stack.c` has no guard,
+so a `DHAT_STACK_MAX` above 128 is silently clamped to 128. The frame walk's 8 MiB limit
+(`8u << 20`) is still inline.
 
 **Runtime configuration.** DHAT has no `mi_option_*` entry. It reads three variables
 directly through `_mi_getenv`:
@@ -79,7 +83,7 @@ Declared in `include/mimalloc/dhat.h`. All functions are `mi_attr_noexcept`.
 | `void mi_dhat_stop(void)` | Idempotent. It stops observing but **keeps** every record for dumping. It sets `dhat_stopping`, stores `DHAT_DISABLED`, clears the armed bit, then yield-spins (`_mi_prim_thread_yield`) until `dhat_inflight` is zero, and stamps `dhat_ended`. It is a no-op from inside an armed event, which is how the spin avoids waiting on itself. |
 | `bool mi_dhat_is_enabled(void)` | A relaxed load of `dhat_state == DHAT_ENABLED`. It is false before resolution. |
 | `bool mi_dhat_stats_get(mi_dhat_stats_t*)` | Requires `size == sizeof(mi_dhat_stats_t)` and `version == MI_DHAT_STATS_VERSION` (1). It copies the ledger under `dhat_lock`, so it is consistent with the dump, and it works while stopped. `mi_dhat_stats_t_decl(name)` fills both (a lower-case macro grandfathered in `ci/macro_case_baseline.txt`). Fields: `enabled`, `incomplete`, `total_bytes`/`total_blocks` (every observed allocation call, realloc included), `live_*`, `peak_*` (at the byte peak), `dropped`, `internal_bytes` (committed collector chunks). |
-| `bool mi_dhat_dump(const char* path)` | Writes the JSON of §5, while active or stopped, and even if DHAT never started (an empty `pps`). It returns `false` for a `NULL` path, from inside an armed event or a nested dump, if `fopen` fails, or if `fclose` fails. `fprintf` errors are not checked. |
+| `bool mi_dhat_dump(const char* path)` | Writes the JSON of §5, while active or stopped, and even if DHAT never started (an empty `pps`). It returns `false` for a `NULL` path, from inside an armed event or a nested dump, if `fopen` fails, if the frame map's scratch cannot be allocated (the file is then left empty, §5), or if `fclose` fails. `fprintf` errors are not checked. |
 
 ```c
 #include <mimalloc.h>
@@ -178,8 +182,10 @@ rounds each request up to `MI_MAX_ALIGN_SIZE` (the arena holds `uint64_t` counte
 when the chunk is full, pushes a new `max(DHAT_CHUNK_SIZE, header + request)` chunk from
 `_mi_os_alloc(_mi_subproc_main(), ...)` onto `dhat_chunks`, adding it to
 `dhat_internal_bytes`. It never calls a hooked path. `ci/internal-state-inventory.json`
-classifies that one site as `dhat-collector-arena-chunk`, enforced by
+classifies that site as `dhat-collector-arena-chunk`, enforced by
 `ci/check_internal_state.py` ([internal-state-diagnostics.md](internal-state-diagnostics.md)).
+DHAT's only other raw OS site is the dump's frame map (`dhat-dump-frame-map`, §5), which
+lives for one dump and is never part of the arena.
 
 The arena is always touched under `dhat_lock` and is **never freed piecemeal**: a freed
 record is unlinked, not reused, so collector memory grows with the number of **observed
@@ -200,16 +206,18 @@ allocation still succeeds.
 |---|---|---|
 | `dhat_pp_t` (program point) | `hash`, `depth`, `pcs[]`, and per-point counters `tb`, `tbk`, `tl`, `live`, `livek`, `mb`, `mbk`, `gb`, `gbk`, plus `dump_tl` scratch | FNV-1a over the PC bytes (`dhat_hash_stack`), then an exact compare (`dhat_stack_equal`) |
 | `dhat_record_t` (live block) | `ptr`, requested `size`, `born`, `page`, `pp` | a 64-bit multiply-xorshift of the pointer (`dhat_hash_ptr`) |
-| `dhat_pp_table`, `dhat_live_table` | `DHAT_BUCKETS` chained buckets each, allocated lazily from the arena by `dhat_init_tables_locked` | |
+| `dhat_pp_table`, `dhat_live_table` | `DHAT_BUCKETS` chained buckets each, allocated lazily by `dhat_init_tables_locked` as **one** arena object (`dhat_tables_t`), so both exist or neither does | |
 
 Neither table ever resizes. A lookup is one bucket plus a chain walk, so chains average
 `live / 4096`. New program points are pushed at the chain head; live records are appended
-at the tail (`dhat_record_slot_locked` returns the terminating slot). `dropped` counts **failure
-occurrences**, which is not always the number of lost events. Budget exhaustion after the
-tables exist is counted per event. But if one table allocation succeeds and the other fails,
-`dhat_init_tables_locked` marks one drop and then refuses every later event without counting
-it (`incomplete` is already set). A scratch run with a 70000-byte budget recorded 0 of
-1000 allocations and reported `dropped == 1`.
+at the tail (`dhat_record_slot_locked` returns the terminating slot). `dropped` counts
+**failure occurrences**. Every allocation the collector refuses counts once: stack capture
+of depth 0, tables the budget refuses (retried, and counted, on each allocation), a
+program point or record the budget refuses, or an address that already has a record. So
+for allocations alone, `total_blocks + dropped` is the number observed. A free or resize
+whose counters would underflow also counts, clamping to 0, and one free can count twice.
+Before #551 the two tables were separate allocations. A budget that admitted only the
+first then refused every later event without counting it.
 
 ### 4.5 What each event commits
 
@@ -299,28 +307,42 @@ order:
 | `te` | ms from start to now, or to `dhat_ended` once stopped. If DHAT never started, this is the raw clock value |
 | `mi_dhat_incomplete` | extra key: `true` if anything was dropped this session |
 | `pps` | one object per program point, in bucket order and then chain order (not sorted) |
-| `ftbl` | frame table of `"0x…"` hex PCs. It is *meant* to hold each distinct PC once, in first-occurrence order, but see the known defect below |
+| `ftbl` | frame table of `"0x…"` hex PCs: each distinct PC once, in first-occurrence order |
 
 Each `pps` entry has `tb`/`tbk` (total bytes and blocks, reallocs included), `tl` (total
 lifetime in ms), `mb`/`mbk` (the point's own maximum live), `gb`/`gbk` (live at the global
 peak), `eb`/`ebk` (live at the end), and `fs`, an array of indices into `ftbl`, innermost
 frame first. `tl` is `dump_tl`: `dhat_prepare_dump_lifetimes_locked` adds `now - born` for
 records still live, and does so without changing the ledger's completed-lifetime total.
-Frame-table deduplication allocates nothing; the code comment calls it O(frames³), accepted
-for a diagnostic operation. The PCs are **unsymbolized runtime addresses**, and DHAT emits no
-module map (unlike the profiler's `src/profile-maps.c`), so under ASLR symbolization needs
-the load addresses from the same run.
+The PCs are **unsymbolized runtime addresses**, and DHAT emits no module map (unlike the
+profiler's `src/profile-maps.c`), so under ASLR symbolization needs the load addresses from
+the same run.
 
-> **Known defect: `ftbl` can omit PCs, and then `fs` points at the wrong frames.** The `fs`
-> indices come from `dhat_frame_index_locked`, whose `dhat_frame_seen_before_locked` stops
-> scanning at the current program point. The `ftbl` loop in `dhat_write_json_locked` does
-> its own inline "seen" scan instead. For the current bucket (`j == i`), that scan walks the
-> **whole** chain at full depth, including program points *after* the current one. A PC
-> shared by two program points in one bucket, and absent from every earlier bucket, is
-> therefore never emitted. Every `fs` index at or past the first omitted position then
-> resolves to the wrong entry, and the largest point past the end of `ftbl`: a scratch dump
-> of 72 program points emitted 3 `ftbl` entries while its `fs` indices reached 7. Treat
-> `fs`/`ftbl` from non-trivial runs as unreliable until fixed; the `pps` counters are fine.
+**The frame table.** `fs` and `ftbl` read one numbering. Before writing anything,
+`dhat_frame_map_build_locked` makes one pass over the program points in dump order (bucket,
+then chain, then frame), and gives each distinct PC the next index at its first occurrence.
+- **The map.** An open-addressing table of `{pc, index}` entries (16 bytes on a 64-bit
+  target), keyed by `dhat_hash_ptr` with linear probing. It holds one entry per **distinct**
+  PC. Program points repeat the hook-chain and caller PCs, so that is far fewer than the
+  frames it indexes.
+- **Growth.** It starts at `DHAT_FRAME_MAP_MIN_SLOTS` slots and doubles, rehashing, whenever
+  it would pass half full.
+- **Writing.** `fs` looks each PC up. `ftbl` is a second walk in the same order, which
+  writes a PC wherever the next unwritten index first turns up.
+- **Scratch.** The scratch comes straight from `_mi_os_alloc` (rule 4; inventory id
+  `dhat-dump-frame-map`). It is not charged to `MIMALLOC_DHAT_MAX_BYTES` and not counted in
+  `internal_bytes`. `dhat_frame_map_free` returns each outgoing array at a doubling, and the
+  last one before the dump returns. If an allocation fails, `mi_dhat_dump` returns `false`
+  and the file is left empty.
+
+Every step is O(frames).
+
+Before #551 (fixed): the `fs` indices came from a recursive scan that stopped at the current
+program point, while the `ftbl` loop did its own scan that walked the current bucket's
+**whole** chain. A PC shared by two program points in one bucket, and absent from earlier
+buckets, was never emitted, so `fs` indices resolved to the wrong frames or past the end of
+`ftbl`. With 256 distinct stacks, `ftbl` held 2 of 12 PCs. The index scan was also
+O(frames³) under `dhat_lock`: 4.6 s for 1024 stacks, against milliseconds now.
 
 **When a report is written.** On an explicit `mi_dhat_dump`, or at exit when
 `MIMALLOC_DHAT_DUMP_AT_EXIT` is set: `_mi_dhat_process_done` runs in `mi_process_done_once`
@@ -368,10 +390,17 @@ must call `mi_dhat_dump` themselves (`include/mimalloc/dhat.h`).
   `_mi_dhat_fork_prepare` / `_mi_dhat_fork_parent` take and release `dhat_lock`, and
   `_mi_dhat_fork_child` re-initializes it and resets `dhat_once`. The records survive
   copy-on-write, so `mi_dhat_dump` and `mi_dhat_stats_get` work in the child.
-  **Possible defect (static trace, not reproduced):** `dhat_inflight` and `dhat_stopping`
-  are not reset. If any parent thread was mid-event at the fork, for example blocked on
-  `dhat_lock` after its increment, then in the child `mi_dhat_stop` spins forever and
-  `mi_dhat_start` always returns `false`.
+  Only the forking thread survives, so the child also resets the session protocol (#551):
+  - `dhat_inflight` becomes the forking thread's **own** contribution: 1 if its DHAT event
+    is armed, which happens only for a `fork()` called from a memory-change callback, and
+    0 otherwise. That surviving event still finishes in the child and decrements, so
+    zeroing the counter would underflow it.
+  - A set `dhat_stopping` is cleared, and `dhat_ended` is stamped at the fork, which is
+    what the interrupted stop would have done after draining.
+
+  Events other threads had in flight are lost to the child's ledger and are not counted as
+  dropped. Before the fix, an inherited count made the child's `mi_dhat_stop` spin forever
+  and its `mi_dhat_start` always return `false`.
 
 ## 7. Accuracy guarantees and cost
 
@@ -405,8 +434,8 @@ stalling every allocating thread. Use it for short runs.
 - **Stop, then destroy.** `_mi_dhat_forget_heap` acts only while active. Blocks of a heap
   destroyed after `mi_dhat_stop` still appear as live (`eb`) in that session's dump.
 - **Possible defects, found by static trace and not reproduced:** a dump nesting locks inside
-  `dhat_lock`, a dump from a thread without a tld, and inherited `dhat_inflight` in a fork child
-  (all §6); a cross-thread moving realloc (§4.1).
+  `dhat_lock` and a dump from a thread without a tld (both §6); a cross-thread moving
+  realloc (§4.1).
 - **Several mimallocs in one process.** Each copy has its own DHAT state but reads the same
   environment, so two DHAT builds with `MIMALLOC_DHAT_DUMP_AT_EXIT` set write the same path
   and the last wins ([profiler.md](profiler.md#if-your-process-contains-more-than-one-mimalloc)).
@@ -415,7 +444,8 @@ stalling every allocating thread. Use it for short runs.
 
 | test | registered | asserts |
 |---|---|---|
-| `test-dhat` (`test/test-dhat.c`) | only `if(MI_DHAT)` | an empty dump right after start; exact totals and live counts over malloc, realloc and free, and a lower bound on peak bytes; no callback leaks during a dump while active; the over-aligned path reports caller sizes (16 and 12); after stop, the JSON has `dhatFileVersion`, `bklt`, `bkacc`, `pps` and `ftbl`. With `MI_MEMEVT` it also checks that the callback table saw 2/1/1 events; without, that the memory-events API is stubbed |
+| `test-dhat` (`test/test-dhat.c`) | only `if(MI_DHAT)` | an empty dump right after start; exact totals and live counts over malloc, realloc and free, and a lower bound on peak bytes; no callback leaks during a dump while active; the over-aligned path reports caller sizes (16 and 12); after stop, the JSON has `dhatFileVersion`, `bklt`, `bkacc`, `pps` and `ftbl`. The frame table over 32 recursion-depth stacks (#551): every `fs` index is below `len(ftbl)`, `ftbl` has no duplicates, indices appear in first-occurrence order, and each depth's program point maps to its call site's return address wherever the capture saw it (at least one site must be checked where the capture walks every frame). A budget sweep asserts `total_blocks + dropped == 1000` for every budget. With `MI_MEMEVT` it also checks that the callback table saw 2/1/1 events; without, that the memory-events API is stubbed. With `MI_MEMEVT` on POSIX, three fork scenarios require the child's `mi_dhat_stop` to return and its `mi_dhat_start` to succeed: a thread parked in its armed event, the same plus a thread draining `mi_dhat_stop`, and a fork from the thread's own callback |
+| `test-dhat-one-bucket` (the same source, `DHAT_TEST_ONE_BUCKET=1` for its own dump file names) | `if(MI_DHAT)`, with `MI_BUILD_STATIC` and not `MI_DEBUG_TSAN` | the same assertions against a collector compiled from `src/static.c` with `-DDHAT_BUCKETS=1 -DDHAT_FRAME_MAP_MIN_SLOTS=2`. Every program point shares one chain, so the #551 frame-table case fails deterministically instead of by chance, and every dump grows and rehashes its frame map |
 | `test-fork-locks-dhat-env` | `NOT WIN32` and `MI_DHAT`, with env `MIMALLOC_DHAT=1` | because of the §2 defect this variant arms nothing and behaves like `test-fork-locks`; DHAT is exercised only by `check_dump_in_child`, which calls `mi_dhat_start` after the fork loop (in every variant) and requires `mi_dhat_dump` to succeed in the child |
 | `test-memory-events` T12 | with `MI_MEMEVT` | a brand-new thread's first allocation with memory-events, the profiler and DHAT all active must not deadlock |
 | `test-observer-scaling` | always, `RUN_SERIAL` | the 4-thread / 1-thread aggregate throughput ratio stays ≥ 1.20 (`MIN_SPEEDUP`); it skips below 4 hardware threads, under `MI_OWNER_GATE`, at guarded sample rate 1, and below 1 Mops/s single-threaded. This is #371's behavioural gate against a serializing observer prologue |
