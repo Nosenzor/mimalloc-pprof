@@ -855,7 +855,9 @@ struct mi_subproc_s {
 // Thread Local data
 // ------------------------------------------------------
 
-// Allocation sampling profiler per-thread state (MI_PPROF).
+// Allocation sampling profiler per-thread state (profile.c). The type and `mi_tld_t::profiler`
+// exist in every build; only profile.c (MI_PPROF) writes them, and a debug build's idle sweep
+// reads them to assert it left them unchanged.
 typedef struct mi_profiler_tld_s {
   size_t   bytes_since_sample;
   size_t   next_threshold;
@@ -888,17 +890,20 @@ typedef struct mi_hooks_tld_s {
     void*      pp;                    // dhat_pp_t*
     bool       armed;
   }        dhat_event;
-  int      prof_callback_depth;       // profile.c (MI_PPROF): reentrancy / suppression depth
-  bool     prof_lock_owner;           // profile.c (MI_PPROF): this thread already holds prof_lock
+  int      prof_callback_depth;       // profile.c: reentrancy / suppression depth (present in every build; used with MI_PPROF)
+  bool     prof_lock_owner;           // profile.c: this thread already holds prof_lock (present in every build; used with MI_PPROF)
 } mi_hooks_tld_t;
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7a):
 // idle handoff states for `mi_tld_t::park_state`.
 // `size_t`-typed, not `uint32_t`: see `mi_scav_word_t` above -- the MSVC C atomics wrapper
 // only has pointer-width accessors, so every field reached through `mi_atomic_*` is one word.
+// #366 widened who parks and who claims: an MI_OWNER_GATE build parks every thread outside an
+// allocator call (`_mi_gate_leave`), and `mi_purge_all`, the arena reclaim and the diagnostic
+// walk (src/diagnostic-walk.c) claim parked tlds too.
 #define MI_PARK_RUNNING   (0)   // the owner is running: only the owner may touch its theaps
-#define MI_PARK_PARKED    (1)   // the owner blocked in `mi_on_thread_idle_start`: the scavenger may claim it
-#define MI_PARK_SWEEPING  (2)   // the scavenger claimed it and is doing the idle work right now
+#define MI_PARK_PARKED    (1)   // the owner is outside the allocator (`mi_on_thread_idle_start`, or the owner gate): a sweeper may claim it
+#define MI_PARK_SWEEPING  (2)   // a sweeper (see above) claimed it and is working on its theaps; `sweeper` names it
 
 // Thread local data
 struct mi_tld_s {

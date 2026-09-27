@@ -607,7 +607,8 @@ static bool t11_freed_visitor(void* allocation, size_t usable_size, void* arg) {
 }
 
 static void test_visit_live_allocations(void) {
-  /* mi_heap_visit_blocks (which the visitor is built on) reports mi_page_usable_block_size,
+  /* _mi_theap_area_visit_blocks (the per-page walker the visitor uses; it is not built on
+     mi_heap_visit_blocks) reports mi_page_usable_block_size,
      the same internal usable-size notion the memory-change hooks use -- not the public,
      possibly-padding-adjusted mi_usable_size(p) (see the T5a comment). Capture the expected
      size the same way, from an ALLOCATE event's own delta_bytes, so this comparison is
@@ -643,16 +644,7 @@ static void test_visit_live_allocations(void) {
   for (int i = T11_N / 2; i < T11_N; i++) mi_free(t11_tracked[i].addr);
 }
 
-/* ---- T12: mi_unwrapped_malloc/_free/_realloc -- round trip, data preservation, and
-   confirmation that these do NOT trigger memory-change events even while tracking is
-   enabled. Also exercises the magic-mismatch error path (mi_unwrapped_free on a regular
-   mi_malloc pointer) -- confirmed safe because _mi_error_message(EINVAL, ...) is a
-   non-fatal diagnostic in this build (mi_error_default only aborts for EFAULT under
-   MI_DEBUG/MI_SECURE, or ENOMEM/EOVERFLOW under MI_XMALLOC -- none of which apply to
-   EINVAL). Not done: mixing the families the other direction (mi_free on an unwrapped
-   pointer) -- header explicitly documents that as forbidden/UB-adjacent territory beyond
-   the one safe, diagnostic-only direction exercised here. */
-/* ---- T11: free from a thread that never allocated ------------------------------------
+/* ---- T11b: free from a thread that never allocated -----------------------------------
    Settles #128 F3(a). Upstream issue #1271 records that mimalloc's own per-heap stats
    charge the free to the *freeing* theap while _mi_page_malloc charged the *allocating*
    one -- and that the decrement is dropped entirely when the freeing thread has no theap
@@ -717,7 +709,7 @@ static void test_free_from_foreign_thread(void) {
   assert(after.live_count == before.live_count);
 }
 
-/* ---- T12: brand-new thread whose first-ever mimalloc call happens with memory-events,
+/* ---- T12b: brand-new thread whose first-ever mimalloc call happens with memory-events,
    the profiler, and DHAT all active simultaneously (issue #266) ---------------------------
 
    Regression coverage for the macOS-only crash this issue diagnosed: a worker thread's
@@ -779,6 +771,15 @@ static void test_new_thread_first_alloc_all_observers_active(void) {
   if (dhat_started) mi_dhat_stop();
 }
 
+/* ---- T12: mi_unwrapped_malloc/_free/_realloc -- round trip, data preservation, and
+   confirmation that these do NOT trigger memory-change events even while tracking is
+   enabled. Also exercises the magic-mismatch error path (mi_unwrapped_free on a regular
+   mi_malloc pointer) -- confirmed safe because _mi_error_message(EINVAL, ...) is a
+   non-fatal diagnostic in this build (mi_error_default only aborts for EFAULT under
+   MI_DEBUG/MI_SECURE, or ENOMEM/EOVERFLOW under MI_XMALLOC -- none of which apply to
+   EINVAL). Not done: mixing the families the other direction (mi_free on an unwrapped
+   pointer) -- header explicitly documents that as forbidden/UB-adjacent territory beyond
+   the one safe, diagnostic-only direction exercised here. */
 static void test_unwrapped_family(void) {
   assert(mi_memory_tracking_is_enabled());
   evt_ctx_t ctx; evt_ctx_reset(&ctx);

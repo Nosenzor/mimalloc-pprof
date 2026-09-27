@@ -47,8 +47,13 @@ terms of the MIT license. A copy of the license can be found in the file
 
   DEVIATION from Bun (CLAUDE.md rule 6): Bun keeps all of this inside
   `src/page.c` (+1038 lines) and the sweep drivers inside `src/theap.c`. Here
-  the whole engine lives in this file; `src/page.c` carries only the five hook
-  calls, and `src/theap.c` only exports its page walker. The shared inline
+  the whole engine lives in this file; `src/page.c` carries only single-line
+  calls into it (`_mi_page_purge_holes_in_progress`, `_mi_page_purged_reset`,
+  `_mi_page_unpurge_run`, `_mi_page_unpurge_unformed_upto`,
+  `_mi_page_purged_count`, `_mi_page_holes_assert_valid`,
+  `_mi_page_publish_retired`/`_mi_page_unpublish_retired` and
+  `_mi_theap_purge_large_holes`), and `src/theap.c` only exports its page
+  walker (and calls `_mi_theap_unpublish_retired`). The shared inline
   helpers (`mi_page_can_purge_holes`, `mi_page_block_index_is_purged`, ...) are
   in `mimalloc/internal.h` next to the other page inlines, because both this
   file and those hooks need them.
@@ -61,16 +66,19 @@ terms of the MIT license. A copy of the license can be found in the file
       discarded range; the record structs themselves come from the profiler's
       raw-OS arena (CLAUDE.md rule 4) and are never inside a page at all. Both
       are asserted, per discard, by `_mi_prof_debug_assert_no_records_in`.
-   2. heap inspection (`mi_prof_visit`, `mi_heap_visit_blocks`, the DHAT and
-      memory-events walkers) goes through `_mi_theap_area_visit_blocks`, which
+   2. heap inspection (`mi_heap_visit_blocks`, `mi_theap_visit_blocks`,
+      `mi_memory_visit_live_allocations` and the diagnostic walk behind
+      `mi_heap_dump_json`) goes through `_mi_theap_area_visit_blocks`, which
       counts a purged block as free -- so a discarded block is never handed to a
       visitor -- and through `_mi_page_free_collect_no_unpurge`, so inspecting a
-      heap never faults a hole back in.
+      heap never faults a hole back in. (`mi_prof_visit` walks the profiler's
+      stack table, not a heap, and DHAT has no block walker.)
    3. the sweep of a parked thread never touches `mi_tld_t::profiler`: nothing
-      in this file reads or writes it (asserted in `_mi_theap_sweep_parked`).
+      in this file reads or writes it (asserted, in debug builds, in
+      `_mi_thread_idle_work_ex`, which covers the `mi_purge_all` caller too, #366).
 
   TEARDOWN, HEAP DELETION AND THE PARK LEAVE (7a, PR #299). Re-audited against 7a's
-  final head; still no check needed in this file. Line numbers are as of that audit.
+  final head; still no check needed in this file.
 
   (a) SCAVENGER SHUTDOWN. After `_mi_scavenger_stop` sets `_mi_scavenger_shutdown`, no
       sweep can start on the scavenger: its run loop exits on `_mi_scavenger_running == 0`
@@ -80,43 +88,45 @@ terms of the MIT license. A copy of the license can be found in the file
       theaps, which is safe at any point in the process's life.
 
   (b) LOCK ORDER. This sweep is a LEAF: `_mi_purge_holes_of` takes `tld->theaps_lock`
-      (page-holes.c:862) and, while holding it, takes no other lock of the tld/heap
+      and, while holding it, takes no other lock of the tld/heap
       family. In particular the abandoned pass (`_mi_arenas_purge_abandoned_holes`,
       arena.c) reads `heap->arena_pages[]` with an atomic load, never
       `heap->arena_pages_lock`, and reaches the pages through the arena bitmaps, so it
       needs neither `heap->theaps_lock` nor `subproc->tlds_lock`. The two locks that
       could close a cycle with `tld->theaps_lock` are held the other way round and both
-      back off rather than block: `_mi_heap_detach_theaps` (theap.c:473) holds
-      `heap->theaps_lock` and TRY-acquires `tld->theaps_lock` (theap.c:480), and
-      `_mi_tld_detach_theaps` (theap.c:508) holds `tld->theaps_lock` and TRY-acquires
-      `heap->theaps_lock` (theap.c:515). A leaf cannot be in a cycle, and neither
+      back off rather than block: `_mi_heap_detach_theaps` (theap.c) holds
+      `heap->theaps_lock` and TRY-acquires `tld->theaps_lock`, and
+      `_mi_tld_detach_theaps` (theap.c) holds `tld->theaps_lock` and TRY-acquires
+      `heap->theaps_lock`. A leaf cannot be in a cycle, and neither
       try-acquire can be in one either.
 
   (c) HEAP DELETION. `mi_heap_delete`/`_destroy` -> `mi_heap_detach_theaps` (heap.c) calls
-      `_mi_park_leave` on every parked owner of the heap (heap.c:219) under
-      `subproc->tlds_lock` (heap.c:214), and only THEN `_mi_heap_detach_theaps`
-      (heap.c:224). `_mi_park_leave` does not return until MI_PARK_SWEEPING has cleared,
+      `_mi_park_leave` on every parked owner of the heap under `subproc->tlds_lock`, and
+      only THEN `_mi_heap_detach_theaps`. `_mi_park_leave` does not return until MI_PARK_SWEEPING has cleared,
       so no theap is ever detached under a running sweep.
       That wait terminates, and holding `tlds_lock` across it is safe, because this sweep
       needs nothing the deleter holds: it never takes `tlds_lock` (the scavenger takes it
-      only to CLAIM a park, scavenger.c:138, and releases it before `_mi_thread_idle_work`),
-      and the deleter does not hold either `theaps_lock` yet -- theap.c:473/480 run after
-      `_mi_park_leave` has returned. The wait is bounded by one page's walk because every
-      phase re-reads `tld->park_reclaim`: page-holes.c:767 between pages, page-holes.c:873
-      between heaps in the abandoned pass, arena.c:1410 between abandoned pages.
-      The one loop that does NOT check between iterations is the theap loop at
-      page-holes.c:863 -- it does not need to: with `park_reclaim` set, each theap's
-      per-page callback (page-holes.c:767) returns false on its FIRST page, so a theap
+      only to CLAIM a park, in `_mi_theap_sweep_parked`, and releases it before
+      `_mi_thread_idle_work`), and the deleter does not hold either `theaps_lock` yet --
+      `_mi_heap_detach_theaps` runs after `_mi_park_leave` has returned. The wait is bounded
+      by one page's walk because every phase re-reads `tld->park_reclaim`:
+      `mi_theap_page_purge_holes` between pages, the heap loop of `_mi_purge_holes_of`
+      between heaps in the abandoned pass, `mi_arena_page_purge_holes_at` (arena.c) between
+      abandoned pages. (A `mi_purge_all(MI_PURGE_FORCE)` claim sets
+      MI_GATE_FLAG_RECLAIM_IGNORED, so the first two run to completion; see
+      `mi_tld_reclaim_requested`.) The one loop that does NOT check between iterations is
+      the theap loop of `_mi_purge_holes_of` -- it does not need to: with `park_reclaim`
+      set, each theap's per-page callback returns false on its FIRST page, so a theap
       costs O(1) and the loop as a whole is bounded by the theap count.
 
   (d) A PARK LEFT MID-SWEEP. 7a put `_mi_park_leave_if_parked` on the allocator slow paths
-      (page.c:1159, free.c:162), so a parked thread that allocates or frees from a
+      (`_mi_malloc_generic` in page.c, `mi_free_generic_local` in free.c), so a parked thread that allocates or frees from a
       `thread_local` destructor un-parks itself while this sweep may be walking its pages.
       Nothing extra is needed here, and the reason is (c)'s machinery seen from the other
       end: that call reaches `_mi_park_leave`, which publishes `park_reclaim = 1`
-      (scavenger.c:114) and then SPINS until `park_state` leaves MI_PARK_SWEEPING. The
+      (`mi_park_leave_loop`) and then SPINS until `park_state` leaves MI_PARK_SWEEPING. The
       sweeper only stores MI_PARK_PARKED after `_mi_thread_idle_work` has fully returned
-      (scavenger.c:199), so by the time the leaver's CAS to MI_PARK_RUNNING can succeed the
+      (`_mi_theap_sweep_parked`), so by the time the leaver's CAS to MI_PARK_RUNNING can succeed the
       sweep has stopped touching that theap's pages entirely -- the same guarantee 7a's
       queue sweep gets, from the same protocol, because both run inside
       `_mi_thread_idle_work`. `test-park-handoff.c`'s `test_exit_while_hole_swept_stress`
@@ -199,7 +209,7 @@ size_t _mi_page_purged_count(const mi_page_t* page) {
 }
 
 // The hole invariants, called from `_mi_page_is_valid` (`src/page.c`). Kept here rather than
-// inlined there so `page.c` keeps its five hook calls (CLAUDE.md rule 6). These are what make
+// inlined there so `page.c` keeps only single-line calls into this file (CLAUDE.md rule 6). These are what make
 // every existing test in the suite a test of the purge machinery.
 void _mi_page_holes_assert_valid(const mi_page_t* page) {
   #if MI_DEBUG > 1

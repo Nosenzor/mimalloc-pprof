@@ -425,7 +425,7 @@ void          _mi_thread_idle_work(mi_tld_t* tld, mi_theap_t* theap0);
 // per-page loops (collect MI_FORCE, hole pacing ignored).
 void          _mi_thread_idle_work_ex(mi_tld_t* tld, mi_theap_t* theap0, bool force);
 void          _mi_park_leave_gate(mi_tld_t* tld);   // #366: `_mi_park_leave` without the parked_count decrement (owner-gate acquire)
-mi_tld_t*     _mi_scavenger_tld_ptr(void);          // #366: the scavenger's own tld if it has one (a Windows DLL build gives it one; the purge walk skips it), else NULL
+mi_tld_t*     _mi_scavenger_tld_ptr(void);          // #366: the scavenger's own tld if it has one, else NULL -- NULL in every build today (see `_mi_scavenger_tld`); the purge walks skip it
 mi_msecs_t    _mi_theap_sweep_parked(mi_subproc_t* subproc);
 // #272 test observable (test/test-park-handoff.c). `mi_decl_export` because the
 // `ctest-shared` job links that test against the shared library, where the default
@@ -615,10 +615,12 @@ size_t      _mi_prof_debug_records_compared(void);
    prologue used to do sits behind it, unchanged, in the `_slow` bodies.
 
    The word is not just "on/off": memory-events documents its environment as read lazily,
-   exactly once, on the FIRST hook call and never during process startup (see
-   memory-events.h), and DHAT resolves the same way. An `unresolved` bit per observer keeps
-   that contract -- the word starts non-zero, so the first hook still takes the slow path
-   and still resolves the environment there -- while letting the steady state be zero.
+   exactly once, on the FIRST allocation hook and never during process startup (see
+   memory-events.h). DHAT resolves its own at process init instead (`_mi_dhat_process_init`,
+   from `mi_process_init_once`), and lazily in `dhat_prepare` only for a hook that runs
+   before that. An `unresolved` bit per observer keeps both contracts -- the word starts
+   non-zero, so an early hook still takes the slow path and resolves the environment
+   there -- while letting the steady state be zero.
    Each observer owns its own two bits and publishes them when it resolves, is enabled, or
    is stopped; neither module can clear the other's.
 
@@ -704,7 +706,7 @@ static inline void _mi_memevt_on_resize(void* oldp, void* newp, size_t usable_pr
 #endif // MI_MEMEVT || MI_DHAT
 
 // Suppress accounting/dispatch for internal allocate+free pairs that are really one resize
-// (e.g. a moving realloc's internal mi_theap_umalloc+mi_free), and for reentrant calls made
+// (e.g. a moving realloc's internal _mi_theap_malloc_zero+mi_free), and for reentrant calls made
 // from inside a memory-change callback itself.
 void        _mi_memevt_suppress_begin(void);
 void        _mi_memevt_suppress_end(void);
@@ -1087,8 +1089,8 @@ MI_DECL_MAYBE_UNUSED static inline bool mi_theap_matches_thread(mi_theap_t* thea
 // `theap->heap`, see theap.c) -- `_mi_theap_abandon` (theap.c) calls
 // `_mi_arenas_page_abandon` on behalf of such a theap from the *deleting* thread, which
 // is not the theap's own owning thread. Bun's version also allows the park state the
-// background scavenger sets while sweeping a parked thread's theaps; that state does not
-// exist in this tree (#272), so that clause is omitted here.
+// background scavenger sets while sweeping a parked thread's theaps; #272 imported that
+// state, and with it the MI_PARK_SWEEPING clause at the end below.
 // Maybe unused: called only from `mi_assert_internal` (src/arena.c), which a release build compiles out.
 MI_DECL_MAYBE_UNUSED static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
   if (theap == NULL || theap->tld == NULL) return true;
@@ -1113,12 +1115,12 @@ MI_DECL_MAYBE_UNUSED static inline bool _mi_theap_can_touch(mi_theap_t* theap) {
 // walk: `test-park-handoff` trips `mi_theap_visit_pages`'s `count == total` (and
 // `mi_page_is_valid_init`'s block-conservation check) that way, ~2/120 runs pinned to 4 CPUs.
 //
-// So take the park back in the allocator's own generic/slow paths as well (`mi_page_malloc`'s
-// slow path and `mi_free_generic_local`), which closes the gap for those paths. Costs one
+// So take the park back in the allocator's own generic/slow paths as well (`_mi_malloc_generic`
+// in page.c and `mi_free_generic_local` in free.c), which closes the gap for those paths. Costs one
 // relaxed load of an already-hot cache line, and only there -- never on the fast path.
 //
 // Residual: `mi_free_ex`'s thread-local fast path (`src/free.c`, `xtid==0`) calls
-// `mi_free_block_local` directly, and `mi_page_malloc`'s free-list pop, without going through
+// `mi_free_block_local` directly, and `_mi_page_malloc_zero`'s free-list pop, without going through
 // this function -- a parked thread's fast-path free that ends up retiring a page (via
 // `_mi_page_retire`) still races the scavenger's walk on that path. `mi_free_block_local` carries
 // a permanent debug-only assert as a detector for that residual instead (see its definition).

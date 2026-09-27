@@ -70,7 +70,7 @@ typedef struct mi_prof_config_s {
      snapshot, and profile.proto scratch buffers are transient and always use
      _mi_os_alloc directly, never this arena, so they are never counted here. */
   size_t max_profiler_bytes;
-  uint64_t seed;                // 0 = nondeterministic
+  uint64_t seed;                // 0 = the prof_seed option (MIMALLOC_PROF_SEED, default 0); sampling is deterministic per thread for every seed
   bool accum;
   size_t max_stack_depth;       // 0 = default (32); compile cap 128
   const char* dump_at_exit;     // NULL = none; copied into the internal buffer

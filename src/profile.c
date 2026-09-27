@@ -732,7 +732,7 @@ static void prof_scale_heap_sample(size_t count, size_t bytes, size_t rate, size
   *out_bytes = (size_t)((double)bytes * scale);
 }
 
-enum { PROF_PROTO_MAX_MODULES = 512 };   // dense fixed cap, mirrors the HMODULE[1024] cap in profile-maps.c
+enum { PROF_PROTO_MAX_MODULES = 512 };   // dense fixed cap; half the HMODULE[1024] cap in profile-maps.c, so modules past the 512th are dropped here
 enum { PROF_PROTO_MAX_DEPTH = 128 };     // mirrors MI_PROF_BT_MAX_LIMIT in profile-stack.c
 typedef struct proto_module_s { uintptr_t base; size_t size; char path[512]; } proto_module_t;
 typedef struct proto_module_ctx_s { proto_module_t* modules; size_t count; } proto_module_ctx_t;
@@ -975,18 +975,19 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
   // performance problem. Found by comparing against oven-sh/mimalloc's profiler (#78),
   // whose countdown is likewise thread-local.
   //
-  // Everything read or written below is per-theap: bytes_since_sample, next_threshold,
-  // generation, and the PRNG state prof_threshold() advances. prof_generation and
-  // prof_rate are written only under prof_lock in mi_prof_start_ex; reading a stale
-  // generation here merely delays a counter reset by one allocation, which is harmless.
+  // Everything read or written below is per-thread (`mi_tld_t::profiler`, shared by all
+  // of a thread's theaps): bytes_since_sample, next_threshold, generation, and the PRNG
+  // state prof_threshold() advances. prof_generation and prof_rate are written only under
+  // prof_lock in mi_prof_start_seeded; reading a stale generation here merely delays a
+  // counter reset by one allocation, which is harmless.
   //
   // prof_rate IS load-bearing though: prof_threshold() computes `% (rate * 2)`, so a
-  // rate of 0 -- which is what a concurrent mi_prof_stop leaves behind -- would divide
-  // by zero. Under the old code the lock plus the re-check of prof_enabled made that
-  // unreachable. Now it has to be checked explicitly.
+  // rate of 0 would divide by zero. The check below is defensive and never fires today:
+  // prof_rate starts at 524288, mi_prof_start_seeded never stores 0, and mi_prof_stop
+  // leaves the rate alone. Keep it in case either of those changes.
   mi_profiler_tld_t* tld = &theap->tld->profiler;
   if (tld->generation != prof_generation) { tld->bytes_since_sample = 0; tld->next_threshold = 0; tld->random = 0; tld->generation = prof_generation; }
-  if (prof_rate == 0) return;   // stopped concurrently; prof_threshold would divide by zero
+  if (prof_rate == 0) return;   // defensive (never 0 today, see above): prof_threshold would divide by zero
   tld->bytes_since_sample += size;
   if (tld->next_threshold == 0) tld->next_threshold = prof_threshold(theap->tld);
   if mi_likely(tld->bytes_since_sample < tld->next_threshold) return;   // the common case: no lock taken at all
@@ -1011,10 +1012,10 @@ void _mi_prof_on_alloc(mi_theap_t* theap, mi_page_t* page, void* p, size_t size)
 
 // #266: pair around an inner allocation whose reported size is not the caller's actual
 // request (e.g. the guarded allocator's own over-allocated inner call in alloc.c) so its
-// _mi_prof_on_alloc doesn't touch the per-theap sampling counters with the wrong size;
+// _mi_prof_on_alloc doesn't touch the per-thread sampling counters with the wrong size;
 // the caller fires one corrected _mi_prof_on_alloc afterward. Reuses prof_callback_depth,
 // the same re-entrancy guard _mi_prof_on_alloc already checks, rather than adding new
-// per-theap state.
+// per-thread state.
 // #266: called only from already-initialized-thread call sites (guarded/aligned alloc
 // paths, never from inside `_mi_meta_zalloc`'s own call chain), but peek defensively
 // rather than force -- see hooks-tld.h's file comment.

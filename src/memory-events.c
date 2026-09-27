@@ -32,11 +32,13 @@
 //
 // State machine (single _Atomic(size_t), not a bool -- see profile.c's prof_enabled
 // comment on MSVC's plain-C atomic wrapper only implementing uintptr_t/int64_t widths):
-//   MEMEVT_UNINIT   (0): never resolved; the disabled-hot-path check below treats this
-//                        the same as "maybe active" and falls into the slow path once.
+//   MEMEVT_UNINIT   (0): never resolved; `_mi_observers_armed` (below) still carries this
+//                        module's UNRESOLVED bit, so the first allocation hook falls into
+//                        the slow path and resolves it there.
 //   MEMEVT_DISABLED (1): resolved off, by env or by explicit API call. Steady-state
-//                        common case: the hot-path check below is exactly one relaxed
-//                        atomic load + compare, no lock, no callback-table touch.
+//                        common case: once no compiled-in observer is on, the hot-path
+//                        check (`_mi_observers_idle` in internal.h) is one relaxed load of
+//                        `_mi_observers_armed` + compare, no lock, no callback-table touch.
 //   MEMEVT_ENABLED  (2): resolved on, by env or by explicit API call.
 //
 // A shared mi_atomic_once_t (memevt_once) synchronizes the two ways this can first
@@ -101,19 +103,25 @@ static void*                 memevt_args[MI_MEMORY_CHANGE_COUNT];
 #endif // MI_MEMEVT
 
 // Reentrancy / internal-op suppression (mirrors profile.c's prof_callback_depth).
-// >0 means: skip accounting and skip dispatch entirely. Two callers increment this:
+// >0 means: skip accounting and skip dispatch entirely. Incremented by:
 //   (a) memevt_dispatch, around invoking the user's handler -- so if the handler itself
 //       calls mi_malloc/mi_free, that nested allocation is not itself accounted for or
 //       dispatched (bounds recursion depth; see memory-events.h's callback contract).
-//   (b) _mi_heap_realloc_zero's moving-realloc path, around its internal
-//       mi_heap_umalloc+mi_free pair, so those two calls don't leak an ALLOCATE/FREE
-//       pair to consumers; the caller then explicitly calls _mi_memevt_on_resize once,
-//       after suppression is lifted, to emit the single synthesized RESIZE.
+//   (b) the moving-realloc paths -- mi_theap_realloc_zero_ex (alloc.c) and
+//       mi_theap_realloc_zero_aligned_at (alloc-aligned.c) -- around their internal
+//       allocate+mi_free pair, so those two calls don't leak an ALLOCATE/FREE pair to
+//       consumers; the caller then explicitly calls _mi_memevt_on_resize once, after
+//       suppression is lifted, to emit the single synthesized RESIZE.
+//   (c) the guarded and over-aligned allocation paths (alloc.c, alloc-aligned.c), around
+//       their inner over-allocation, before re-emitting one event for the caller's request;
+//       and mi_dhat_dump (dhat.c), around its stdio.
 // #266: this used to be `static mi_decl_thread int memevt_suppress_depth`; it now lives
-// on `mi_tld_t::hooks` (see hooks-tld.h's file comment for why). Both callers are always
-// on an already-initialized thread (paired around inner mi_realloc/mi_malloc_aligned/
-// mi_theap_malloc_guarded calls, never inside `_mi_meta_zalloc`'s own call chain), so a
-// NULL peek is not expected here in practice -- but this must still only ever PEEK, never
+// on `mi_tld_t::hooks` (see hooks-tld.h's file comment for why). The allocation-path
+// callers run on an already-initialized thread (paired around inner mi_realloc/
+// mi_malloc_aligned/mi_theap_malloc_guarded calls, never inside `_mi_meta_zalloc`'s own call
+// chain), so a NULL peek is not expected there; mi_dhat_dump may run with no tld at all
+// (it uses a peek-or-local hooks struct), and a NULL peek then leaves the depth untouched.
+// Either way this must only ever PEEK, never
 // force: forcing (mi_theap_get_default() -> mi_thread_init()) is unsafe not only mid-init
 // but also mid *teardown* (mi_thread_theaps_done resets the default theap to the empty
 // sentinel before freeing this thread's theaps specifically so nothing re-initializes it
@@ -127,12 +135,11 @@ void _mi_memevt_suppress_end(void)   { mi_hooks_tld_t* const h = _mi_hooks_tld_p
 
 #if MI_MEMEVT
 // #270: fork-safety. Child-side policy: CONTINUE. `memevt_cb_lock` only ever guards a
-// snapshot-copy of the callback table (see the comment above its declaration) and, per
-// that same comment, is never held while a user handler runs -- so unlike
-// `prof_lock`/`dhat_lock` it is not itself an alloc/free-hook lock that can nest under
-// a heap/arena lock (see fork.c's lock-order block). It is still grouped with them
-// (innermost, alongside `out_buf_lock`) for simplicity rather than given its own
-// earlier slot, since there is no actual ordering requirement pulling it elsewhere.
+// snapshot-copy of the callback table (see the comment above its declaration) and is
+// never held while a user handler runs. But `memevt_dispatch` takes it from inside the
+// alloc/free hooks, which can run with a heap/arena lock held further up the stack, so
+// like `prof_lock`/`dhat_lock` it must come after every allocator lock: fork.c's
+// lock-order block puts it innermost, just before `out_buf_lock`.
 // The registered handlers themselves are the embedder's own responsibility across
 // fork (same as any other pthread_atfork-registered library) -- mimalloc does not know
 // how to make an arbitrary user callback fork-safe. The lock and the env-var lazy-init
@@ -210,10 +217,12 @@ bool mi_memory_snapshot(mi_memory_snapshot_t* out) mi_attr_noexcept {
 // Dispatch. Called only once tracking is confirmed MEMEVT_ENABLED. Updates counters
 // (total_bytes-affecting update happens before the callback, per spec), then snapshots
 // the relevant handler/arg pair under memevt_cb_lock, releases the lock, and only then
-// invokes the handler -- so the handler runs with neither memevt_cb_lock nor any
-// mimalloc allocator lock held (the latter is already guaranteed by hook placement: see
-// the call sites in alloc.c/free.c, all positioned after the corresponding page-local
-// work / list push is already complete).
+// invokes the handler -- so the handler never runs under memevt_cb_lock. The hook sites
+// take no allocator lock of their own (alloc.c runs after the block is popped and
+// zeroed; both free hooks in free.c run BEFORE the block is pushed on `local_free` /
+// `xthread_free`, deliberately, so the address cannot be reused while DHAT still holds
+// its record). A caller further up the stack can still hold one for internal events --
+// see the callback contract in memory-events.h.
 // ---------------------------------------------------------------------------------------
 
 // `hooks` is the caller's already-peeked, known-non-NULL `mi_hooks_tld_t*` (every call
@@ -266,11 +275,13 @@ static void memevt_dispatch(mi_hooks_tld_t* hooks, mi_memory_change_kind_t kind,
 
 #if MI_MEMEVT || MI_DHAT
 // ---------------------------------------------------------------------------------------
-// Hook entry points. Each begins with the single disabled-hot-path flag check: a plain
-// relaxed load compared against MEMEVT_DISABLED. Only when that check is *not* true
-// (either MEMEVT_UNINIT -- resolved once, here -- or MEMEVT_ENABLED) does any further
-// work happen; no accounting atomic and no callback-table lock/lookup occur on the
-// disabled path.
+// Hook entry points: the `_slow` bodies of the `static inline` `_mi_memevt_on_*` wrappers
+// in internal.h (#371). The wrapper does the disabled-hot-path test -- one relaxed load of
+// `_mi_observers_armed` compared with zero (`_mi_observers_idle`) -- and calls a body
+// below only when some compiled-in observer is on or still unresolved. Each body starts
+// with the hooks-tld peek, then the suppression depth; `memevt_state` is read only after
+// that (MEMEVT_UNINIT is resolved once, in the alloc body). No accounting atomic and no
+// callback-table lock/lookup occur unless the state is MEMEVT_ENABLED.
 // ---------------------------------------------------------------------------------------
 
 /* DHAT and the public callback table are independent observers.  The detailed
@@ -548,27 +559,26 @@ void* mi_unwrapped_malloc(size_t size, size_t alignment) mi_attr_noexcept {
   // process. A prior fix here called mi_process_init(), reasoning that every other path into
   // _mi_os_alloc_aligned goes through process init first so the process-global
   // mi_os_mem_config_t is never read torn. That part is true but incomplete: mi_process_init()
-  // only runs mi_thread_init() for the *one* thread that wins its internal mi_atomic_do_once
-  // race (see mi_process_init_once in init.c); every other thread that calls mi_process_init()
-  // concurrently just blocks on the once-guard and returns *without* mi_thread_init() ever
-  // running for itself. That matters because _mi_os_alloc_aligned's callees read per-thread
-  // heap state, not just the process-global config: mi_os_prim_alloc_at -> _mi_os_get_aligned_hint
-  // calls _mi_heap_random_next(mi_prim_get_default_heap()) in release builds (the address-hint
-  // randomization is compiled out under MI_DEBUG>0, which is exactly why this never reproduced
-  // in a debug build). A thread that never ran mi_thread_init() still has its TLS default-heap
-  // pointer at its process-start value, `&_mi_heap_empty` -- a `const`, read-only-mapped sentinel
-  // (see _mi_heap_empty/_mi_heap_default in init.c). _mi_heap_random_next mutates the chacha
-  // state it is given (chacha_next32/chacha_block regenerate the block in place), so calling it
-  // on `_mi_heap_empty.random` is a write into read-only memory: an immediate, near-deterministic
-  // SIGSEGV inside chacha_block, reproduced (~100% of runs) via gdb backtrace:
+  // only runs thread init for the *one* thread that wins its internal mi_atomic_do_once race
+  // (see mi_process_init_once in init.c); every other thread that calls mi_process_init()
+  // concurrently just blocks on the once-guard and returns *without* its own thread init. On
+  // the v2 line that mattered because _mi_os_alloc_aligned's callees read per-thread state:
+  // mi_os_prim_alloc_at -> _mi_os_get_aligned_hint drew its address-hint randomness from the
+  // thread's default heap in release builds (compiled out under MI_DEBUG>0, which is exactly
+  // why this never reproduced in a debug build), and a thread that never initialized still
+  // pointed at the `const`, read-only-mapped empty sentinel. The random generator mutates the
+  // state it is given, so that was a write into read-only memory: an immediate,
+  // near-deterministic SIGSEGV inside chacha_block, reproduced (~100% of runs) via gdb:
   //   mi_unwrapped_malloc -> _mi_os_alloc_aligned -> mi_os_prim_alloc_at -> _mi_prim_alloc ->
   //   _mi_os_get_aligned_hint -> _mi_random_next -> chacha_block (SIGSEGV, all GP regs zeroed)
-  // mi_thread_init() is the right call here, not mi_process_init(): it calls mi_process_init()
-  // itself first (unconditionally, cheap once the once-guard has resolved), and then -- for
-  // *every* calling thread, not just the process-init winner -- calls _mi_thread_heap_init(),
-  // which is itself a cheap already-initialized check-and-return once this thread has a real
-  // heap. This guarantees mi_prim_get_default_heap() never points at the const empty sentinel
-  // by the time anything below reads or mutates per-thread heap state.
+  // On v3 the names are `_mi_theap_default()`, `_mi_theap_random_next` and `_mi_theap_empty`,
+  // and `_mi_os_get_aligned_hint` itself now returns no hint when the default theap is not
+  // initialized (see the issue #1267 note there), so this call is belt-and-braces on that path; it
+  // still guarantees every later per-thread read here sees a real theap.
+  // mi_thread_init() is the right call, not mi_process_init(): `_mi_thread_init_with_heap`
+  // calls mi_process_init() itself first (cheap once the once-guard has resolved) and then,
+  // for *every* calling thread, initializes its default theap -- an already-initialized
+  // check-and-return once the thread has one.
   mi_thread_init();
   if (alignment == 0) alignment = sizeof(void*);
   if ((alignment & (alignment - 1)) != 0) return NULL; // must be a power of two

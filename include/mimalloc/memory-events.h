@@ -16,9 +16,10 @@
 
    ## Activation (runtime, once compiled in)
 
-   - `MIMALLOC_MEMORY_EVENTS=1` is read lazily, exactly once, the first time any
-     allocation/free/realloc hook runs -- never during process startup. The result is
-     cached; later allocator operations never re-read the environment.
+   - `MIMALLOC_MEMORY_EVENTS=1` is read lazily, exactly once, the first time the
+     allocation hook runs (the free/realloc hooks never resolve it) -- never during
+     process startup. The result is cached; later allocator operations never re-read
+     the environment.
    - `mi_memory_tracking_set_enabled` can also enable/disable tracking at any time,
      including before the first allocation. An explicit API call is always authoritative:
      if it runs before the first allocation, the later lazy environment read is skipped
@@ -35,10 +36,16 @@
 
    ## Callback contract
 
-   - Callbacks are invoked with no mimalloc allocator locks held, and may themselves
-     call `mi_malloc`/`mi_free`/etc. without deadlocking (the callback-table lock is
-     acquired only to snapshot the handler pointer, then released before the handler
-     runs). Callbacks must still be short and non-blocking.
+   - Callbacks are invoked without the callback-table lock (it is acquired only to
+     snapshot the handler pointer, then released before the handler runs), and may
+     themselves call `mi_malloc`/`mi_free`/etc. For a caller's own allocation no
+     allocator lock is held either, but an event raised by the allocator's internal
+     bookkeeping can run under an allocator lock further up the stack: e.g. a non-main
+     heap's `arena_pages_lock` while its per-arena page table is allocated from the main
+     heap, or `mi_subprocs_lock` + `heaps_lock` + `tlds_lock` while `MI_PURGE_RECLAIM`
+     frees those tables. A handler must therefore not create heaps or sub-processes,
+     allocate from a non-main heap, or call `mi_prof_start` (whose walk takes
+     `mi_subprocs_lock`). Callbacks must be short and non-blocking.
    - A memory-change hook invoked while another hook's callback is already running on
      the same thread (including as a side effect of that callback allocating/freeing)
      is suppressed: no accounting update and no nested callback invocation. This bounds
@@ -121,8 +128,11 @@ mi_decl_nodiscard mi_decl_export bool mi_memory_snapshot(mi_memory_snapshot_t* o
 
 /* ---------------------------------------------------------------------------------------------
    Best-effort live-allocation visitor (diagnostics only; not a consistent global snapshot).
-   Built on top of this codebase's existing per-heap block-visitation facility
-   (mi_heap_visit_blocks); see memory-events.c for the exact scope this walks. */
+   NOT built on mi_heap_visit_blocks: it walks the page queues (`theap->pages[]`) of every
+   theap of the calling thread through the same per-page block walker, so it sees OS-backed
+   pages too. It reports whatever those pages hold, which can include blocks another thread
+   allocated on a page this thread reclaimed, and it misses this thread's own blocks on pages
+   it has abandoned (full pages are abandoned by default). See memory-events.c. */
 
 // Return false to stop the visit early.
 typedef bool (mi_memory_allocation_visit_fun)(

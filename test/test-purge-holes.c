@@ -2151,7 +2151,7 @@ int main(void) {
   // OWNER's own sweeps too, not just the scavenger's claim -- so with it left at the default the
   // second and later cases would silently be handed a skipped sweep and the whole file would
   // become a slow way of testing nothing. The pacing itself has its own case
-  // (`test_owner_sweeps_are_paced`), which sets the option back for its own duration.
+  // (`test_owner_sweep_pacing`), which sets the option back for its own duration.
   mi_option_set(mi_option_purge_holes_min_interval, 0);
   fprintf(stderr, "purge_holes is %s, os page size is %zu\n",
           (purging_enabled ? "ON" : "OFF"), (size_t)_mi_os_page_size());

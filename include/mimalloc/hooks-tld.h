@@ -28,17 +28,22 @@
      _mi_prof_on_alloc, _mi_dhat_begin_alloc/_mi_dhat_finish_event -- these ARE reachable
      from inside `_mi_meta_zalloc`'s call chain, allocating this thread's own tld/theap,
      where a NULL result always means "this is a meta allocation, nothing to report" --
-     see memory-events.c's `_mi_meta_is_meta_page` check) and for the suppress_begin/end
+     see memory-events.c's `_mi_meta_is_meta_page` check), for the suppress_begin/end
      pairs (never actually reachable with a NULL peek in practice, since they only run
-     from already-initialized-thread call sites, but must still never force).
+     from already-initialized-thread call sites, but must still never force), and for
+     _mi_dhat_begin_free/_begin_resize: their armed event has to survive until the
+     separate _mi_dhat_finish_event call, which stack-local storage cannot do, so a
+     thread with no tld is simply not tracked by DHAT (see the comment in dhat.c).
 
    - `_mi_hooks_tld_peek_or_local()`: for call sites that need real, possibly-mutated
-     scratch state for the duration of ONE call (e.g. memevt_dispatch/dhat_prepare's
-     "already inside the handler" suppression-depth bump around invoking a user
-     callback), but where a NULL peek must NOT mean "drop the event" -- the free/resize
-     hooks (_mi_memevt_on_free/_on_realloc_in_place/_on_resize, _mi_dhat_begin_free/
-     _begin_resize) and any top-level control API that itself brackets a callback
-     (mi_prof_visit, mi_dhat_dump). These are never reachable from inside
+     scratch state for the duration of ONE call (e.g. memevt_dispatch's "already inside
+     the handler" suppression-depth bump around invoking a user callback), but where a
+     NULL peek must NOT mean "drop the event" -- the memory-events free/resize hooks
+     (the `_slow` bodies of _mi_memevt_on_free/_on_realloc_in_place/_on_resize) and
+     mi_dhat_dump, which brackets its own stdio. (mi_prof_visit uses neither accessor:
+     it deliberately forces thread init with `mi_theap_get_default()`, because the
+     callback it runs under `prof_lock` must see the same real `hooks` as a nested
+     _mi_prof_on_free; see its comment in profile.c.) These are never reachable from inside
      `_mi_meta_zalloc`'s call chain (meta allocations only ever allocate), so nothing is
      lost by not forcing; a thread whose very first (or only remaining) mimalloc
      interaction is exactly such a call -- e.g. a foreign thread's first-ever call being

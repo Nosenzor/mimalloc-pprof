@@ -1339,17 +1339,19 @@ if (MI_BUILD_TESTS)
                          ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_DISALLOW_ARENA_ALLOC=1")
   endif()
 
-  # pthread_atfork fork-safety handlers (issue #270, Bun parity P5). POSIX-only --
-  # both sources compile to a Windows-skip stub via #ifdef _WIN32, but there is no
-  # pthread/fork() to link against on MSVC/MinGW, so only build+register them off
-  # Windows (matching src/init.c's own `#if !defined(_WIN32) && !defined(__wasi__)`
-  # guard around the pthread_atfork registration these tests exercise).
+  # pthread_atfork fork-safety handlers (issue #270, Bun parity P5; the handlers live in
+  # src/fork.c, registered from src/init.c). POSIX-only -- the three fork test sources
+  # below (test-fork-locks.c, test-fork-user-heap.c, test-fork-generation.c) compile to a
+  # Windows-skip stub, but there is no pthread/fork() to link against on MSVC/MinGW, so
+  # only build+register them off Windows (matching src/init.c's own
+  # `#if !defined(_WIN32) && !defined(__wasi__)` guard around the pthread_atfork
+  # registration these tests exercise).
   if(NOT WIN32)
     find_package(Threads REQUIRED)
 
     # test-fork-locks: the repro from #270's Step 1 -- see the file's header comment
-    # for how to reproduce the pre-#270 hang (revert the subproc.c/init.c fork-handler
-    # changes and re-run). TIMEOUT is generous: 200 forks x a 5s per-child watchdog is
+    # for how to reproduce the pre-#270 hang (revert src/fork.c's handlers and src/init.c's
+    # pthread_atfork registration, and re-run). TIMEOUT is generous: 200 forks x a 5s per-child watchdog is
     # the worst case if every single fork hangs, which should never happen once the
     # handlers are in place (a clean run finishes in well under a second).
     add_executable(mimalloc-test-fork-locks test/test-fork-locks.c)
@@ -1367,11 +1369,16 @@ if (MI_BUILD_TESTS)
 
     # #270 review follow-up: MIMALLOC_PROF/MIMALLOC_DHAT/MIMALLOC_MEMORY_EVENTS each
     # activate an alloc/free HOOK lock (prof_lock/dhat_lock/memevt_cb_lock) that a
-    # default run of this test never touches. An earlier version of subproc.c's lock
-    # order took those hook locks before the heap/arena locks (porting Bun's stated
-    # rule unmodified) and deadlocked deterministically under MIMALLOC_PROF=1 in a
-    # Release build (see the #270 PR discussion) -- these variants keep that reproducer
-    # registered so a future reordering regresses loudly in CI instead of silently.
+    # default run of this test never touches. An earlier version of the handlers' lock
+    # order (then in subproc.c, now src/fork.c) took those hook locks before the heap/arena
+    # locks (porting Bun's stated rule unmodified) and deadlocked deterministically under
+    # MIMALLOC_PROF=1 in a Release build (see the #270 PR discussion) -- these variants keep
+    # that reproducer registered so a future reordering regresses loudly in CI instead of
+    # silently. Two caveats: in an MI_PPROF=OFF build MIMALLOC_PROF=1 arms nothing, so the
+    # -prof-env variants then run like the plain test; and MIMALLOC_DHAT=1 does not enable
+    # DHAT today (known issue, see include/mimalloc/dhat.h), so -dhat-env arms nothing either
+    # and DHAT is exercised only by the final `check_dump_in_child`, which calls
+    # `mi_dhat_start` itself (in every variant).
     add_test(NAME test-fork-locks-prof-env COMMAND mimalloc-test-fork-locks)
     set_tests_properties(test-fork-locks-prof-env PROPERTIES TIMEOUT 300 ENVIRONMENT "MIMALLOC_PROF=1")
     if(MI_DHAT)
@@ -1770,8 +1777,10 @@ if (MI_BUILD_TESTS)
 
   # #338 (Bun parity): binary heap snapshot writer + its CLI viewer. Both imported from
   # oven-sh/mimalloc @ b20b60d9 (MIT). The viewer is a plain-libc tool, not a test; it is
-  # built here so every gate proves it compiles, and the snapshot test hands its output to
-  # it (`summary`) so the writer and the reader are pinned to each other on every run.
+  # built here so every gate proves it compiles. No test runs it: test-snapshot only checks
+  # that the writer succeeds, test-snapshot-exit pins the writer with its own independent C
+  # reader, and ci/tests/test_heap_snapshot_example.py checks the Python reader against the
+  # committed `mi-heapview` output for a fixture.
   # The viewer reads a file and never links the allocator, so it is built in every
   # configuration; the writer's tests follow MI_DIAGNOSTICS (#414).
   add_executable(mi-heapview tools/mi-heapview.c)

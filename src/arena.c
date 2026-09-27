@@ -3179,7 +3179,8 @@ mi_decl_export _Atomic(uintptr_t) mi_debug_forked_claim_seized;  // #293: test-f
 // `_mi_process_is_forked_child` branch below was originally dropped here with a note to
 // "add it back once #270/PR #289 lands" -- #289 landed a handler-only fork design
 // (src/fork.c) without the persistent flag this branch needs, so the flag
-// (`_mi_process_is_forked_child`, src/fork.c) was added alongside restoring this branch.
+// (`_mi_process_is_forked_child`, defined in src/subproc.c and set by src/fork.c's child
+// handler) was added alongside restoring this branch.
 // Without it, a page belonging to a theap whose thread did not survive a multi-threaded
 // `fork()` hits the `!mi_page_is_abandoned` branch below and gets force-seized without
 // reconciling its (possibly torn, mid-update) `used`/`local_free`/`xthread_free`

@@ -90,11 +90,11 @@ terms of the MIT license. A copy of the license can be found in the file
   "generations", caught by the P1 reentrancy checker) under a multi-threaded
   fork-storm stress test -- see the #270 PR discussion. `mi_fork_serialize_lock` plus
   the owner/depth pair above is this tree's fix. Bun's version is also entangled with
-  a per-subprocess `tld` registry (`sp->tlds`/`tlds_lock`) and scavenger/park state
-  that do not exist in this tree yet -- only the lock skeleton and the
-  `threadlocal.c` handler are ported here; the resulting gap and every
-  scavenger-specific hook point are marked `// Phase 7: scavenger` below (tracked by
-  #264 item 7 / #272).
+  a per-subprocess `tld` registry (`sp->tlds`/`tlds_lock`) and scavenger/park state.
+  #270 ported only the lock skeleton and the `threadlocal.c` handler; #272 later
+  imported the registry and the scavenger, and their fork handling (`tlds_lock` as
+  step 4 below, the per-tld and scavenger resets in `_mi_process_fork_child`) is
+  documented where it is used.
 
   =====================================================================================
   ==  LOCK ORDER  =====================================================================
@@ -112,69 +112,83 @@ terms of the MIT license. A copy of the license can be found in the file
   ---- Nesting graph (lock -> locks it may acquire while held) ----
 
     mi_subprocs_lock                subproc.c        registry of sub-processes
-      -> sp->heaps_lock             `_mi_subproc_prof_sync_force_slow` (subproc.c) and
-                                    `_mi_subprocs_unsafe_destroy_all` -> `mi_subproc_unsafe_destroy`
+      -> sp->heaps_lock             `_mi_subproc_prof_sync_force_slow` (subproc.c),
+                                    `_mi_subprocs_unsafe_destroy_all` -> `mi_subproc_unsafe_destroy`,
+                                    and `_mi_arenas_reclaim_now` (arena-reclaim.c)
       -> heap->theaps_lock          (same, transitively)
+      -> sp->tlds_lock              the `mi_purge_all` claim walk (purge-all.c) and the arena
+                                    reclaim (arena-reclaim.c)
 
     sp->heaps_lock                  subproc.c        the subproc's list of heaps
       -> heap->theaps_lock          `_mi_subproc_prof_sync_force_slow` (subproc.c)
+      -> sp->tlds_lock              `mi_arena_reclaim_subproc` (arena-reclaim.c)
       -> mi_thread_locals_lock      `mi_subproc_unsafe_destroy` -> `_mi_thread_locals_done` (threadlocal.c)
-      -> heap->arena_pages_lock     `mi_subproc_unsafe_destroy` -> `_mi_heap_force_destroy` -> `mi_heap_free` (heap.c:203)
+      -> heap->arena_pages_lock     `mi_subproc_unsafe_destroy` -> `_mi_heap_force_destroy` -> `mi_heap_free` (heap.c)
       -> heap->os_abandoned_pages_lock, sp->theap_meta_lock   (same teardown path, via frees)
 
     subproc->tlds_lock              init.c           #272: the subproc's registry of live tlds
-      -> (nothing)                  `mi_tld_register`/`mi_tld_unregister` (init.c) and the
-                                    scavenger's parked-thread walk (`_mi_theap_sweep_parked`,
-                                    scavenger.c) only touch list links and atomics under it,
-                                    and no caller holds another lock while acquiring it. A LEAF
-                                    in both directions; its step number below is therefore free,
-                                    and it sits where the child needs the list stable to walk it.
+      -> heap->arena_pages_lock, sp->theap_meta_lock, hook locks
+                                    NOT a leaf. `mi_arena_reclaim_subproc` (arena-reclaim.c,
+                                    `MI_PURGE_RECLAIM`) holds it, inside `heaps_lock`, across
+                                    `mi_arena_reclaim_release_heap_pages` -- a non-main heap's
+                                    `arena_pages_lock`, then `_mi_arena_pages_free` -> a FREE
+                                    through the memory-events hook -- and then `theap_meta_lock`.
+                                    It is itself taken under `mi_subprocs_lock` (the
+                                    `mi_purge_all` walk, purge-all.c) and `sp->heaps_lock` (that
+                                    reclaim). The other holders touch only list links and
+                                    atomics under it: `mi_tld_register`/`mi_tld_unregister`
+                                    (init.c), the scavenger's parked-thread walk
+                                    (`_mi_theap_sweep_parked`), the `mi_purge_all` claim walk,
+                                    `_mi_pages_release_retired` (OS discards; its debug record
+                                    check only TRY-acquires `prof_lock`), and
+                                    `mi_heap_detach_theaps` (heap.c), which spins in
+                                    `_mi_park_leave` under it. Step 4 below satisfies every edge.
 
     heap->theaps_lock               heap.c/theap.c   the heap's list of theaps
-      -> sp->theap_meta_lock        `mi_heap_free_theaps` (heap.c:174) -> `_mi_theap_decref`
-                                    -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c:363)
+      -> sp->theap_meta_lock        `mi_heap_free_theaps` (heap.c) -> `_mi_theap_decref`
+                                    -> `mi_theap_free_mem` -> `_mi_meta_free` (theap.c)
                                     ... and, for a page owned by `theap_meta`, `mi_free`
-                                    -> `mi_stat_free` (free.c:768) takes `theap_meta_lock`
+                                    -> `mi_stat_free` (free.c) takes `theap_meta_lock`
                                     (#350 removed the P10b/#317 edge that used to be listed
                                     here: `mi_arena_pages_abandoned_ensure` now allocates the
                                     per-bin abandoned bitmap from raw OS memory and takes no
                                     `theap_meta_lock` at all.)
       -> tld->theaps_lock           `_mi_heap_detach_theaps` -- but `mi_lock_TRY_acquire`
-                                    with a back-off retry (theap.c:412), so NOT a blocking
-                                    edge; see the Phase 7 gap note below
+                                    with a back-off retry (theap.c), so NOT a blocking
+                                    edge; see the `mi_tld_t::theaps_lock` note below
 
-    heap->arena_pages_lock          arena.c:685      per-heap arena page-info table
+    heap->arena_pages_lock          arena.c          per-heap arena page-info table
       (NON-main heap only; for `heap_main` the body is a plain atomic store, no nesting)
       -> heap_main->arena_pages_lock, sp->arena_reserve_lock, page_map->lock, hook locks
                                     `mi_heap_ensure_arena_pages` holds it across
-                                    `mi_arena_pages_alloc` (arena.c:1544), which runs a FULL
+                                    `mi_arena_pages_alloc` (arena.c), which runs a FULL
                                     `mi_heap_zalloc_aligned(subproc->heap_main, ...)`
-      -> sp->theap_meta_lock        `mi_heap_free` (heap.c:203-208) holds it across
-                                    `_mi_free_subproc_safe` -> `mi_stat_free` (free.c:768)
-      -> heap->os_abandoned_pages_lock   (same free, via `mi_arena_page_abandon`, arena.c:1224)
+      -> sp->theap_meta_lock        `mi_heap_free` (heap.c) holds it across
+                                    `_mi_free_subproc_safe` -> `mi_stat_free` (free.c)
+      -> heap->os_abandoned_pages_lock   (same free, via `mi_arena_page_abandon`, arena.c)
 
     mi_thread_locals_lock           threadlocal.c    TLS slot bitmap
       -> sp->theap_meta_lock        `_mi_thread_local_create` holds it across
                                     `mi_thread_local_create_expand` -> `_mi_meta_zalloc_aligned`
-                                    (threadlocal.c:349); `_mi_thread_locals_done` likewise
-                                    across `_mi_meta_free` (threadlocal.c:311)
+                                    (threadlocal.c); `_mi_thread_locals_done` likewise
+                                    across `_mi_meta_free` (threadlocal.c)
 
-    sp->theap_meta_lock             subproc.c:181    the detached meta theap
+    sp->theap_meta_lock             subproc.c        the detached meta theap
       -> heap_main->arena_pages_lock, sp->arena_reserve_lock, page_map->lock,
          heap_main->os_abandoned_pages_lock, hook locks
                                     `_mi_meta_zalloc` holds it across a full
                                     `mi_theap_zalloc(subproc->theap_meta, ...)`, and
-                                    `theap_meta`'s heap IS `heap_main` (subproc.c:339,
+                                    `theap_meta`'s heap IS `heap_main` (subproc.c,
                                     init.c's process bootstrap) -- so an ordinary
                                     allocation slow path runs inside this lock:
                                     `_mi_malloc_generic` -> `_mi_arenas_page_alloc`
-                                    -> `mi_heap_ensure_arena_pages` (arena.c:685),
-                                    -> `mi_arenas_try_alloc` -> `arena_reserve_lock` (arena.c:534),
-                                    -> `_mi_page_map_register` -> `pmap->lock` (page-map.c:393)
+                                    -> `mi_heap_ensure_arena_pages` (arena.c),
+                                    -> `mi_arenas_try_alloc` -> `arena_reserve_lock` (arena.c),
+                                    -> `_mi_page_map_register` -> `pmap->lock` (page-map.c)
                                     THIS is the edge the first version of this order got
                                     backwards (it took the page-map/arena locks BEFORE
                                     `theap_meta_lock`), which deadlocks against any thread
-                                    starting up (`init.c:268` / `theap.c:329` allocate a
+                                    starting up (`init.c` / `theap.c` allocate a
                                     fresh tld/theap through `_mi_meta_zalloc`).
                                     NOT an edge: `_mi_arenas_page_abandon` (arena.c) must
                                     never re-enter `_mi_meta_zalloc_aligned` for a page that
@@ -192,19 +206,19 @@ terms of the MIT license. A copy of the license can be found in the file
                                     and takes no `theap_meta_lock`, so there is no self-edge
                                     left to guard.)
 
-    heap_main->arena_pages_lock     arena.c:685      LEAF. For the main heap
+    heap_main->arena_pages_lock     arena.c          LEAF. For the main heap
                                     `mi_heap_ensure_arena_pages` only stores
                                     `&arena->pages_main` -- it never allocates -- and
                                     `mi_heap_free` skips the arena-pages loop entirely for
-                                    a main heap (`if (!is_main)`, heap.c:202).
+                                    a main heap (`if (!is_main)`, heap.c).
 
-    sp->arena_reserve_lock          arena.c:534      LEAF. `mi_arena_reserve` ->
+    sp->arena_reserve_lock          arena.c          LEAF. `mi_arena_reserve` ->
                                     `mi_reserve_os_memory_ex2` -> `mi_arena_initialize` ->
                                     `mi_arenas_add` is raw-OS + atomics only; no mimalloc
                                     lock other than `out_buf_lock` (warnings).
 
-    heap->os_abandoned_pages_lock   arena.c:1224     LEAF. Pure list splice.
-    page_map->lock                  page-map.c:393   LEAF. `_mi_os_zalloc` of a submap only.
+    heap->os_abandoned_pages_lock   arena.c          LEAF. Pure list splice.
+    page_map->lock                  page-map.c       LEAF. `_mi_os_zalloc` of a submap only.
 
     prof_lock / dhat_lock / memevt_cb_lock                   INNERMOST (alloc/free HOOKS)
                                     Acquired by `_mi_prof_on_alloc`/`_mi_dhat_*`/
@@ -215,7 +229,7 @@ terms of the MIT license. A copy of the license can be found in the file
                                     (profiler/DHAT memory comes from the raw-OS arena per
                                     CLAUDE.md rule 4; `memevt_dispatch` releases
                                     `memevt_cb_lock` before invoking the handler).
-    out_buf_lock                    options.c:388    LAST: a plain memcpy into a fixed
+    out_buf_lock                    options.c        LAST: a plain memcpy into a fixed
                                     buffer, reachable from a warning message under any
                                     lock above.
 
@@ -321,7 +335,7 @@ terms of the MIT license. A copy of the license can be found in the file
      `mi_prof_visit`'s declaration (profile.h): a visitor must not allocate.
      (`mi_prof_snapshot_visit` is unaffected: it visits an already-copied snapshot under
      no lock at all.)
-   * `mi_out_buf_flush` (options.c:411) calls the registered `mi_output_fun` while
+   * `mi_out_buf_flush` (options.c) calls the registered `mi_output_fun` while
      holding `out_buf_lock`; an output function that allocates inverts the innermost
      level. That is upstream mimalloc's own contract for `mi_register_output`.
 
@@ -414,7 +428,11 @@ static mi_threadid_t mi_fork_thread_id(void) {
       the page-map/arena locks) is reported by an ordinary Debug-FULL test run.
 
   Scope of (b): only locks with PROCESS-LIFETIME storage are tracked -- the main
-  subprocess's own three locks, the process main heap's three, and the five global ones.
+  subprocess's own four locks (`heaps_lock`, `tlds_lock`, `theap_meta_lock`,
+  `arena_reserve_lock`), the process main heap's three, and up to seven global ones
+  (`prof_lock`/`dhat_lock`/`memevt_cb_lock` only when compiled in): at most 14 of the
+  `MI_FORK_TRACKED_MAX` (16) slots. A lock that arrives with the table full is silently
+  left untracked.
   A non-main heap's locks are freed with the heap (heap.c's `mi_heap_free`), and this
   table is keyed by address, so tracking them would mean reading a `debug_owner` field
   out of freed memory; they are deliberately left unclassified (their level is simply
@@ -440,7 +458,8 @@ static mi_threadid_t mi_fork_thread_id(void) {
   levels of `mi_thread_locals_lock` and `theap_meta_lock` (and prepare's matching acquire
   order) makes an ordinary `test-fork-locks` run report
   "fork lock-order violation: mi_thread_locals_lock (step 6) was held while acquiring
-  subproc->theap_meta_lock (step 5)". See the #270 PR discussion.
+  subproc->theap_meta_lock (step 5)" -- step numbers from before #272 inserted
+  `tlds_lock` as step 4; both are one higher today. See the #270 PR discussion.
 ----------------------------------------------------------- */
 
 #if (MI_DEBUG>1)
@@ -746,7 +765,7 @@ void _mi_process_fork_child(void) {
   // survive the fork is skipped rather than abandoned. That is the intended, permanent
   // behavior (not a limitation to lift later).
   _mi_process_is_forked_child = true;
-  // #293: this child's generation is now new -- every tld stamped by a `mi_tld_register`
+  // #293: this child's generation is now new -- every tld stamped by a `mi_tld_init`
   // (init.c) that ran before this fork predates it, and the per-tld loop below restamps
   // the survivor's own tld with the new value. Bump exactly once per fork here, NOT once
   // per subproc in the walk below.
