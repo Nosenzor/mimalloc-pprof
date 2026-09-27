@@ -223,8 +223,8 @@ static THREAD_RET subproc_worker(void* arg) {
   subproc_worker_arg_t* const worker = (subproc_worker_arg_t*)arg;
   mi_subproc_add_current_thread(worker->subproc);
   worker->joined = (mi_subproc_current()._mi_subproc_id == worker->subproc._mi_subproc_id);
-  // A Windows shared-library thread may already have been initialized by the DLL's
-  // thread-attach callback. Such a thread cannot move into another sub-process.
+  // A Windows shared-library worker may already belong to the process main sub-process
+  // before this function runs. Such a thread cannot move into another sub-process.
   if (!worker->joined) return THREAD_OK;
   // The sub-process's main heap, which mi_heap_main() names for this thread now.
   fill_heap(mi_heap_main(), NULL);
@@ -262,7 +262,7 @@ static void scenario_subproc(void) {
   if (!worker_arg.joined) {
     mi_subproc_destroy(subproc);
     mi_prof_stop();
-    puts("skip: Windows DLL initialized the worker before sub-process assignment");
+    puts("skip: Windows worker already belonged to another sub-process");
     return;
   }
 #else
