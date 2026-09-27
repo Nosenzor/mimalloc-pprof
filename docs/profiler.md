@@ -12,8 +12,11 @@ function and no load of profiler state, byte-identical between `MI_PPROF=ON` and
 path), which every allocation is routed through *only* while the profiler is
 actually running: `mi_prof_start` poisons every theap's `pages_free_direct` (Bun's
 strategy, ported from `oven-sh/mimalloc@942b8342`, MIT) so the fast path always
-misses for as long as profiling is on, and stops poisoning it — same-thread,
-lock-free — the moment `mi_prof_stop` runs.
+misses for as long as profiling is on. `mi_prof_stop` clears the poison flag on every
+theap, through the same walk that start uses (`_mi_subproc_prof_sync_force_slow`, over
+every sub-process, heap and theap under their locks), but rewrites no theap's
+`pages_free_direct`: each theap gets its fast path back lazily, the next time it passes
+through the generic path.
 
 Historical context: #154 originally measured **+70% per allocation** (11.75 ns
 `MI_PPROF=OFF` vs. 20.00 ns `MI_PPROF=ON`-stopped, Windows/MinGW Release, 4M
@@ -56,10 +59,17 @@ MIMALLOC_PROF_SAMPLE_INTERVAL=524288 \
 | `MIMALLOC_PROF_BT_MAX=32` | Maximum captured stack depth (compile-time cap 128) |
 | `MIMALLOC_PROF_MAX_BYTES=N` | Bound persistent profiler arena memory |
 | `MIMALLOC_PROF_SEED=N` | Deterministic sampling, for repeatable tests (see the note below) |
-| `MIMALLOC_PROF_DUMP_FORMAT=proto` | Write pprof `profile.proto` instead of text |
+| `MIMALLOC_PROF_DUMP_FORMAT=proto` | Meant to write pprof `profile.proto` instead of text. **Known issue:** ignored today (see below) |
 
 `MIMALLOC_PROF_SAMPLE_RATE` remains a compatibility alias for
 `MIMALLOC_PROF_SAMPLE_INTERVAL`; when both are set, `..._INTERVAL` wins.
+
+**Known issue: `MIMALLOC_PROF_DUMP_FORMAT` is ignored.** Both places that read it pass a
+32-byte buffer, and `_mi_getenv` rejects any buffer under 64 bytes, so `=proto` still
+produces a text exit dump. When the variable is set, a FALLBACK-mode `mi_prof_start_ex`
+also skips its own `dump_format`. Until that is fixed, get a `profile.proto` exit dump
+with `dump_format = MI_PROF_FORMAT_PROTO` in a `mi_prof_config_t` (OVERRIDE mode, or
+FALLBACK with the variable unset), or call `mi_prof_dump_proto` yourself.
 
 **What `MIMALLOC_PROF_SEED` guarantees.** Two runs of the same workload with the same
 seed sample at the same points, **provided the threads are created in the same order** —

@@ -314,8 +314,8 @@ commit, and reachable from both C and Rust ([full API table](#api-surface)).
   `stats::get()`), per sub-process and per heap, embedded as `#` comment lines in every
   profile dump so a sampled profile can be checked against ground truth. Upstream v3's
   API, bound completely in Rust here. → [Exact allocator stats](#exact-allocator-stats)
-- **DHAT total accounting.** Exact, every-allocation profiling with lifetimes and
-  access counts (`mi_dhat_start`, `dhat::start()`), dumped in Valgrind's DHAT format for
+- **DHAT total accounting.** Exact, every-allocation profiling of sizes and lifetimes —
+  no memory-access data (`bkacc: false`) — via `mi_dhat_start` / `dhat::start()`, dumped in Valgrind's DHAT format for
   `dh_view.html`. Independent of `MI_PPROF`; **opt-in at build time** (`features = ["dhat"]`
   / `-DMI_DHAT=ON`). → [DHAT](#dhat-exact-heap-profiling)
 - **Memory-events API.** Opt-in allocation-change callbacks and live-allocation
@@ -383,7 +383,7 @@ activated. A runtime environment variable cannot add a subsystem that was compil
 | sampled pprof profiling | not compiled | `pprof` / `MI_PPROF=1` | stopped | `prof::start()` / `mi_prof_start()`, or `MIMALLOC_PROF=1` |
 | allocation events | not compiled | `memory-events` / `MI_MEMEVT=1` | disabled | `memory_events::set_enabled(true)` / `mi_memory_tracking_set_enabled(true)`, or `MIMALLOC_MEMORY_EVENTS=1` |
 | heap snapshots and JSON dumps | not compiled | `diagnostics` / `MI_DIAGNOSTICS=1` | available on demand | call the snapshot or dump API |
-| exact DHAT profiling | not compiled | `dhat` (implies `memory-events`) / `MI_DHAT=1` | stopped | `dhat::start()` / `mi_dhat_start()`, or `MIMALLOC_DHAT=1` |
+| exact DHAT profiling | not compiled | `dhat` (implies `memory-events`) / `MI_DHAT=1` | stopped | `dhat::start()` / `mi_dhat_start()` (`MIMALLOC_DHAT=1` is a known issue: it does not start DHAT today, see [DHAT](#dhat-exact-heap-profiling)) |
 | process-wide owner gate | not compiled | `owner-gate` / `MI_OWNER_GATE=1` | active | no separate runtime switch |
 
 Cargo's `full` feature includes all five compile-time options; each profiler or observer
@@ -564,11 +564,17 @@ in Valgrind's [`dh_view.html`](https://valgrind.org/docs/manual/dh-manual.html).
 DHAT is **off by default** and must be built in explicitly: the Rust crate's `dhat`
 feature (`mimalloc-pprof = { version = "1", features = ["dhat"] }`) or CMake's
 `-DMI_DHAT=ON`. Without it the observer is compiled out of the allocator entirely and
-`mi_dhat_start` / `dhat::start()` return `false`. Once built in, no code is needed at all:
+`mi_dhat_start` / `dhat::start()` return `false`. Once built in, start it from code
+(below) and let `MIMALLOC_DHAT_DUMP_AT_EXIT` write the report when the process exits:
 
 ```sh
-MIMALLOC_DHAT=1 MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json ./my_app
+MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json ./my_app
 ```
+
+> **Known issue:** `MIMALLOC_DHAT=1` is meant to start DHAT with no code at all, but today
+> it is ignored: the variable is read into a buffer below `_mi_getenv`'s 64-byte minimum,
+> so it is never seen and DHAT stays off. Call `mi_dhat_start()` / `dhat::start()` until
+> that is fixed.
 
 Built with `MI_NO_PROCESS_DETACH` (issue #268)? The automatic exit path that
 `*_DUMP_AT_EXIT` relies on is skipped by design — call `mi_prof_dump` / `mi_dhat_dump`
@@ -604,8 +610,9 @@ mi_dhat_stop();                             /* stop observing; report still dump
 if (!mi_dhat_dump("heap.dhat.json")) return 2;
 ```
 
-Unlike the sampled profiler this keeps a record for **every** live allocation, so
-it is exact but high-overhead — use it for tests and focused investigations, not a
+Unlike the sampled profiler this keeps a record for **every** allocation it observes
+(a freed record is not reused until the next start), so it is exact but high-overhead —
+use it for tests and focused investigations, not a
 continuously running production workload. Memory budgeting
 (`MIMALLOC_DHAT_MAX_BYTES`), partial-report semantics, and the stats API:
 **[docs/dhat-and-memory-events.md](docs/dhat-and-memory-events.md)**.
@@ -800,7 +807,7 @@ The fifteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the envir
 | `prof_sample_rate` | `524288` | average bytes between samples |
 | `prof_bt_max` | `32` | max captured stack depth |
 | `prof_accum` | `0` | keep cumulative counters until `mi_prof_reset` |
-| `prof_seed` | `0` | sampling PRNG seed; 0 = nondeterministic |
+| `prof_seed` | `0` | sampling PRNG seed; every value, 0 included, gives each thread the same stream from run to run |
 | `prof_max_bytes` | `0` | budget for profiler-internal arena memory; 0 = unbudgeted |
 | `memory_events` | `0` | enable allocation-change accounting/callbacks |
 | `purge_zeroes` | `0` | zero-tracking: after a purge the OS documents as zero-filling, let `mi_zalloc` skip its `memset` (lost in #80, restored by [#337](https://github.com/zackees/mimalloc-pprof/issues/337)) |
@@ -1048,10 +1055,10 @@ full survey, including what was *not* imported and why, is in [`MIMALLOC_FORKS.m
 | Zero-cost-when-off profiler fast path (`prof_force_slow`) | Poisons `pages_free_direct` while profiling runs so `mi_malloc`'s fast path disassembles byte-identical whether `MI_PPROF` is on or off with the profiler stopped. | `942b8342` (strategy import) | [#281](https://github.com/zackees/mimalloc-pprof/pull/281) | Own functions adapted to this tree's `mi_theap_t`/`mi_subproc_t` layout rather than Bun's page-flag-bit mechanism. Fixed a +70% ns/alloc regression. |
 | `MI_NO_PROCESS_DETACH` | Opt out of the exit-time destructor entirely, for embedders that own their own teardown. | Bun (unconditional) | [#284](https://github.com/zackees/mimalloc-pprof/pull/284) | ~5-line port: a CMake option, an early return in `_mi_auto_process_done`, a guarded destructor registration. `MIMALLOC_PROF_DUMP_AT_EXIT` / DHAT dump-at-exit are consequently also skipped under the define. |
 | `mi_heap_dump_json` / `mi_heap_get_seq` + stats snapshot printing | JSON heap dump API, and printing `_mi_stats_print` from a snapshot (`mi_stats_add`) instead of the live, concurrently-updated struct. | `942b8342` | [#286](https://github.com/zackees/mimalloc-pprof/pull/286) | `mi_heap_t::heap_seq` already existed at this tree's pin; only the accessor and the dump walk (`src/heap-dump.c`) were new. |
-| `pthread_atfork` fork-safety handlers | Prepare/parent/child handlers so a `fork()`ing process doesn't inherit a lock held by another thread. | Bun (`_mi_process_fork_prepare/parent/child`) | [#289](https://github.com/zackees/mimalloc-pprof/pull/289) | The lock **skeleton** is Bun's; the lock **order** is not — re-derived from this tree's actual lock-nesting graph and documented edge-by-edge in `src/fork.c`, with an owner-tid + mutex-depth `MI_DEBUG>2` runtime detector that asserts every acquire agrees with the documented order. |
+| `pthread_atfork` fork-safety handlers | Prepare/parent/child handlers so a `fork()`ing process doesn't inherit a lock held by another thread. | Bun (`_mi_process_fork_prepare/parent/child`) | [#289](https://github.com/zackees/mimalloc-pprof/pull/289) | The lock **skeleton** is Bun's; the lock **order** is not — re-derived from this tree's actual lock-nesting graph and documented edge-by-edge in `src/fork.c`. An owner-tid + depth guard (always on) serialises concurrent and nested `fork()` calls; separately, an `MI_DEBUG>2` checker records the nesting edges ordinary code takes between the tracked process-lifetime locks and, at the next `fork()`, reports any edge that contradicts the documented order. |
 | Heap delete/destroy teardown protocol | Four-step claim protocol closing an ABA race between `mi_heap_destroy` and a concurrent allocation on the same heap. | Bun (`src/theap.c`, `src/heap.c`, `src/arena.c`) | [#291](https://github.com/zackees/mimalloc-pprof/pull/291) | Adapted for the absence of `pthread_atfork`/scavenger state at the time. Also imported Bun's heap-teardown test corpus (`test-heap-teardown.c`, `test-heap-churn.c`, `test-heap-aba.c`) and its `mi_debug_fail_os_commit_after` fault-injection hook. Found and fixed two use-after-free classes the working protocol made reachable, beyond what Bun's own tree has. |
 | Background scavenger thread + `mi_on_thread_idle*` | A demand-driven background thread that purges scheduled arena memory on a timer instead of only on allocation; `purge_delay` 1000 → 100 ms. | `src/scavenger.c` | [#299](https://github.com/zackees/mimalloc-pprof/pull/299) | Deviations from Bun: stopped from an `atexit` handler on Windows; lazy start fires only from a main-subprocess thread (a sub-subprocess-started scavenger has its TLS torn down first); the new `mi_subproc_t` fields are appended at the struct tail rather than mid-struct — Bun's placement shifts `stats`, which the free path touches, ~2 ns/alloc+free. (The park protocol itself is Bun's, imported as part of this PR.) |
-| Page hole purging (`purge_holes*`) | Discards the memory of free blocks *inside* a still-used page (OS-page units), so one long-lived object no longer pins a whole page resident. | `src/page.c` (+1038), `942b8342` | [#302](https://github.com/zackees/mimalloc-pprof/pull/302) | The whole engine, including the sweep drivers, was moved into a new `src/page-holes.c`; upstream files carry only five hook calls. Measured in [Memory returned after idle](#memory-returned-after-idle). |
+| Page hole purging (`purge_holes*`) | Discards the memory of free blocks *inside* a still-used page (OS-page units), so one long-lived object no longer pins a whole page resident. | `src/page.c` (+1038), `942b8342` | [#302](https://github.com/zackees/mimalloc-pprof/pull/302) | The whole engine, including the sweep drivers, was moved into a new `src/page-holes.c`; upstream files carry only single-line calls into it. Measured in [Memory returned after idle](#memory-returned-after-idle). |
 | Windows PRNG / RAM-sizing / NUMA fixes; macOS TLS slots 96/97 | `ProcessPrng` instead of always loading `bcrypt.dll`; `GlobalMemoryStatusEx` instead of an SMBIOS parse; NUMA node count off-by-one; fixed TLS slots moved into libpthread's never-assigned gap (95 is the last assigned key). | Bun (`6ccccec2`, `c3c36aa8`, `75a1edf8`, `d676cced`, `include/mimalloc/prim-tls.h:356-361`); NUMA fix from upstream `66383f06`, cherry-picked by Bun as `16cd3684` | [#297](https://github.com/zackees/mimalloc-pprof/pull/297) | CI fetches `apple-oss-distributions/libpthread`'s `tsd_private.h` from `main` (not pinned) and fails if slot 96 or 97 is ever assigned upstream. |
 | Collect on sub-process-safe free | `_mi_free_subproc_safe` collects the page inside its own sub-process, so `mi_heap_destroy` no longer strands ~170 KB per destroyed heap in burst patterns. | [`04ced98d`](https://github.com/oven-sh/mimalloc/commit/04ced98d) | [#318](https://github.com/zackees/mimalloc-pprof/pull/318) | Hand-ported (trees diverged); converged on Bun's `MI_THREADID_DETACHED` test in `mi_stat_free` after review found a teardown-order NULL deref in the first draft. New `test-heap-burst-destroy` proves RED/GREEN. |
 | Lazy per-bin abandoned bitmaps, `heap->releasing`, unmapped abandon on release | Per-bin abandoned-page bitmaps are allocated on first abandon instead of eagerly (~110 KB and ~50 page faults per heap); a heap being released abandons its pages unmapped; the delete walk is ordered against concurrent frees. | [`787be2a8`](https://github.com/oven-sh/mimalloc/commit/787be2a8), [`91218f30`](https://github.com/oven-sh/mimalloc/commit/91218f30), [`a26c5de7`](https://github.com/oven-sh/mimalloc/commit/a26c5de7) | [#319](https://github.com/zackees/mimalloc-pprof/pull/319) | Review found the lazy allocation could re-enter `subproc->theap_meta_lock` from the abandon path; sub-process meta theaps now have `allow_page_abandon=false` like the process one, and meta pages skip the bitmap allocation. New tests `test-abandoned-lazy`, `test-heap-release-mt`. |

@@ -30,13 +30,13 @@ busy threads too (paced by `purge_holes_min_interval`, bounded per visit by
 <!-- doc-snippet: skip (mirrors the declarations in include/mimalloc.h; redefining them next to the header does not compile) -->
 ```c
 typedef enum mi_purge_flags_e {
-  MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep runs to completion
+  MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed thread's hole walk runs to completion
   MI_PURGE_RECLAIM = 2, // also give back every arena that is COMPLETELY free, metadata included
 } mi_purge_flags_t;
 
 typedef struct mi_purge_all_report_s {
-  size_t arena_bytes;        // returned to the OS by the arena passes
-  size_t hole_bytes;         // returned by hole purging (every swept heap + abandoned pages)
+  size_t arena_bytes;        // returned to the OS by the arena passes (plus the sweeps' unformed-tail discards)
+  size_t hole_bytes;         // free blocks discarded by hole purging (every swept heap + abandoned pages)
   size_t theaps_swept;       // per-thread heaps claimed and swept by this call (caller included)
   size_t theaps_pending;     // registered threads not reached within wait_ms
   size_t theaps_orphaned;    // pre-fork threads that vanished in a fork child; never touched
@@ -115,9 +115,13 @@ cutoff), so thread churn cannot extend a call; the next iteration sees them.
 
 - The arena passes ignore `purge_delay` and purge now.
 - The hole sweep ignores `purge_holes_min_interval` pacing.
-- A **claimed sweep runs to completion**: the per-visit `park_reclaim` budget the
-  scavenger honours is ignored, and the claimed thread's owner stalls at its next
-  allocator call until the sweep finishes. The stall is the cost of reaching a busy
+- A **claimed thread's hole walk runs to completion**: the hole sweep and the checks
+  between phases ignore the `park_reclaim` budget the scavenger honours, and the claimed
+  thread's owner stalls at its next allocator call until the walk finishes. Two parts
+  still stop at the owner's reclaim: the collect (`mi_theap_page_collect`) and the
+  abandoned-page hole pass (`mi_arena_page_purge_holes_at`), which reads `park_reclaim`
+  directly. By then the call has already swept every heap's abandoned pages itself, on
+  the caller's thread, before it claims anyone. The stall is the cost of reaching a busy
   thread; `test-purge-all` (case G2) measures and prints the worst single-call stall a
   busy worker sees during a forced purge — see the number below.
 - `FORCE` never means "wait forever": `wait_ms` still bounds acquisition.
@@ -179,10 +183,19 @@ clear admission slot, so it is never permanently `BUSY`.
 
 ### Hook and profiler attribution
 
-A foreign sweep runs on the *purging* thread. Memory-events and profiler bookkeeping it
-emits — page purges, hole discards, the per-thread counters — are attributed to the
-purging thread, not to the thread whose heap was swept. Output hooks resolve to the
-purging thread's hook state.
+A foreign sweep runs on the *purging* thread, but it creates almost no observer events.
+Page purges and hole discards emit nothing, and the sweep never reads or writes the swept
+thread's sampling countdown (`mi_tld_t::profiler`; debug builds assert it is unchanged).
+The one hook the purge and sweep paths reach is the profiler's: folding the frees other
+threads made into a page, which both the collect and the hole walk do, unlinks the records
+of sampled blocks among them (`_mi_prof_on_free_collect`). Those records are process-wide,
+so no thread is credited with them.
+
+The one observer event a purge produces comes from `MI_PURGE_RECLAIM`. Freeing each
+non-main heap's per-arena page table goes through `mi_free`, so it emits one memory-events
+FREE (and a DHAT free) per table, on the purging thread. Its ALLOCATE was emitted on
+whichever thread first made that heap allocate in that arena. Hooks reached on the purging
+thread resolve to that thread's hook state.
 
 ### `BUSY`
 

@@ -169,9 +169,10 @@ See
   `mi_tld_t`.
   Profiler/memory-events hooks that need per-thread scratch state (e.g. the profiler's
   sampling counters) live on `mi_theap_t`/`mi_tld_t`, not `mi_heap_t`.
-- `src/static.c` is the single-TU amalgamation the Rust sys crate compiles — every new C file
-  must be included there (guarded by `MI_PPROF` where appropriate) or Rust builds silently
-  miss it.
+- `src/static.c` is the root of the single-TU amalgamation the Rust crate compiles
+  (`cargo run -p xtask -- amalgamate-c` expands it into
+  `rust/mimalloc-pprof/vendor/mimalloc-pprof-amalgamated.c`) — every new C file must be
+  included there (guarded by `MI_PPROF` where appropriate) or Rust builds silently miss it.
 - Fast local iteration: `uv run ci/dev_linux.py c-test | rust-test | bench` (issue #10) once
   landed. `bench` is the speed acceptance test; paste its output on #10 when touched.
   `uv run ci/verify_local.py` mirrors the Linux-runnable subset of CI (c-unit/rust-native/
