@@ -324,13 +324,12 @@ first access and would re-enter without bound (oven-sh/bun#38051). Since #366 it
 the caller, not the swept tld; a nested allocation comes out of the caller's own theaps.
 
 **Atomics.** The sweep state on the tld (`holes_sweep_*`, `holes_busy*`) is plain, meant for
-the owner or the claim holder only. *Possible defect, found by static trace and not
-reproduced (`MI_OWNER_GATE` builds only):* phase B of `mi_purge_all_ex` passes the caller's
-tld to `_mi_arenas_purge_abandoned_holes` before `MI_GATE_ENTER`, while a gated caller is
-PARKED, so the scavenger could claim that tld and sweep it concurrently, racing on
-`holes_sweeping` and the tallies (`_mi_page_purge_holes_begin` asserts `!holes_sweeping`).
-`_mi_theap_sweep_parked` reads `holes_sweep_last`
-only after the acquire that pairs with the owner's release-store of `MI_PARK_PARKED`. Keep
+the owner or the claim holder only. `mi_purge_all_ex` therefore enters its own gate before
+phase B, which passes the caller's tld to `_mi_arenas_purge_abandoned_holes`; before #417
+(`ff7b5e5b`) a gated caller was still PARKED there and the scavenger could sweep the same tld.
+`_mi_theap_sweep_parked` reads `holes_sweep_last` after the acquire that pairs with the
+owner's release-store of `MI_PARK_PARKED`; an owner leaving the park concurrently can still
+race that read, harmlessly, because the claim CAS then fails. Keep
 any future atomic field word-width: the MSVC C atomics wrapper is word-width only (see the
 `types.h` comment). Process counters are `int64_t` under `mi_atomic_addi64_relaxed`; the
 `skipped`/`visited` tallies accumulate on the tld and are folded in once per pass. Retired
