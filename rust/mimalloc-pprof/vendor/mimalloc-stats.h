@@ -167,9 +167,11 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // reads mutable state of an unclaimed owner. Top-level complete/skipped_pages/
 // busy_theaps describe observed coverage. In an MI_OWNER_GATE build, an incomplete
 // attempt is discarded and retried from a clean boundary for up to `wait_ms`;
-// otherwise busy owners are omitted immediately. The wait never retains page pins,
-// owner claims, or heap traversal locks. A call nested inside an existing owner-gated
-// allocator operation is one-shot because it cannot release its caller's outer gate.
+// otherwise busy owners are omitted immediately. In a forked child, owners that did
+// not survive the fork are counted as missed and never waited for. The wait never
+// retains page pins, owner claims, or heap traversal locks. A call nested inside an
+// existing owner-gated allocator operation is one-shot because it cannot release its
+// caller's outer gate.
 // A true complete result still does not make independently captured pages one global
 // instant. Ungated foreign owners must cooperatively park for coverage. Use mi_free
 // to free the result.
