@@ -1171,6 +1171,16 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-profile-accum PROPERTIES ENVIRONMENT "MIMALLOC_PROF_ACCUM=1")
     add_test(NAME test-profile-auto COMMAND mimalloc-test-profile)
     set_tests_properties(test-profile-auto PROPERTIES ENVIRONMENT "MIMALLOC_PROF=1")
+    # #549: the exit-dump settings are read with _mi_getenv, which reports a too-small result
+    # buffer exactly like an unset variable. Each case runs the binary in a dedicated mode that
+    # reads back the file mi_process_done() writes (see the modes above main in test-profile.c).
+    add_test(NAME test-profile-env-dump-format COMMAND mimalloc-test-profile --env-dump-format-check)
+    set_tests_properties(test-profile-env-dump-format PROPERTIES ENVIRONMENT
+                         "MIMALLOC_PROF=1;MIMALLOC_PROF_DUMP_AT_EXIT=test-profile-env-dump-format.prof;MIMALLOC_PROF_DUMP_FORMAT=proto")
+    add_test(NAME test-profile-start-ex-dump-format COMMAND mimalloc-test-profile --start-ex-dump-format-check)
+    add_test(NAME test-profile-start-ex-long-env-path COMMAND mimalloc-test-profile --start-ex-long-env-path-check)
+    set_tests_properties(test-profile-start-ex-long-env-path PROPERTIES ENVIRONMENT
+                         "MIMALLOC_PROF_DUMP_AT_EXIT=test-profile-start-ex-long-env-path.a-path-longer-than-sixty-four-characters.prof")
 
     # Adversarial concurrency coverage for the v3 engine (issue #43): thread
     # bootstrap race, cross-thread free, snapshot stability under mutation.
@@ -1774,6 +1784,9 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-dhat PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-dhat COMMAND mimalloc-test-dhat)
+  # #549: MIMALLOC_DHAT=1 alone must start DHAT -- the mode never calls mi_dhat_start().
+  add_test(NAME test-dhat-env-enabled COMMAND mimalloc-test-dhat --env-enabled-check)
+  set_tests_properties(test-dhat-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_DHAT=1")
   endif()
 
   # mi_heap_dump_json / mi_heap_get_seq (issue #269, Bun parity P4): backs bun:jsc

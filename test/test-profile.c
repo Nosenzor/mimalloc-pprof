@@ -1184,7 +1184,115 @@ static void test_start_while_allocating_stop_mid_sample_restart_reset(void) {
   mi_option_set_enabled(mi_option_prof_accum, accum_was_enabled);
 }
 
-int main(void) {
+/* ---- #549: environment-driven exit dumps ---------------------------------------------------
+   Each mode below is its own CTest case and returns before the main suite: it reads back the
+   file mi_process_done() writes, so it must own the process. None of them resolves stack PCs
+   to modules, so they also pass in the macOS Recovery guest (ci/recovery_expected_failures.py).
+   `_mi_getenv` reports a result buffer that is too small exactly like an unset variable, which
+   is how all three settings below were silently ignored. */
+#define EXIT_DUMP_ENV_LONG_VALUE_MIN 64  /* src/libc.c: _mi_getenv refuses result buffers under 64 bytes */
+static const char text_dump_header[] = "heap profile:";
+
+static size_t read_exit_dump(const char* path) {
+  FILE* f = fopen(path, "rb");
+  if (f == NULL) return 0;
+  const size_t n = fread(t12_proto_buf, 1, sizeof(t12_proto_buf), f);
+  fclose(f);
+  return n;
+}
+static bool file_exists(const char* path) {
+  FILE* f = fopen(path, "rb");
+  if (f == NULL) return false;
+  fclose(f);
+  return true;
+}
+/* A pprof Profile rather than the text dump: every top-level field decodes, the fields consume
+   the file exactly, and at least one sample_type (field 1) is present -- the proto writer
+   always emits them, even for an empty profile. */
+static bool exit_dump_is_proto(size_t len) {
+  const size_t header_len = sizeof(text_dump_header) - 1;
+  if (len >= header_len && memcmp(t12_proto_buf, text_dump_header, header_len) == 0) return false;
+  size_t pos = 0, sample_types = 0; uint32_t field, wire; uint64_t val; const unsigned char* bytes; size_t blen;
+  while (t12_pb_next(t12_proto_buf, len, &pos, &field, &wire, &val, &bytes, &blen)) {
+    if (field == 1 && wire == 2) sample_types++;
+  }
+  return (pos == len && sample_types > 0);
+}
+
+/* test-profile-env-dump-format: the pure-environment path (prof_auto_start, no start call at
+   all). CTest sets MIMALLOC_PROF=1, MIMALLOC_PROF_DUMP_AT_EXIT and MIMALLOC_PROF_DUMP_FORMAT=proto. */
+static int run_env_dump_format_check(void) {
+  const char* const path = getenv("MIMALLOC_PROF_DUMP_AT_EXIT");
+  if (getenv("MIMALLOC_PROF") == NULL || path == NULL || getenv("MIMALLOC_PROF_DUMP_FORMAT") == NULL) {
+    fprintf(stderr, "test-profile --env-dump-format-check: needs MIMALLOC_PROF, MIMALLOC_PROF_DUMP_AT_EXIT and MIMALLOC_PROF_DUMP_FORMAT set\n");
+    return 1;
+  }
+  (void)remove(path);
+  void* p = mi_malloc(4096); assert(p != NULL); mi_free(p);
+  assert(mi_prof_is_enabled());
+  mi_process_done();  /* the exit-dump path, run now so this process can read its output */
+  const size_t n = read_exit_dump(path);
+  assert(n > 0);
+  assert(exit_dump_is_proto(n));
+  assert(remove(path) == 0);
+  puts("profile env dump-format check passed");
+  return 0;
+}
+
+/* test-profile-start-ex-dump-format: mi_prof_start_ex's own reader of MIMALLOC_PROF_DUMP_FORMAT.
+   The variable is set only after process initialization has run prof_auto_start's one-shot
+   read, so nothing but mi_prof_start_ex can pick it up. */
+static int run_start_ex_dump_format_check(void) {
+  static const char path[] = "test-profile-start-ex-dump-format.prof";
+  if (getenv("MIMALLOC_PROF_DUMP_FORMAT") != NULL || getenv("MIMALLOC_PROF_DUMP_AT_EXIT") != NULL) {
+    fprintf(stderr, "test-profile --start-ex-dump-format-check: MIMALLOC_PROF_DUMP_FORMAT and MIMALLOC_PROF_DUMP_AT_EXIT must be unset at startup\n");
+    return 1;
+  }
+  void* probe = mi_malloc(1); assert(probe != NULL); mi_free(probe);  /* process init has certainly run */
+  test_setenv("MIMALLOC_PROF_DUMP_FORMAT", "proto");
+  (void)remove(path);
+  mi_prof_config_t_decl(cfg);
+  cfg.dump_at_exit = path;  /* FALLBACK mode and dump_format left at TEXT: the variable decides */
+  assert(mi_prof_start_ex(&cfg));
+  void* p = mi_malloc(4096); assert(p != NULL); mi_free(p);
+  mi_process_done();
+  const size_t n = read_exit_dump(path);
+  assert(n > 0);
+  assert(exit_dump_is_proto(n));
+  assert(remove(path) == 0);
+  puts("profile start_ex dump-format check passed");
+  return 0;
+}
+
+/* test-profile-start-ex-long-env-path: in FALLBACK mode MIMALLOC_PROF_DUMP_AT_EXIT wins over
+   the struct's dump_at_exit (profile.h) -- also when the path is longer than the fixed-size
+   buffer the presence check used to probe it with. CTest sets the long path. */
+static int run_start_ex_long_env_path_check(void) {
+  static const char struct_path[] = "test-profile-start-ex-long-env-path.struct.prof";
+  const char* const env_path = getenv("MIMALLOC_PROF_DUMP_AT_EXIT");
+  if (env_path == NULL || strlen(env_path) < EXIT_DUMP_ENV_LONG_VALUE_MIN) {
+    fprintf(stderr, "test-profile --start-ex-long-env-path-check: needs MIMALLOC_PROF_DUMP_AT_EXIT set to a path of at least %d characters\n", EXIT_DUMP_ENV_LONG_VALUE_MIN);
+    return 1;
+  }
+  (void)remove(env_path); (void)remove(struct_path);
+  mi_prof_config_t_decl(cfg);
+  cfg.dump_at_exit = struct_path;
+  assert(mi_prof_start_ex(&cfg));
+  void* p = mi_malloc(4096); assert(p != NULL); mi_free(p);
+  mi_process_done();
+  const bool wrote_struct_path = file_exists(struct_path);
+  if (wrote_struct_path) (void)remove(struct_path);
+  assert(!wrote_struct_path);
+  assert(read_exit_dump(env_path) > 0);
+  assert(remove(env_path) == 0);
+  puts("profile start_ex long env-path check passed");
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc > 1 && strcmp(argv[1], "--env-dump-format-check") == 0) return run_env_dump_format_check();
+  if (argc > 1 && strcmp(argv[1], "--start-ex-dump-format-check") == 0) return run_start_ex_dump_format_check();
+  if (argc > 1 && strcmp(argv[1], "--start-ex-long-env-path-check") == 0) return run_start_ex_long_env_path_check();
   enum { count = 1000, size = 512 };
   void* blocks[count];
   size_t records = 0, bytes = 0, stacks = 0;

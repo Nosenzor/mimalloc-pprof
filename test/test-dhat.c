@@ -11,6 +11,7 @@
 #endif
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "mimalloc.h"
 #include "mimalloc/memory-events.h"
@@ -46,7 +47,28 @@ static void assert_memevt_is_stubbed(void) {
 }
 #endif
 
-int main(void) {
+/* #549: MIMALLOC_DHAT=1 alone must start DHAT at process initialization. Run as its own
+   CTest case (test-dhat-env-enabled) with the variable set through the ENVIRONMENT property,
+   and deliberately never calls mi_dhat_start(): test-dhat and test-fork-locks-dhat-env both
+   start DHAT explicitly or never look, which is how an ignored variable went unnoticed. */
+static int run_env_enabled_check(void) {
+  if (getenv("MIMALLOC_DHAT") == NULL) {
+    fprintf(stderr, "test-dhat --env-enabled-check: MIMALLOC_DHAT not set in environment\n");
+    return 1;
+  }
+  void* p = mi_malloc(16); assert(p != NULL);
+  assert(mi_dhat_is_enabled());
+  mi_dhat_stats_t_decl(stats);
+  assert(mi_dhat_stats_get(&stats));
+  assert(stats.enabled && stats.total_blocks >= 1 && stats.live_blocks >= 1);
+  mi_free(p);
+  mi_dhat_stop();
+  puts("DHAT env-enabled check passed");
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc > 1 && strcmp(argv[1], "--env-enabled-check") == 0) return run_env_enabled_check();
   callback_counts_t callbacks = { 0, 0, 0 };
   #if MI_MEMEVT
   assert(mi_memory_tracking_set_enabled(true));

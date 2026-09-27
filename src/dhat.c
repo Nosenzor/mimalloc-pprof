@@ -23,6 +23,15 @@
 #define DHAT_CHUNK_SIZE (64*1024)
 #define DHAT_DEFAULT_BUDGET (64*1024*1024)
 #define DHAT_BUCKETS 4096
+/* #549: result buffer for a short environment value (MIMALLOC_DHAT, MIMALLOC_DHAT_MAX_BYTES).
+   `_mi_getenv` (src/libc.c, upstream) refuses any buffer under 64 bytes with ENOENT, the
+   same code as "not set", so a smaller buffer silently ignores the variable. */
+#ifndef MI_DHAT_ENV_VALUE_SIZE
+#define MI_DHAT_ENV_VALUE_SIZE 64
+#endif
+#if MI_DHAT_ENV_VALUE_SIZE < 64
+#error "MI_DHAT_ENV_VALUE_SIZE must be at least 64: _mi_getenv (src/libc.c) treats a smaller buffer as an unset variable"
+#endif
 
 typedef struct dhat_chunk_s {
   struct dhat_chunk_s* next;
@@ -311,7 +320,7 @@ static void dhat_commit_resize_locked(dhat_event_t* ev) {
 }
 
 static bool dhat_env_size(const char* name, size_t* out) {
-  char buf[64];
+  char buf[MI_DHAT_ENV_VALUE_SIZE];
   if (_mi_getenv(name, buf, sizeof(buf)) != 0 || buf[0] == 0) return false;
   char* end = NULL;
   const unsigned long long v = strtoull(buf, &end, 10);
@@ -336,7 +345,7 @@ static void dhat_publish_armed(size_t state) {
 
 static void dhat_resolve_env(void) {
   if (_mi_atomic_once_enter(&dhat_once)) {
-    char value[8] = { 0 };
+    char value[MI_DHAT_ENV_VALUE_SIZE] = { 0 };
     /* DHAT has its own opt-in switch; it must never inherit the unrelated
        MIMALLOC_MEMORY_EVENTS activation state. */
     const bool env_enabled = (_mi_getenv("MIMALLOC_DHAT", value, sizeof(value)) == 0 && value[0] != 0 && value[0] != '0');
