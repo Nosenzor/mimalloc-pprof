@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d7af56d9 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8b2641e0 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -5187,6 +5187,9 @@ bool        _mi_prof_maps_append(_mi_prof_dump_append_fun* append, void* arg);
 bool        _mi_prof_maps_visit(mi_prof_module_visit_fun* visitor, void* arg);
 void        _mi_prof_process_init(void);
 void        _mi_prof_process_done(void);
+// #550: drop the sample records of a heap whose pages are released without per-block frees
+// (`_mi_heap_force_destroy`), like `_mi_dhat_forget_heap`. Takes `prof_lock`; allocates nothing.
+void        _mi_prof_forget_heap(mi_heap_t* heap);
 // #270: fork-safety -- quiesce/reset `prof_lock` around fork(). Child-side policy:
 // continue (profiler records are ordinary process memory, safe copy-on-write across
 // fork; only the lock itself needs resetting). See fork.c's lock-order block.
@@ -17729,6 +17732,9 @@ void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
   mi_heap_detach_theaps(heap);
   _mi_dhat_forget_heap(heap);
+  #if MI_PPROF
+  _mi_prof_forget_heap(heap);  // #550: likewise the profiler's sample records, before the pages go
+  #endif
   _mi_heap_destroy_pages(heap);
   mi_heap_free_theaps(heap);
   // Free unless this is the PROCESS main heap (which is statically allocated and must
@@ -30436,6 +30442,45 @@ void _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size) {
   mi_lock_acquire(&prof_lock); prof_realloc_in_place(page,p,size); mi_lock_release(&prof_lock);
 }
 
+// #550: `_mi_heap_force_destroy` (mi_heap_destroy, and mi_subproc_destroy for every heap of the
+// sub-process, its main heap included) releases a heap's pages without freeing their blocks one
+// by one, so the free hooks above never see those blocks go. This is the profiler's analogue of
+// `_mi_dhat_forget_heap`, called from the same spot: after the heap's theaps are detached (no new
+// record can appear for it) and while its pages are still valid. Before it existed the records
+// outlived their pages, the live counters stayed inflated, and `mi_prof_stop` wrote
+// `metadata`/`has_metadata` into pages already returned to the arena or the OS.
+//
+// The teardown counts as a free: live counters and the stacks' current counts drop, cumulative
+// (accum) ones do not move. Nothing is allocated (CLAUDE.md rule 4); records go back on
+// `prof_free`. The walk is O(live records), like the `prof_all` unlink of every sampled free.
+static void prof_forget_heap(mi_heap_t* heap) {
+  mi_prof_record_t** cur = &prof_all;
+  while (*cur != NULL) {
+    mi_prof_record_t* const rec = *cur;
+    mi_page_t* const page = rec->page;
+    if (mi_page_heap(page) != heap) { cur = &rec->all_next; continue; }
+    *cur = rec->all_next;
+    // A page belongs to one heap, so this walk takes every record on its chain.
+    page->metadata = NULL; page->has_metadata = false;
+    mi_atomic_decrement_relaxed(&prof_records); mi_atomic_sub_relaxed(&prof_bytes, rec->size);
+    _mi_prof_stack_free(rec->stack, rec->size);
+    _mi_prof_stack_release(rec->stack);
+    rec->next = prof_free; prof_free = rec;
+  }
+}
+// Always takes the lock, never an unlocked "no records" test first: a racing `mi_prof_stop`
+// writes into these same pages under `prof_lock`, and only acquiring it orders those writes
+// before the pages are freed. A heap teardown is not a hot path. `prof_lock` is innermost, so
+// taking it with `subproc->heaps_lock` held (mi_subproc_destroy) respects the lock order. A
+// destroy from inside a `mi_prof_visit` callback already owns the lock (see `_mi_prof_on_free`);
+// the visit pinned every stack entry, so `_mi_prof_stack_release` moves none of them.
+void _mi_prof_forget_heap(mi_heap_t* heap) {
+  if (heap == NULL) return;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_forget_heap(heap); return; }
+  mi_lock_acquire(&prof_lock); prof_forget_heap(heap); mi_lock_release(&prof_lock);
+}
+
 #else
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { MI_UNUSED(sample_rate); return false; }
 bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept { MI_UNUSED(sample_rate); MI_UNUSED(seed); return false; }
@@ -30456,6 +30501,7 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
 void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { MI_UNUSED(snap); }
 void _mi_prof_process_init(void) { }
 void _mi_prof_process_done(void) { }
+void _mi_prof_forget_heap(mi_heap_t* heap) { MI_UNUSED(heap); }  // #550: no records to forget
 // #270: no `prof_lock` exists when MI_PPROF is off -- nothing to quiesce.
 void _mi_prof_fork_prepare(void) { }
 void _mi_prof_fork_parent(void)  { }
