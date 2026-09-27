@@ -52,16 +52,13 @@ directly through `_mi_getenv`:
 
 | variable | read by | effect |
 |---|---|---|
-| `MIMALLOC_DHAT` | `dhat_resolve_env` (once) | intended: start at process init when set, non-empty and not starting with `0`. **See the defect below.** |
+| `MIMALLOC_DHAT` | `dhat_resolve_env` (once) | starts at process init when set, non-empty and not starting with `0` |
 | `MIMALLOC_DHAT_DUMP_AT_EXIT` | `dhat_resolve_env`, or the first `mi_dhat_start`, once | path (1024-byte buffer) that `_mi_dhat_process_done` dumps to at exit |
 | `MIMALLOC_DHAT_MAX_BYTES` | every fresh session (`dhat_resolve_env`, `mi_dhat_start`) | decimal budget in bytes; `0` means unlimited; an unparsable value keeps 64 MiB |
 
-> **Known defect: `MIMALLOC_DHAT` cannot enable DHAT.** `dhat_resolve_env` reads it into a
-> `char value[8]`. `_mi_getenv` (`src/libc.c`) returns `ENOENT` for any buffer smaller than
-> 64 bytes, so `env_enabled` is always false. A scratch `MI_DHAT=1` build confirmed this:
-> `MIMALLOC_DHAT=1` leaves `mi_dhat_is_enabled()` false, while `MIMALLOC_DHAT_MAX_BYTES`
-> (read into `char buf[64]`) works. Until the buffer is widened, start DHAT with
-> `mi_dhat_start` / `dhat::start()`. `MIMALLOC_DHAT_DUMP_AT_EXIT` is unaffected.
+Before #549, `dhat_resolve_env` passed an eight-byte buffer to `_mi_getenv`, which requires
+at least 64 bytes. Those builds ignored `MIMALLOC_DHAT`; #549 widened the buffer and added
+`test-dhat-env-enabled`. `MIMALLOC_DHAT_DUMP_AT_EXIT` was unaffected.
 
 **What compiles away with `MI_DHAT=0`.** The `#else` block at the end of `src/dhat.c` keeps
 the public API (all `false` / no-op), `_mi_dhat_is_active`, and the entry points upstream
@@ -446,7 +443,8 @@ stalling every allocating thread. Use it for short runs.
 |---|---|---|
 | `test-dhat` (`test/test-dhat.c`) | only `if(MI_DHAT)` | an empty dump right after start; exact totals and live counts over malloc, realloc and free, and a lower bound on peak bytes; no callback leaks during a dump while active; the over-aligned path reports caller sizes (16 and 12); after stop, the JSON has `dhatFileVersion`, `bklt`, `bkacc`, `pps` and `ftbl`. The frame table over 32 recursion-depth stacks (#551): every `fs` index is below `len(ftbl)`, `ftbl` has no duplicates, indices appear in first-occurrence order, and each depth's program point maps to its call site's return address wherever the capture saw it (at least one site must be checked where the capture walks every frame). A budget sweep asserts `total_blocks + dropped == 1000` for every budget. With `MI_MEMEVT` it also checks that the callback table saw 2/1/1 events; without, that the memory-events API is stubbed. With `MI_MEMEVT` on POSIX, three fork scenarios require the child's `mi_dhat_stop` to return and its `mi_dhat_start` to succeed: a thread parked in its armed event, the same plus a thread draining `mi_dhat_stop`, and a fork from the thread's own callback |
 | `test-dhat-one-bucket` (the same source, `DHAT_TEST_ONE_BUCKET=1` for its own dump file names) | `if(MI_DHAT)`, with `MI_BUILD_STATIC` and not `MI_DEBUG_TSAN` | the same assertions against a collector compiled from `src/static.c` with `-DDHAT_BUCKETS=1 -DDHAT_FRAME_MAP_MIN_SLOTS=2`. Every program point shares one chain, so the #551 frame-table case fails deterministically instead of by chance, and every dump grows and rehashes its frame map |
-| `test-fork-locks-dhat-env` | `NOT WIN32` and `MI_DHAT`, with env `MIMALLOC_DHAT=1` | because of the §2 defect this variant arms nothing and behaves like `test-fork-locks`; DHAT is exercised only by `check_dump_in_child`, which calls `mi_dhat_start` after the fork loop (in every variant) and requires `mi_dhat_dump` to succeed in the child |
+| `test-dhat-env-enabled` | only `if(MI_DHAT)`, with env `MIMALLOC_DHAT=1` | process initialization enables DHAT and records an allocation without calling `mi_dhat_start` (#549) |
+| `test-fork-locks-dhat-env` | `NOT WIN32` and `MI_DHAT`, with env `MIMALLOC_DHAT=1` | DHAT is active before the fork loop; `check_dump_in_child` requires `mi_dhat_dump` to succeed in the child |
 | `test-memory-events` T12 | with `MI_MEMEVT` | a brand-new thread's first allocation with memory-events, the profiler and DHAT all active must not deadlock |
 | `test-observer-scaling` | always, `RUN_SERIAL` | the 4-thread / 1-thread aggregate throughput ratio stays ≥ 1.20 (`MIN_SPEEDUP`); it skips below 4 hardware threads, under `MI_OWNER_GATE`, at guarded sample rate 1, and below 1 Mops/s single-threaded. This is #371's behavioural gate against a serializing observer prologue |
 | Rust `dhat_controls_report_lifecycle` / `dhat_compiled_out_is_inert` (`lib.rs`), `feature_contract.rs`, `t19_layout.rs::dhat_struct_matches_c` | per feature | start/stop/stats with the feature; stubs without it; `mi_dhat_stats_t` layout against `rust/mimalloc-pprof/layout_probe.c` |
@@ -475,6 +473,6 @@ byte-identical to upstream; `ci/check_no_diagnostic_suppression.py` compiles a
 | `include/mimalloc/internal.h` | `_mi_observers_armed`, the `MI_OBSERVERS_DHAT_*` bits, `_mi_memevt_on_*` wrappers, `_mi_dhat_*` declarations |
 | `src/memory-events.c` | the four `_slow` bodies that bracket DHAT (`_mi_memevt_on_alloc_slow` and siblings) |
 | `include/mimalloc/hooks-tld.h`, `include/mimalloc/types.h` | `_mi_hooks_tld_peek`, `_mi_hooks_tld_peek_or_local`, `mi_hooks_tld_t` |
-| `src/heap.c`, `src/init.c`, `src/fork.c`, `src/libc.c` | `_mi_heap_force_destroy`; `mi_process_init_once` / `mi_process_done_once`; the lock-order block and `_mi_process_fork_prepare`; `_mi_getenv` and its 64-byte minimum (the `MIMALLOC_DHAT` defect) |
+| `src/heap.c`, `src/init.c`, `src/fork.c`, `src/libc.c` | `_mi_heap_force_destroy`; `mi_process_init_once` / `mi_process_done_once`; the lock-order block and `_mi_process_fork_prepare`; `_mi_getenv` and its 64-byte minimum |
 | `rust/mimalloc-pprof/src/lib.rs`, `rust/mimalloc-pprof/build.rs`, `rust/mimalloc-pprof/Cargo.toml` | `pub mod dhat`, the `MI_DHAT` define, the `dhat` feature |
 | `test/test-dhat.c`, `CMakeLists.txt` | the focused test and its `if(MI_DHAT)` registration |

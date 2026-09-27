@@ -67,13 +67,10 @@ Three variables have no option behind them and are read with `_mi_getenv`:
 `MIMALLOC_PROF_SAMPLE_INTERVAL` (plain decimal, `prof_env_get_size`; takes precedence over
 the `_RATE` alias), `MIMALLOC_PROF_DUMP_AT_EXIT`, and `MIMALLOC_PROF_DUMP_FORMAT`.
 
-> **Known defect: `MIMALLOC_PROF_DUMP_FORMAT` is ignored.** Both of its readers
-> (`prof_auto_start` and `mi_prof_start_ex`) pass a 32-byte `fmt_buf`, and `_mi_getenv`
-> (`src/libc.c`) rejects any buffer under 64 bytes with `ENOENT`. So `=proto` still yields a
-> text exit dump. Worse, when the variable is set, a FALLBACK-mode `mi_prof_start_ex` sees it
-> through `prof_env_present` (a 64-byte buffer) and drops its own `dump_format` too. The only
-> way to get a proto exit dump is `dump_format = MI_PROF_FORMAT_PROTO` in an OVERRIDE config,
-> or in FALLBACK with the variable unset. No test sets the variable.
+Before #549, both dump-format readers passed 32-byte buffers to `_mi_getenv`, which
+requires at least 64 bytes, so they ignored `MIMALLOC_PROF_DUMP_FORMAT`. The FALLBACK-mode
+presence probe also missed long `MIMALLOC_PROF_DUMP_AT_EXIT` paths. #549 widened these
+buffers and added exit-dump tests for both format readers and a long path.
 
 **What `MI_PPROF=0` removes.** Every hook call site (each inside `#if MI_PPROF`) except the
 three in `src/fork.c`, which call the empty `_mi_prof_fork_*` stubs unconditionally. It also
@@ -99,7 +96,7 @@ no-op).
 |---|---|---|---|
 | `mi_prof_start`, `mi_prof_start_seeded` | `false` if already running. A 0 rate resolves through the env/option chain (§4.3); bumps `prof_generation`; walks every theap (§4.2) | `prof_lock` for the flip, the walk outside it | `prof::start`, `prof::start_seeded`, `enable_heap_profiling` |
 | `mi_prof_start_ex` | NULL means `mi_prof_start(0)`; `false` on a `size`/`version` mismatch. Applies `accum`/`max_stack_depth`/`max_profiler_bytes` (via `mi_option_set`, so they persist after stop) and the exit-dump path/format **before** calling `mi_prof_start_seeded`, so they take effect even when it returns `false` because the profiler is already running | as above | `enable_heap_profiling_with` |
-| `mi_prof_stop` | Clears `prof_enabled`, writes `metadata`/`has_metadata` of each record's page (see §6 for the `mi_heap_destroy` defect), frees every arena chunk, zeroes counters, then clears `prof_force_slow` everywhere | `prof_lock`, then the walk | `prof::stop` |
+| `mi_prof_stop` | Clears `prof_enabled`, writes `metadata`/`has_metadata` of each remaining record's page, frees every arena chunk, zeroes counters, then clears `prof_force_slow` everywhere | `prof_lock`, then the walk | `prof::stop` |
 | `mi_prof_reset` | Zeroes accum counters, sweeps refcount-0 stacks; live records untouched | `prof_lock` | `prof::reset` |
 | `mi_prof_dump_writer`, `mi_prof_dump` | Text `heap_v2`. Fully buffered first; `write` runs only if everything succeeded, after `prof_lock` is released | `prof_lock` for the stack walk | `prof::dump_to_vec`, `prof::dump_file` |
 | `mi_prof_dump_proto_writer`, `mi_prof_dump_proto` | Uncompressed `profile.proto`, built from a snapshot | only inside `mi_prof_snapshot_new` | `prof::dump_proto_to_vec`, `prof::dump_proto_file` |
@@ -308,8 +305,8 @@ the total PC count. With accum off, `alloc_*` comes out as 0.
 from `_mi_prof_process_init` and also from the first `_mi_prof_on_alloc`. The second call is a
 fallback for statically linked MinGW programs that lose the CRT/TLS startup callback. It
 starts the profiler when `mi_option_prof` is set and caches `MIMALLOC_PROF_DUMP_AT_EXIT`. Its
-read of `MIMALLOC_PROF_DUMP_FORMAT` always fails, which is the known defect in §2, so from the
-environment alone the exit dump `_mi_prof_process_done` writes is always text. Under
+read of `MIMALLOC_PROF_DUMP_FORMAT` selects the exit format, so the environment can request
+a proto dump. Under
 `MI_NO_PROCESS_DETACH`, `_mi_auto_process_done` returns early, so no exit dump is written.
 `mi_prof_start_ex` resolves each field against its variable (`prof_env_present`): FALLBACK
 lets the environment win, `MI_PROF_CONFIG_OVERRIDE` lets non-zero fields win (see the
@@ -367,19 +364,17 @@ The child policy is CONTINUE: records are plain copy-on-write process memory.
 
 ## 6. Known defects, edge cases and accepted limits
 
-- **Known defect: use-after-free after `mi_heap_destroy` with live sampled blocks.**
-  `_mi_heap_force_destroy` calls `_mi_dhat_forget_heap` but has no profiler counterpart.
-  The destroyed pages go to the arena with their records still attached (the debug build
-  trips `mi_arenas_page_free_ex`'s assertion). In a release build the orphaned records stay
-  in `live_samples`/`live_bytes` and the stacks' `curobjs` until stop, and the next
-  `mi_prof_stop` writes `rec->page->metadata`/`has_metadata` into the freed page. That is a
-  use-after-free, and it faults if the memory was decommitted or released. No test covers it.
+- **Heap destroy (#550).** `_mi_heap_force_destroy` calls `_mi_prof_forget_heap` before it
+  releases a heap's pages. The profiler removes their sample records and live counts under
+  `prof_lock`; cumulative counts stay unchanged. `mi_heap_delete` moves pages instead and
+  keeps their records. `test-profile-heap-destroy` and its accum variant cover both paths,
+  plus sub-process teardown and a destroy inside `mi_prof_visit`.
 - **Known defect: `accum_bytes` omits in-place growth.** `prof_realloc_in_place` →
   `_mi_prof_stack_resize` adds the growth to the stack's `accumbytes`, but `prof_accum_bytes`
   is never adjusted. So `mi_prof_stats_t.accum_bytes` disagrees with the text header's
   totals, which are summed from the stacks, even when the heap is quiescent. `test-profile`
   only checks an in-place shrink, and only its live bytes.
-- **Known defect: `MIMALLOC_PROF_DUMP_FORMAT` is ignored** (§2).
+- **Environment dump format.** Builds before #549 ignored `MIMALLOC_PROF_DUMP_FORMAT` (§2).
 - **Frame pointers (non-Apple Unix).** The walk trusts frame pointers, with sanity bounds
   but no readability probe. CMake always compiles with `-fno-omit-frame-pointer`.
   `build.rs` adds nothing, and cc-rs adds the flag only when debuginfo is on (the default
@@ -411,11 +406,13 @@ The child policy is CONTINUE: records are plain copy-on-write process memory.
 | `test-profile` | `test/test-profile.c` | Sample-count bounds at a fixed seed, the `@ heap_v2/<rate>` header, zero records after free, in-place realloc accounting. Then: T10 visitor reentrancy (a dump inside a visitor fails; a snapshot survives stop); T12 proto parse (scaled `inuse` between 1× and 2× raw, a mapping naming the test binary, the comment string); T14/T15 module visit and the macOS PAC check; T15a–e `mi_prof_start_ex` precedence and budget; T16 drops and stats v1/v2/v3; T17 aligned; T18 empty profile; start/stop cycles (generation); page reuse after stop; rate 1; cross-thread free; meta pages never sampled; #267 start/stop/restart/reset under allocating workers |
 | `test-profile-accum` | same binary, `MIMALLOC_PROF_ACCUM=1` | the accum branches: stacks kept until reset |
 | `test-profile-auto` | same binary, `MIMALLOC_PROF=1` | auto-start on the first allocation |
+| `test-profile-env-dump-format`, `test-profile-start-ex-dump-format`, `test-profile-start-ex-long-env-path` | `test/test-profile.c` | #549: the automatic exit dump honors `MIMALLOC_PROF_DUMP_FORMAT=proto`, both format readers work, and a long environment path wins in FALLBACK mode; registered only when `MI_NO_PROCESS_DETACH` is off |
+| `test-profile-heap-destroy`, `test-profile-heap-destroy-accum` | `test/test-profile-heap-destroy.c` | #550: heap destroy and sub-process destroy remove live sample records, heap delete preserves them until free, callback teardown avoids a lock recursion; the accum variant retains cumulative counts. The sub-process case requires the worker to join that sub-process; a Windows worker already initialized elsewhere skips that case |
 | `test-profile-race`, `test-profile-race-scavenger` | `test/test-profile-race.c` | bootstrap race, cross-thread free, snapshot under mutation, visit against the scavenger, hole sweep against visits (with a negative control for `_mi_prof_debug_records_in`). The second variant adds `MIMALLOC_PURGE_DELAY=1;MIMALLOC_SCAVENGER=1`. Both are `RUN_SERIAL` |
 | `test-prof-seed-determinism` | `test/test-prof-seed-determinism.c` | two child processes with the same seed report equal, non-zero sample counts (#91) |
 | `test-fork-locks-prof-env`, `test-fork-locks-spawn-prof-env` | `test/test-fork-locks.c` with `MIMALLOC_PROF=1` | the #270 lock-order reproducer |
 
-The first five targets are registered only with `MI_PPROF=ON`. The two fork-locks variants
+The dedicated profiler targets are registered only with `MI_PPROF=ON`. The two fork-locks variants
 sit under `if(NOT WIN32)` alone: they are never registered on Windows, and they are also
 registered in OFF builds, where `MIMALLOC_PROF=1` does nothing. To run them, use
 `uv run ci/dev_linux.py c-test` (which configures `-DMI_PPROF=ON`) or `ctest -R prof` in a
@@ -437,7 +434,8 @@ The CI gates ([CI gates](ci-gates.md)):
 | File / symbol | What |
 |---|---|
 | `src/profile.c` `_mi_prof_on_alloc`, `prof_random`, `prof_threshold`, `_mi_prof_arena_alloc` | sampling decision, recording, arena |
-| `src/profile.c` `prof_free_record`, `_mi_prof_on_free`, `_mi_prof_on_free_collect` | free path |
+| `src/profile.c` `prof_free_record`, `_mi_prof_on_free`, `_mi_prof_on_free_collect`, `_mi_prof_forget_heap` | free path and heap teardown |
+| `src/heap.c` `_mi_heap_force_destroy` | forgets live samples before releasing pages |
 | `src/profile.c` `mi_prof_start_seeded`, `mi_prof_start_ex`, `mi_prof_stop`, `mi_prof_dump_writer`, `mi_prof_dump_proto_writer` | lifecycle and the two formats |
 | `src/profile.c` `_mi_prof_debug_records_in`; the `#else` block | debug check; OFF-build stub template |
 | `src/profile-stack.c` `_mi_prof_stack_capture`, `_mi_prof_stack_intern` | capture and intern table |
