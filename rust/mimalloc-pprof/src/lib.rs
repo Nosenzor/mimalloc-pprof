@@ -217,8 +217,10 @@ pub unsafe fn usable_size(p: *const u8) -> usize {
 /// shape (`{"heaps":[{"seq":N,"pages":[{"id","block_size","used","reserved","thread_id"}],
 /// "blocks":[[id,size],...]}]}`, `blocks` present only when `include_blocks`).
 ///
-/// Set `hash_addresses` to mix every reported address through a per-process key so a
-/// dump can be shared or diffed without exposing raw ASLR-derived pointers.
+/// Set `hash_addresses` to mix every reported address through a key drawn afresh for each
+/// call, so a dump can be shared without exposing raw ASLR-derived pointers. Because the
+/// key changes per call, two hashed dumps cannot be diffed by address. `thread_id` is not
+/// hashed (on most platforms it is derived from a thread-local address).
 ///
 /// Safe, best-effort capture under concurrent frees (#374), using
 /// [`HEAP_DUMP_JSON_DEFAULT_WAIT_MS`] as the owner-acquisition deadline. See
@@ -281,7 +283,9 @@ pub const HEAP_DUMP_JSON_DEFAULT_WAIT_MS: usize = 100;
 /// (version 1). Read it with `mi-heapview` (built with the C library) or the Python
 /// reference reader in `examples/heap-snapshot/`. Point-in-time and best-effort: other
 /// threads keep allocating while it is written, so their pages' counts may be slightly
-/// stale. Allocation-free on the writer's side, so it is safe to call from anywhere.
+/// stale. The C writer allocates nothing, but this wrapper allocates a `CString` for the
+/// path, and the writer takes `heaps_lock` and each heap's `os_abandoned_pages_lock`: do
+/// not call it from code that may run under those locks (such as an allocator callback).
 ///
 /// Requires the `diagnostics` feature (#414): without it the writer is compiled out of the
 /// C library and this always returns `Err`.
@@ -322,7 +326,8 @@ pub fn heap_snapshot_to_file(
 ///
 /// Safe on any thread; a no-op on a thread that never allocated. Call it when the thread
 /// has nothing to do (an event loop about to block, a worker pool waiting on its queue),
-/// not on a hot path: it costs a few `madvise`/`DiscardVirtualMemory` calls.
+/// not on a hot path: it costs a few `madvise` calls (`MEM_RESET` + `VirtualUnlock` on
+/// Windows).
 pub fn on_thread_idle() {
     unsafe { sys::mi_on_thread_idle() }
 }
@@ -364,10 +369,12 @@ impl Drop for IdlePark {
 
 /// Stop the background scavenger thread (issue #272).
 ///
-/// It restarts on demand (the next [`park_while_idle`], or the next thread that
-/// initializes), so this is a way to quiesce it -- e.g. before a `fork`/`exec` that counts
-/// threads, or in a test -- not a way to disable it permanently. For that, set the
-/// `scavenger` option to 0 (`MIMALLOC_SCAVENGER=0`) before the first allocation.
+/// Permanent for the life of the process: no later [`park_while_idle`] or new thread
+/// starts it again (only a `fork()`ed child starts afresh). Afterwards
+/// [`park_while_idle`] hands nothing off, [`on_thread_idle`] still does its work on the
+/// calling thread, and a due arena purge runs inline on allocating threads, as upstream
+/// does. To never start it at all, set the `scavenger` option to 0
+/// (`MIMALLOC_SCAVENGER=0`) before the first allocation.
 pub fn scavenger_stop() {
     unsafe { sys::mi_scavenger_stop() }
 }
@@ -382,8 +389,9 @@ pub fn scavenger_stop() {
 /// no heap owns.
 ///
 /// Most fields are monotonic. `purged_bytes`, `purged_blocks` and `unformed_bytes` are
-/// gauges ("right now"), and the three `ineligible_*` fields are a gauge over the LAST sweep
-/// only. Everything is zero when the `purge_holes` option is off (`MIMALLOC_PURGE_HOLES=0`).
+/// gauges ("right now"), and the three `ineligible_*` fields are a process-wide gauge: any
+/// thread's hole sweep zeroes them when it starts, and whatever is swept after that adds to
+/// them. Everything is zero when the `purge_holes` option is off (`MIMALLOC_PURGE_HOLES=0`).
 ///
 /// ```
 /// # use mimalloc_pprof as mi;
@@ -510,9 +518,11 @@ impl PurgeStatus {
 /// could not reach (issue #366). Mirrors `mi_purge_all_report_t`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PurgeAllReport {
-    /// Bytes returned to the OS by the arena passes.
+    /// Bytes returned to the OS by the arena passes (plus the sweeps' unformed-tail
+    /// discards).
     pub arena_bytes: usize,
-    /// Bytes returned by hole purging (every swept thread plus abandoned pages).
+    /// Free-block bytes returned by hole purging (every swept thread plus abandoned
+    /// pages); the unformed-tail discards count in `arena_bytes` instead.
     pub hole_bytes: usize,
     /// Threads claimed and swept by this call, the caller included.
     pub theaps_swept: usize,
@@ -576,7 +586,7 @@ impl From<sys::mi_purge_all_report_t> for PurgeAllReport {
 ///
 /// `wait_ms` bounds **owner-acquisition waiting only** -- how long this call keeps trying
 /// to claim other threads' state. It does not bound a claimed thread's sweep, nor the
-/// `madvise`/`DiscardVirtualMemory` syscalls that sweep makes, so the call can take longer
+/// `madvise` (Windows: `MEM_RESET`) syscalls that sweep makes, so the call can take longer
 /// than `wait_ms` once it has something to purge.
 ///
 /// With [`PurgeFlags::RECLAIM`] the same call also gives back completely free
@@ -612,7 +622,8 @@ pub fn purge_all_ex(flags: PurgeFlags, wait_ms: usize) -> (PurgeStatus, PurgeAll
 /// [`PurgeFlags::RECLAIM`] to give the completely free ones back.
 ///
 /// `force` ignores the `purge_delay` / hole-purge pacing options and lets each claimed
-/// sweep run to completion. See [`purge_all_ex`] for what the wait bounds (owner
+/// thread's hole walk run to completion (its collect and abandoned-page pass still stop
+/// when the owner asks for its heaps back). See [`purge_all_ex`] for what the wait bounds (owner
 /// acquisition only, never a sweep or its syscalls) and why a partial result -- some
 /// threads pending -- is the normal outcome in a build without the `owner-gate` feature.
 /// The status is [`PurgeAllReport::complete`]; a busy (nothing-done) call reports zero
@@ -672,7 +683,14 @@ pub mod dhat {
     }
 
     /// Start exact allocation/lifetime tracking. Returns `false` if it is already active,
-    /// or if the crate was built without the `dhat` feature.
+    /// or if the crate was built without the `dhat` feature. It can also return `false`
+    /// transiently, without retrying: while a [`stop`] is draining, while another thread
+    /// is inside an observer hook's slow path (it briefly counts as an in-flight event even
+    /// with DHAT off; with memory-events tracking on, every allocation and free takes that
+    /// path), or when called from inside an observed event on this thread.
+    ///
+    /// Known issue: `MIMALLOC_DHAT=1` does not start DHAT at process init today (the C
+    /// side reads it into a buffer below `_mi_getenv`'s minimum); call this instead.
     pub fn start() -> bool {
         unsafe { sys::mi_dhat_start() }
     }
@@ -748,8 +766,8 @@ pub mod dhat {
 /// as well, set `MIMALLOC_PROF=1` in the environment instead.
 ///
 /// Returns `false` if profiling was already enabled (the earlier session,
-/// and its sample rate, stay active), or if the crate was built with
-/// `default-features = false`.
+/// and its sample rate, stay active), or if the crate was built without the
+/// `pprof` feature (the default feature set is empty since #414).
 pub fn enable_heap_profiling() -> bool {
     prof::start(0)
 }
@@ -813,7 +831,9 @@ pub struct ProfConfig {
     /// (sample records, the stack intern table, interned stack entries).
     /// `None` = unbudgeted (cap-bounded only).
     pub max_profiler_bytes: Option<usize>,
-    /// `None` = nondeterministic.
+    /// `None` or `Some(0)` = the `prof_seed` option (`MIMALLOC_PROF_SEED`, default 0).
+    /// Every seed, the option's 0 included, gives each thread the same sampling stream
+    /// from run to run.
     pub seed: Option<u64>,
     pub accum: bool,
     /// `None` = default (32); compile cap 128.
@@ -833,7 +853,7 @@ pub struct ProfConfig {
 /// `include/mimalloc/profile.h`.
 ///
 /// Returns `false` if profiling was already enabled (the earlier session
-/// stays active), if the crate was built with `default-features = false`, or
+/// stays active), if the crate was built without the `pprof` feature, or
 /// if `config.dump_at_exit` is set but is not
 /// representable as a NUL-free C string (non-UTF-8 or an embedded NUL byte)
 /// -- in that case `mi_prof_start_ex` is never called.
@@ -1230,8 +1250,9 @@ pub fn purge_holes_report() {
 ///
 /// Options are read once, lazily, the first time the allocator needs them, so setting one
 /// after the allocation it governs has already happened has no effect. In particular
-/// [`Opt::SCAVENGER`] and the profiler options must be set before the first allocation to
-/// matter; [`Opt::PURGE_HOLES`] and its companions are re-read per sweep and can be
+/// [`Opt::SCAVENGER`](options::Opt::SCAVENGER) and the profiler options must be set before
+/// the first allocation to matter; [`Opt::PURGE_HOLES`](options::Opt::PURGE_HOLES) and its
+/// companions are re-read per sweep and can be
 /// changed at any time.
 ///
 /// ```
@@ -1264,7 +1285,8 @@ pub mod options {
         pub const PROF_BT_MAX: Self = Self(sys::mi_option_prof_bt_max);
         /// **Fork addition.** Keep cumulative profiler counters until [`crate::prof::reset`].
         pub const PROF_ACCUM: Self = Self(sys::mi_option_prof_accum);
-        /// **Fork addition.** Profiler sampling PRNG seed; 0 = nondeterministic.
+        /// **Fork addition.** Profiler sampling PRNG seed (default 0; every seed, 0
+        /// included, is deterministic per thread).
         pub const PROF_SEED: Self = Self(sys::mi_option_prof_seed);
         /// **Fork addition.** Budget in bytes for profiler-internal arena memory.
         pub const PROF_MAX_BYTES: Self = Self(sys::mi_option_prof_max_bytes);
@@ -1577,8 +1599,10 @@ pub mod stats {
 /// implies). Without it the per-allocation hook sites are compiled out -- they were
 /// measured at 9-13 instructions per malloc/free pair, 18-26% of the pair, even with
 /// tracking disabled -- and every function here links but reports the subsystem off
-/// ([`set_enabled`] returns `false`, [`snapshot`] returns `None`). With the feature on,
-/// tracking is still **off** until [`set_enabled`] or `MIMALLOC_MEMORY_EVENTS=1`.
+/// ([`set_enabled`](memory_events::set_enabled) returns `false`,
+/// [`snapshot`](memory_events::snapshot) returns `None`). With the feature on, tracking is
+/// still **off** until [`set_enabled`](memory_events::set_enabled) or
+/// `MIMALLOC_MEMORY_EVENTS=1`.
 ///
 /// ```
 /// use mimalloc_pprof::{memory_events, MiMalloc};
@@ -1667,7 +1691,9 @@ pub mod memory_events {
         pub accum_count: u64,
     }
 
-    /// Enable or disable tracking; returns the previous state.
+    /// Enable or disable tracking. Returns `true` when memory-events is compiled in
+    /// (the `memory-events` feature) and `false` otherwise -- not the previous state;
+    /// read [`is_enabled`] first if you need to restore it.
     ///
     /// An explicit call is always authoritative over the `MIMALLOC_MEMORY_EVENTS`
     /// environment read: called before the first allocation it *replaces* that read;
@@ -1802,9 +1828,12 @@ pub mod memory_events {
     /// Walk the live allocations this thread may safely observe, calling `visitor` with
     /// each one's address and usable size. Return `false` from `visitor` to stop early.
     ///
-    /// Diagnostics only. This is **not** a consistent global snapshot: it is built on
-    /// `mi_heap_visit_blocks`, so another thread may free a reported allocation the
-    /// instant the callback begins.
+    /// Diagnostics only. This is **not** a consistent global snapshot: it walks the page
+    /// queues of every theap of the calling thread (not `mi_heap_visit_blocks`). It reports
+    /// whatever those pages hold, which can include blocks another thread allocated on a
+    /// page this thread reclaimed, and it misses this thread's own blocks on pages it has
+    /// abandoned (full pages are abandoned by default). Another thread may free a reported
+    /// allocation the instant the callback begins.
     ///
     /// # Safety
     ///
@@ -1820,8 +1849,8 @@ pub mod memory_events {
     ///   Report failures by setting a flag the caller reads after the walk returns.
     /// - The pointers handed to `visitor` must not be dereferenced, retained, or freed:
     ///   they may already be dead. Treat them as addresses, not as references.
-    /// - No other thread may be freeing into the heaps being walked (the
-    ///   `mi_heap_visit_blocks` precondition; see `include/mimalloc.h`).
+    /// - No other thread may be freeing into the pages being walked (the same
+    ///   precondition `mi_heap_visit_blocks` documents in `include/mimalloc.h`).
     pub unsafe fn visit_live_allocations<F>(mut visitor: F) -> bool
     where
         F: FnMut(*mut u8, usize) -> bool,

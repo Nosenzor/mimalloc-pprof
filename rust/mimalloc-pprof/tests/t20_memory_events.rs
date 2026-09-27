@@ -1,7 +1,8 @@
 //! Opt-in allocation-change accounting (`include/mimalloc/memory-events.h`).
 //!
-//! Independent of `MI_PPROF`: `src/memory-events.c` is compiled in every configuration,
-//! so this file carries no `required-features` and runs on both `rust-native` rows.
+//! Independent of `MI_PPROF`. Since #414 memory-events is compiled in only with the
+//! `memory-events` feature, so `Cargo.toml` gives this file
+//! `required-features = ["memory-events"]`.
 //!
 //! Everything here is one `#[test]`, run in sections, and that is not laziness. Tracking,
 //! the callback table and the running totals are all **process**-global, and cargo runs

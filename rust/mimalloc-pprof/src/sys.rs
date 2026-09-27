@@ -164,7 +164,8 @@ pub struct MiPurgeHolesStats {
 #[allow(non_camel_case_types)]
 pub type mi_purge_flags_t = c_int;
 /// `MI_PURGE_FORCE` (`mi_purge_flags_t`, issue #366): ignore `purge_delay` / hole-purge
-/// pacing, and let a claimed sweep run to completion (ignoring `park_reclaim`).
+/// pacing; a claimed thread's hole walk and phase checks ignore `park_reclaim` (its collect
+/// and abandoned-page pass still stop at the owner's reclaim).
 pub const MI_PURGE_FORCE: mi_purge_flags_t = 1;
 /// `MI_PURGE_RECLAIM` (`mi_purge_flags_t`): after the walk, give back every
 /// arena of every sub-process that is COMPLETELY free -- its metadata included (phase F
@@ -190,9 +191,9 @@ pub const MI_PURGE_BUSY: c_int = 2;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub struct mi_purge_all_report_t {
-    /// Bytes returned to the OS by the arena passes.
+    /// Bytes returned to the OS by the arena passes (plus the sweeps' unformed-tail discards).
     pub arena_bytes: usize,
-    /// Bytes returned by hole purging (every swept theap + abandoned pages).
+    /// Free-block bytes returned by hole purging (every swept theap + abandoned pages).
     pub hole_bytes: usize,
     /// tlds claimed and swept by this call (the caller included).
     pub theaps_swept: usize,
@@ -586,7 +587,8 @@ mi_options! {
     mi_option_prof_bt_max = 49;
     /// **Fork addition.** Keep cumulative profiler counters until `mi_prof_reset`.
     mi_option_prof_accum = 50;
-    /// **Fork addition.** Profiler sampling PRNG seed; 0 = nondeterministic.
+    /// **Fork addition.** Profiler sampling PRNG seed (0 is an ordinary seed: sampling is
+    /// deterministic per thread for every value).
     mi_option_prof_seed = 51;
     /// **Fork addition.** Budget in bytes for profiler-internal arena memory.
     mi_option_prof_max_bytes = 52;
@@ -729,7 +731,8 @@ unsafe extern "C" {
     /// Live per-heap -> per-page -> (optional) per-block JSON snapshot (issue #269, Bun
     /// parity P4). Backs Bun's shipped `bun:jsc` `heapStats({dump:true|"blocks"})`. Returns
     /// NULL on allocation failure; a non-NULL result is `mi_malloc`-family memory the
-    /// caller must free with `mi_free` (see `prof::heap_dump_json` for the safe wrapper).
+    /// caller must free with `mi_free` (see `mimalloc_pprof::heap_dump_json` for the safe
+    /// wrapper).
     pub fn mi_heap_dump_json(include_blocks: bool, hash_addresses: bool) -> *mut c_char;
     /// Mirrors `mi_heap_dump_json_ex`: in owner-gated builds, retry an incomplete
     /// capture from a clean boundary for up to `wait_ms`.
@@ -746,7 +749,7 @@ unsafe extern "C" {
     /// binary heap snapshot (format version 1, byte-identical to oven-sh/mimalloc's) to a
     /// CRT file descriptor. `flags` is 0 or `MI_SNAPSHOT_BLOCKS`. Returns 0, or -1 on a write
     /// error. sys-only: on Windows the fd is a CRT descriptor, not a HANDLE -- use
-    /// `heap::snapshot_to_file` from safe code.
+    /// `mimalloc_pprof::heap_snapshot_to_file` from safe code.
     pub fn mi_heap_snapshot(fd: c_int, flags: c_uint) -> c_int;
     /// Mirrors `mi_heap_snapshot_to_file` (include/mimalloc.h; issue #338): open `path`
     /// (create/truncate), write the snapshot, close. Returns 0, or -1 on open/write error.
@@ -875,7 +878,8 @@ unsafe extern "C" {
     pub fn mi_subproc_current() -> mi_subproc_id_t;
 
     // ---- include/mimalloc/memory-events.h ----
-    /// Mirrors `mi_memory_tracking_set_enabled`; returns the previous state. An explicit
+    /// Mirrors `mi_memory_tracking_set_enabled`. Returns `true` when memory-events is
+    /// compiled in and `false` for the stub -- not the previous state. An explicit
     /// call is always authoritative over the `MIMALLOC_MEMORY_EVENTS` environment read.
     pub fn mi_memory_tracking_set_enabled(enabled: bool) -> bool;
     /// Mirrors `mi_memory_tracking_is_enabled`.
