@@ -201,6 +201,21 @@ fn default_latency_child_request_serialization_is_unchanged() {
             },
         },
     };
+    let mut oversubscribed = request.clone();
+    let trace = benchmark_suite::perf_ab_trace::workload(CardId::RandomLargeBursty, 8).unwrap();
+    oversubscribed.benchmark.scenario_id = CardId::RandomLargeBursty.as_str().into();
+    oversubscribed.benchmark.thread_point = "8".into();
+    oversubscribed.benchmark.physical_cores = 2;
+    oversubscribed.benchmark.logical_cores = 4;
+    oversubscribed.benchmark.runner.physical_cores = 2;
+    oversubscribed.benchmark.runner.logical_cores = 4;
+    oversubscribed.benchmark.transactions_per_worker = trace.operations_per_worker;
+    oversubscribed.benchmark.workload_seed =
+        benchmark_suite::perf_ab_trace::PERF_AB_STREAM_SEED_BASE;
+    oversubscribed.expected_trace_checksum =
+        Some(benchmark_suite::perf_ab_trace::trace_checksum(trace, 8));
+    oversubscribed.validate().unwrap();
+
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["protocol_version"], "transaction-latency-child-v1");
     assert!(value.get("expected_trace_checksum").is_none());
@@ -215,6 +230,15 @@ fn exact_128k_one_and_eight_worker_cells_are_opt_in() {
     assert_eq!(latency_scenario_cells(topology).unwrap().len(), 5);
     let diagnostic = latency_diagnostic_scenario_cells(topology).unwrap();
     assert_eq!(diagnostic.len(), 4);
+    assert_eq!(
+        latency_diagnostic_scenario_cells(Topology {
+            physical_cores: 2,
+            logical_cores: 4,
+        })
+        .unwrap()
+        .len(),
+        4
+    );
     assert_eq!(diagnostic[0].0, CardId::LargeObject128KiB);
     assert_eq!(diagnostic[0].1.name(), "1");
     assert_eq!(diagnostic[1].1.name(), "8");
@@ -295,6 +319,22 @@ fn exact_128k_one_and_eight_worker_cells_are_opt_in() {
         samples,
     };
     validate_latency_diagnostic_run(&run, 2).unwrap();
+
+    let mut oversubscribed = run.clone();
+    oversubscribed.host.physical_cores = 2;
+    oversubscribed.host.logical_cores = 4;
+    oversubscribed.host.affinity_logical_cpu_ids = (0..4).collect();
+    for row in &mut oversubscribed.samples {
+        for response in [&mut row.sample.measured, &mut row.sample.control] {
+            response.scheduling.physical_cores = 2;
+            response.scheduling.logical_cores = 4;
+        }
+    }
+    validate_latency_diagnostic_run(&oversubscribed, 2).unwrap();
+
+    let mut impossible_topology = oversubscribed;
+    impossible_topology.host.logical_cores = 0;
+    assert!(validate_latency_diagnostic_run(&impossible_topology, 2).is_err());
 
     let mut missing_pair = run.clone();
     missing_pair.samples.pop();

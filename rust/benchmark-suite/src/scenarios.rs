@@ -811,7 +811,18 @@ impl ScenarioCell {
                 point: thread_point,
             });
         }
-        let threads = topology.resolve(thread_point)?;
+        let threads = if matches!(
+            card_id,
+            CardId::LargeObject128KiB | CardId::RandomLargeBursty | CardId::LargeClassPersistent
+        ) && thread_point == ThreadPoint::Eight
+        {
+            // The opt-in perf-ab diagnostic replays eight workers even on a
+            // smaller runner. Keep the actual CPU topology in its provenance.
+            topology.validate()?;
+            8
+        } else {
+            topology.resolve(thread_point)?
+        };
         let total_transactions = transactions_per_worker
             .checked_mul(threads as u64)
             .ok_or(ScenarioError::CountOverflow)?;
