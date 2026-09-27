@@ -1171,16 +1171,16 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-profile-accum PROPERTIES ENVIRONMENT "MIMALLOC_PROF_ACCUM=1")
     add_test(NAME test-profile-auto COMMAND mimalloc-test-profile)
     set_tests_properties(test-profile-auto PROPERTIES ENVIRONMENT "MIMALLOC_PROF=1")
-    # #549: the exit-dump settings are read with _mi_getenv, which reports a too-small result
-    # buffer exactly like an unset variable. Each case runs the binary in a dedicated mode that
-    # reads back the file mi_process_done() writes (see the modes above main in test-profile.c).
-    add_test(NAME test-profile-env-dump-format COMMAND mimalloc-test-profile --env-dump-format-check)
-    set_tests_properties(test-profile-env-dump-format PROPERTIES ENVIRONMENT
-                         "MIMALLOC_PROF=1;MIMALLOC_PROF_DUMP_AT_EXIT=test-profile-env-dump-format.prof;MIMALLOC_PROF_DUMP_FORMAT=proto")
-    add_test(NAME test-profile-start-ex-dump-format COMMAND mimalloc-test-profile --start-ex-dump-format-check)
-    add_test(NAME test-profile-start-ex-long-env-path COMMAND mimalloc-test-profile --start-ex-long-env-path-check)
-    set_tests_properties(test-profile-start-ex-long-env-path PROPERTIES ENVIRONMENT
-                         "MIMALLOC_PROF_DUMP_AT_EXIT=test-profile-start-ex-long-env-path.a-path-longer-than-sixty-four-characters.prof")
+    # #549: MIMALLOC_PROF_DUMP_FORMAT and a long MIMALLOC_PROF_DUMP_AT_EXIT were silently ignored
+    # (_mi_getenv reads a value that does not fit its buffer as unset). Each case re-runs the
+    # binary as a child that sets the variables up and exits normally, then reads back the dump
+    # the child's exit wrote (see the modes above main in test-profile.c). That exit dump is
+    # exactly what MI_NO_PROCESS_DETACH skips, so the cases need it off.
+    if(NOT MI_NO_PROCESS_DETACH)
+      add_test(NAME test-profile-env-dump-format COMMAND mimalloc-test-profile --env-dump-format-check)
+      add_test(NAME test-profile-start-ex-dump-format COMMAND mimalloc-test-profile --start-ex-dump-format-check)
+      add_test(NAME test-profile-start-ex-long-env-path COMMAND mimalloc-test-profile --start-ex-long-env-path-check)
+    endif()
 
     # Adversarial concurrency coverage for the v3 engine (issue #43): thread
     # bootstrap race, cross-thread free, snapshot stability under mutation.
