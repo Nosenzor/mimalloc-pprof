@@ -44,10 +44,15 @@ fn core_throughput_v1_has_all_and_only_the_declared_cards_and_points() {
             ("representative-mix", vec!["1", "physical-core"]),
         ]
     );
-    assert_eq!(CardId::ALL.len(), 16);
-    assert!(!cards()
-        .iter()
-        .any(|definition| definition.id == CardId::LargeObject128KiB));
+    assert_eq!(cards().len(), 15);
+    assert_eq!(CardId::ALL.len(), 18); // 15 published cards plus three opt-in diagnostics.
+    for diagnostic in [
+        CardId::LargeObject128KiB,
+        CardId::RandomLargeBursty,
+        CardId::LargeClassPersistent,
+    ] {
+        assert!(!cards().iter().any(|definition| definition.id == diagnostic));
+    }
 }
 
 #[test]
