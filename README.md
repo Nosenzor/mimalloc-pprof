@@ -591,6 +591,10 @@ feature (`mimalloc-pprof = { version = "1", features = ["dhat"] }`) or CMake's
 MIMALLOC_DHAT=1 MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json ./my_app
 ```
 
+Builds that predate [#549](https://github.com/zackees/mimalloc-pprof/issues/549),
+including every release up to 1.0.0, ignore `MIMALLOC_DHAT`; call `mi_dhat_start()` /
+`dhat::start()` instead. `MIMALLOC_DHAT_DUMP_AT_EXIT` works in every build.
+
 Built with `MI_NO_PROCESS_DETACH` (issue #268)? The automatic exit path that
 `*_DUMP_AT_EXIT` relies on is skipped by design — call `mi_prof_dump` / `mi_dhat_dump`
 yourself before the process exits.
