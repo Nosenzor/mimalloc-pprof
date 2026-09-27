@@ -65,7 +65,7 @@
       "properties": {
         "metric_schema_version": { "const": "transaction-latency-v1" }, "block_id": { "type": "integer", "minimum": 0 }, "ordinal": { "type": "integer", "minimum": 0, "maximum": 3 }, "workload_seed": { "type": "integer", "minimum": 1 },
         "allocator_id": { "enum": ["tcmalloc", "jemalloc", "upstream-mimalloc", "bun-mimalloc", "mimalloc-pprof"] }, "allocator_source_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" }, "child_binary_sha256": { "$ref": "#/$defs/sha256" },
-        "scenario_id": { "enum": ["tiny-fixed-64", "small-log-mixed", "cross-thread-producer-consumer", "large-objects"] }, "thread_point": { "enum": ["1", "physical-core"] }, "thread_count": { "type": "integer", "minimum": 1 },
+        "scenario_id": { "enum": ["tiny-fixed-64", "small-log-mixed", "cross-thread-producer-consumer", "large-objects", "large-object-128k-diagnostic", "random-large-bursty-diagnostic", "large-class-diagnostic"] }, "thread_point": { "enum": ["1", "physical-core", "8"] }, "thread_count": { "type": "integer", "minimum": 1 },
         "sample_denominator": { "type": "integer", "minimum": 1, "maximum": 1024 }, "transaction_definition": { "$ref": "#/$defs/nonempty" }, "measured": { "$ref": "#/$defs/child" }, "control": { "$ref": "#/$defs/child" }
       }
     },

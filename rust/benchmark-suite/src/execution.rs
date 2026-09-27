@@ -10,6 +10,7 @@ use crate::latency::{deterministic_sample_indices, LatencyExecutionResult, Laten
 use crate::model::{
     BenchmarkChildRequest, BenchmarkChildResponse, RawSample, CHILD_PROTOCOL_VERSION,
 };
+use crate::perf_ab_trace::{self, PerfAbOperation};
 use crate::scenarios::{
     card, CardId, ExpectedCounts, Request, RequestKind, ScenarioCell, ThreadPoint, Topology,
     MAX_REQUESTS_PER_TRANSACTION, REQUEST_CYCLE_OPERATIONS,
@@ -63,6 +64,8 @@ pub trait AllocatorAdapter: Sync {
     /// `pointer` must be live and must have been returned by this adapter; it
     /// must not be used afterwards.
     unsafe fn free(&self, pointer: NonNull<u8>);
+    /// C `mi_free(NULL)` is a valid no-op and occurs in perf-ab slot traces.
+    fn free_null(&self) {}
 }
 
 struct SerializedAdapter<'a, A> {
@@ -115,6 +118,10 @@ impl<A: AllocatorAdapter> AllocatorAdapter for SerializedAdapter<'_, A> {
         let _guard = self.gate.lock().expect("serialized control lock poisoned");
         unsafe { self.inner.free(pointer) }
     }
+    fn free_null(&self) {
+        let _guard = self.gate.lock().expect("serialized control lock poisoned");
+        self.inner.free_null()
+    }
 }
 
 impl AllocatorAdapter for LinkedAdapter {
@@ -145,6 +152,9 @@ impl AllocatorAdapter for LinkedAdapter {
     }
     unsafe fn free(&self, pointer: NonNull<u8>) {
         unsafe { self.free(pointer) }
+    }
+    fn free_null(&self) {
+        LinkedAdapter::free_null(self)
     }
 }
 
@@ -389,12 +399,20 @@ pub fn execute_latency_cell<A: AllocatorAdapter>(
     if sample_denominator == 0 {
         return Err("latency sample denominator must be nonzero".into());
     }
+    if let Some(workload) = perf_ab_trace::workload(cell.card, cell.threads) {
+        if workload.operations_per_worker != cell.transactions_per_worker {
+            return Err("perf-ab diagnostic operation count differs from its pinned trace".into());
+        }
+        return execute_perf_ab_latency(adapter, cell, workload, sample_denominator, control);
+    }
     match (cell.card, cell.thread_point) {
         (CardId::TinyFixed64, ThreadPoint::One)
         | (CardId::SmallLogMixed, ThreadPoint::One)
         | (CardId::SmallLogMixed, ThreadPoint::PhysicalCores)
         | (CardId::CrossThreadProducerConsumer, ThreadPoint::PhysicalCores)
-        | (CardId::LargeObjects, ThreadPoint::One) => {}
+        | (CardId::LargeObjects, ThreadPoint::One)
+        | (CardId::LargeObject128KiB, ThreadPoint::One)
+        | (CardId::LargeObject128KiB, ThreadPoint::Eight) => {}
         _ => return Err("cell is outside transaction-latency-v1".into()),
     }
     if cell.card == CardId::CrossThreadProducerConsumer {
@@ -402,6 +420,168 @@ pub fn execute_latency_cell<A: AllocatorAdapter>(
     } else {
         execute_ordered_latency(adapter, cell, sample_denominator, control)
     }
+}
+
+fn execute_perf_ab_latency<A: AllocatorAdapter>(
+    adapter: &A,
+    cell: &ScenarioCell,
+    workload: perf_ab_trace::PerfAbWorkload,
+    sample_denominator: u64,
+    control: bool,
+) -> Result<LatencyExecutionResult, String> {
+    let ready = Arc::new(Barrier::new(cell.threads + 1));
+    let start = Arc::new(Barrier::new(cell.threads + 1));
+    let schedules = (0..cell.threads)
+        .map(|worker| {
+            deterministic_sample_indices(
+                cell.seed,
+                worker as u32,
+                cell.transactions_per_worker,
+                sample_denominator,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcomes = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(cell.threads);
+        for (worker, indices) in schedules.into_iter().enumerate() {
+            let ready = Arc::clone(&ready);
+            let start = Arc::clone(&start);
+            handles.push(scope.spawn(move || {
+                let mut stream = perf_ab_trace::PerfAbStream::new(workload, worker);
+                let mut slots = [None; perf_ab_trace::PERF_AB_SLOTS];
+                let mut observations = Vec::with_capacity(indices.len());
+                let mut sample_cursor = 0;
+                let mut failure = None;
+                std::hint::black_box(current_cpu_id());
+                ready.wait();
+                start.wait();
+                for operation in 0..cell.transactions_per_worker {
+                    let action = stream.next_operation();
+                    let sampled =
+                        sample_cursor < indices.len() && indices[sample_cursor] == operation;
+                    let timer = sampled.then(Instant::now);
+                    let result = if control {
+                        std::hint::black_box(action);
+                        Ok(())
+                    } else {
+                        match action {
+                            PerfAbOperation::Free { slot } => {
+                                if let Some(pointer) = slots[slot].take() {
+                                    unsafe { adapter.free(pointer) };
+                                } else {
+                                    adapter.free_null();
+                                }
+                                Ok(())
+                            }
+                            PerfAbOperation::Allocate { slot, size } => {
+                                if let Some(pointer) = slots[slot].take() {
+                                    unsafe { adapter.free(pointer) };
+                                } else {
+                                    adapter.free_null();
+                                }
+                                match adapter.alloc(size) {
+                                    Ok(pointer) => {
+                                        let mut offset = 0;
+                                        while offset < size {
+                                            unsafe {
+                                                pointer
+                                                    .as_ptr()
+                                                    .add(offset)
+                                                    .write_volatile(offset as u8);
+                                            }
+                                            offset += 4096;
+                                        }
+                                        slots[slot] = Some(pointer);
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            }
+                        }
+                    };
+                    if let Err(error) = result {
+                        failure = Some(error);
+                        for pointer in slots.iter_mut().filter_map(Option::take) {
+                            if !control {
+                                unsafe { adapter.free(pointer) };
+                            }
+                        }
+                        break;
+                    }
+                    if let Some(timer) = timer {
+                        observations.push(LatencyObservation {
+                            thread_index: worker as u32,
+                            transaction_index: operation,
+                            duration_ns: nonzero_ns(timer),
+                        });
+                        sample_cursor += 1;
+                    }
+                    if workload.bursts > 1
+                        && (operation + 1)
+                            % (cell.transactions_per_worker / u64::from(workload.bursts))
+                            == 0
+                    {
+                        for pointer in slots.iter_mut().filter_map(Option::take) {
+                            if !control {
+                                unsafe { adapter.free(pointer) };
+                            }
+                        }
+                        let burst = (operation + 1)
+                            / (cell.transactions_per_worker / u64::from(workload.bursts));
+                        if burst < u64::from(workload.bursts) && workload.pause_ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(u64::from(
+                                workload.pause_ms,
+                            )));
+                        }
+                    }
+                }
+                for pointer in slots.iter_mut().filter_map(Option::take) {
+                    if !control {
+                        unsafe { adapter.free(pointer) };
+                    }
+                }
+                let actual_cpu = current_cpu_id();
+                let checksum = stream.worker_checksum();
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                if sample_cursor != indices.len() {
+                    return Err(
+                        "perf-ab latency sample schedule was not completely observed".into(),
+                    );
+                }
+                Ok((observations, actual_cpu, checksum))
+            }));
+        }
+        ready.wait();
+        notify_measured_region(true);
+        start.wait();
+        let joined = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "perf-ab latency worker panicked".to_string())?
+            })
+            .collect::<Result<Vec<_>, String>>();
+        notify_measured_region(false);
+        joined
+    })?;
+    let mut observations = Vec::new();
+    let mut actual_cpu_ids = Vec::with_capacity(cell.threads);
+    let mut checksum = 0_u64;
+    for (mut worker_observations, cpu, worker_checksum) in outcomes {
+        observations.append(&mut worker_observations);
+        actual_cpu_ids.push(cpu);
+        checksum ^= worker_checksum;
+    }
+    observations.sort_by_key(|value| (value.thread_index, value.transaction_index));
+    Ok(LatencyExecutionResult {
+        observations,
+        completed_transactions: cell.requested_transactions(),
+        checksum: if control { 1 } else { checksum },
+        actual_cpu_ids,
+    })
 }
 
 fn execute_ordered_latency<A: AllocatorAdapter>(
@@ -1464,7 +1644,9 @@ fn touched_offsets(size: usize) -> TouchedOffsets {
 }
 
 fn touched_offsets_for_card(card_id: CardId, size: usize) -> TouchedOffsets {
-    if card_id == CardId::LargeObjects {
+    if card_id == CardId::LargeObject128KiB {
+        touched_offsets_with_stride(size, PAGE_BYTES)
+    } else if card_id == CardId::LargeObjects {
         touched_offsets_with_stride(size, 64)
     } else {
         touched_offsets(size)
@@ -1556,6 +1738,20 @@ fn nonzero_ns(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_128k_latency_card_touches_once_per_page_and_last_byte() {
+        let offsets =
+            touched_offsets_for_card(CardId::LargeObject128KiB, 128 * 1024).collect::<Vec<_>>();
+        assert_eq!(offsets.len(), 33);
+        assert_eq!(offsets.first(), Some(&0));
+        assert_eq!(offsets.get(1), Some(&PAGE_BYTES));
+        assert_eq!(offsets.last(), Some(&(128 * 1024 - 1)));
+        assert!(offsets
+            .windows(2)
+            .take(31)
+            .all(|pair| pair[1] - pair[0] == PAGE_BYTES));
+    }
 
     struct PanicAdapter;
 
