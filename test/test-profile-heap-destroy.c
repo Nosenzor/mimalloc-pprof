@@ -214,8 +214,18 @@ static void scenario_delete(void) {
   stop_profiler(before);
 }
 
+typedef struct subproc_worker_arg_s {
+  mi_subproc_id_t subproc;
+  bool joined;
+} subproc_worker_arg_t;
+
 static THREAD_RET subproc_worker(void* arg) {
-  mi_subproc_add_current_thread(*(mi_subproc_id_t*)arg);
+  subproc_worker_arg_t* const worker = (subproc_worker_arg_t*)arg;
+  mi_subproc_add_current_thread(worker->subproc);
+  worker->joined = (mi_subproc_current()._mi_subproc_id == worker->subproc._mi_subproc_id);
+  // A Windows shared-library thread may already have been initialized by the DLL's
+  // thread-attach callback. Such a thread cannot move into another sub-process.
+  if (!worker->joined) return THREAD_OK;
   // The sub-process's main heap, which mi_heap_main() names for this thread now.
   fill_heap(mi_heap_main(), NULL);
   // And a heap of the sub-process's own. Neither is freed before the thread exits.
@@ -245,8 +255,19 @@ static void scenario_subproc(void) {
   mi_subproc_id_t subproc = mi_subproc_new();
   assert(subproc._mi_subproc_id != NULL);
   thread_t worker;
-  thread_start(&worker, subproc_worker, &subproc);
+  subproc_worker_arg_t worker_arg = { subproc, false };
+  thread_start(&worker, subproc_worker, &worker_arg);
   thread_join(worker);
+#ifdef _WIN32
+  if (!worker_arg.joined) {
+    mi_subproc_destroy(subproc);
+    mi_prof_stop();
+    puts("skip: Windows DLL initialized the worker before sub-process assignment");
+    return;
+  }
+#else
+  assert(worker_arg.joined);
+#endif
   const counts_t during = counts_now();
   assert(during.samples >= before.samples + 2 * HEAP_BLOCKS);
   mi_subproc_destroy(subproc);
