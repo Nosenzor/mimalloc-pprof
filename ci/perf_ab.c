@@ -21,7 +21,7 @@
    are of another thread's blocks; at the end each thread frees the table it started with. Like the
    chart's harness (its planner's VecDeque, which the override routes through the allocator under
    test), each table also appends every draw's slot to a log that grows by doubling mi_realloc from
-   table_slots entries: the growing-buffer pattern of any Rust Vec. Prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
+   table_slots entries: the growing-buffer pattern of any Rust Vec. The default build prints one line: ops/s, process cpu seconds, the workers' own cpu seconds (the
    allocating threads, without the scavenger), minor page faults, peak RSS (VmHWM: see
    peak_rss_bytes), and, after everything
    was freed while the worker threads stay alive and idle (a server between requests): RSS
@@ -34,6 +34,9 @@
    the arena slack, and the arena layout walk).
    `perf_ab probe` (#527) allocates nothing timed: for each size it prints the bin and page kind the
    linked allocator gives that request, so a size-class edge is confirmed, not assumed (see probe).
+   The separate -DPERF_AB_DIAGNOSTIC=1 build emits one JSON object instead, with pre-worker
+   measured-work and post-work drain process snapshots, worker CPU and a deterministic trace
+   checksum. The normal perf-ab build has none of that per-operation checksum work.
    Linux only (getrusage + /proc/self/statm). */
 #define _GNU_SOURCE   /* RUSAGE_THREAD */
 #include <mimalloc.h>
@@ -59,8 +62,22 @@
 #define PROBE_SMALL_PAGE    (64L << 10)
 #define PROBE_MEDIUM_PAGE   (512L << 10)
 #define PROBE_LARGE_PAGE    (4L << 20)
+#ifndef PERF_AB_STREAM_SEED_BASE
+#define PERF_AB_STREAM_SEED_BASE 0x5eed0000ull
+#endif
+#ifndef PERF_AB_LARSON_TABLE_SEED_BASE
+#define PERF_AB_LARSON_TABLE_SEED_BASE 0x1a750000ull
+#endif
+#define PERF_AB_PHASE_DEFINITION "work=pre-worker-start..all-workers-drained; drain=then..end-of-2x-bound-RSS-window"
 
-typedef struct { uint64_t rng; size_t lo, hi; int log_sizes; long ops; int slots; void* slot[MAX_SLOTS]; size_t size[MAX_SLOTS]; int fifo[4096]; size_t head, tail; double cpu; int index; } stream_t;
+typedef struct {
+  uint64_t rng;
+#if defined(PERF_AB_DIAGNOSTIC)
+  long completed;
+#endif
+  size_t lo, hi; int log_sizes; long ops; int slots; void* slot[MAX_SLOTS]; size_t size[MAX_SLOTS];
+  int fifo[4096]; size_t head, tail; double cpu; int index;
+} stream_t;
 
 /* #506: one Larson table; a round of draws on it runs on one thread at a time (the round barrier) */
 typedef struct { uint64_t rng; void** slot; size_t* log; size_t log_len, log_cap; } table_t;
@@ -92,7 +109,10 @@ static void run_ops(stream_t* st, long n) {
     const uint64_t choice = next(&st->rng) % 16;
     int slot = (int)(next(&st->rng) % (uint64_t)st->slots);
     if (choice >= 8 && choice < 14 && st->head != st->tail) slot = st->fifo[st->head++ % 4096];  /* free oldest */
-    if (choice >= 8) { mi_free(st->slot[slot]); st->slot[slot] = NULL; st->size[slot] = 0; continue; }
+    if (choice >= 8) {
+      mi_free(st->slot[slot]); st->slot[slot] = NULL; st->size[slot] = 0;
+      continue;
+    }
     mi_free(st->slot[slot]);
     const size_t size = draw_size(st);
     char* p = (char*)mi_malloc(size);
@@ -102,11 +122,54 @@ static void run_ops(stream_t* st, long n) {
     st->size[slot] = size;
     st->fifo[st->tail++ % 4096] = slot;
   }
+#if defined(PERF_AB_DIAGNOSTIC)
+  st->completed += n;  /* one batch update, no per-operation instrumentation */
+#endif
 }
 
 static double cpu_of(const struct rusage* ru) {
   return (double)(ru->ru_utime.tv_sec + ru->ru_stime.tv_sec) + (double)(ru->ru_utime.tv_usec + ru->ru_stime.tv_usec) * 1e-6;
 }
+
+static long rss_bytes(void);
+static long peak_rss_bytes(void);
+static double now_s(void);
+
+#if defined(PERF_AB_DIAGNOSTIC)
+typedef struct { struct rusage usage; double monotonic_s; long rss_bytes, peak_rss_bytes; } phase_snapshot_t;
+
+/* At work start, finish /proc reads before the boundary so their CPU/fault cost is not charged
+   to the allocator workload. The end snapshot takes the clock/rusage first so its /proc reads
+   likewise do not inflate measured-work CPU. */
+static phase_snapshot_t phase_snapshot_start(void) {
+  phase_snapshot_t out;
+  out.rss_bytes = rss_bytes();
+  out.peak_rss_bytes = peak_rss_bytes();
+  if (getrusage(RUSAGE_SELF, &out.usage) != 0) { perror("getrusage"); exit(1); }
+  out.monotonic_s = now_s();
+  return out;
+}
+
+static phase_snapshot_t phase_snapshot(void) {
+  phase_snapshot_t out;
+  out.monotonic_s = now_s();
+  if (getrusage(RUSAGE_SELF, &out.usage) != 0) { perror("getrusage"); exit(1); }
+  out.rss_bytes = rss_bytes();
+  out.peak_rss_bytes = peak_rss_bytes();
+  return out;
+}
+
+static void print_phase_snapshot(const phase_snapshot_t* s) {
+  printf("{\"monotonic_s\":%.9f,\"user_s\":%.6f,\"system_s\":%.6f,"
+         "\"minor_faults\":%ld,\"major_faults\":%ld,\"voluntary_context_switches\":%ld,"
+         "\"involuntary_context_switches\":%ld,\"rss_bytes\":%ld,\"peak_rss_bytes\":%ld}",
+         s->monotonic_s,
+         (double)s->usage.ru_utime.tv_sec + (double)s->usage.ru_utime.tv_usec * 1e-6,
+         (double)s->usage.ru_stime.tv_sec + (double)s->usage.ru_stime.tv_usec * 1e-6,
+         s->usage.ru_minflt, s->usage.ru_majflt, s->usage.ru_nvcsw, s->usage.ru_nivcsw,
+         s->rss_bytes, s->peak_rss_bytes);
+}
+#endif
 
 /* the calling thread's cpu so far: a worker adds it to its stream just before it exits or idles */
 static double thread_cpu(void) { struct rusage ru; getrusage(RUSAGE_THREAD, &ru); return cpu_of(&ru); }
@@ -121,8 +184,6 @@ static int holes_report;   /* PERF_AB_HOLES_REPORT (#529) */
 static pthread_barrier_t report_barrier;
 static pthread_mutex_t report_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static long rss_bytes(void);
-
 static void* generation_main(void* arg) {
   stream_t* st = (stream_t*)arg;
   run_ops(st, st->ops / generations);
@@ -135,7 +196,10 @@ static void free_slots(stream_t* st) {
 }
 
 /* one round of Larson draws on `tb`: free a random slot's block, allocate a new one into it */
-static void larson_round(table_t* tb, size_t lo, size_t hi, long n) {
+static void larson_round(table_t* tb, stream_t* st, size_t lo, size_t hi, long n) {
+#if !defined(PERF_AB_DIAGNOSTIC)
+  (void)st;  /* the default perf-ab workload does not compute a trace checksum */
+#endif
   for (long i = 0; i < n; i++) {
     const size_t k = (size_t)(next(&tb->rng) % (uint64_t)table_slots);
     const size_t size = lo + (size_t)(next(&tb->rng) % (hi - lo + 1));
@@ -151,6 +215,9 @@ static void larson_round(table_t* tb, size_t lo, size_t hi, long n) {
     }
     tb->log[tb->log_len++] = k;
   }
+#if defined(PERF_AB_DIAGNOSTIC)
+  st->completed += n;
+#endif
 }
 
 /* #529 (#422 E4): the allocator-internal snapshot. Every worker first waits until all have finished
@@ -183,7 +250,7 @@ static void* worker_main(void* arg) {
   stream_t* st = (stream_t*)arg;
   if (table_slots > 0) {
     for (int r = 0; r < LARSON_ROUNDS; r++) {
-      larson_round(&tables[(st->index + r) % threads], st->lo, st->hi, st->ops / LARSON_ROUNDS);
+      larson_round(&tables[(st->index + r) % threads], st, st->lo, st->hi, st->ops / LARSON_ROUNDS);
       pthread_barrier_wait(&round_barrier);
     }
     table_t* own = &tables[st->index];
@@ -303,7 +370,7 @@ int main(int argc, char** argv) {
   stream_t* st = (stream_t*)calloc((size_t)threads, sizeof(stream_t));
   pthread_t* t = (pthread_t*)calloc((size_t)threads, sizeof(pthread_t));
   for (int i = 0; i < threads; i++) {
-    st[i].rng = 0x5eed0000ull + (uint64_t)i;
+    st[i].rng = PERF_AB_STREAM_SEED_BASE + (uint64_t)i;
     st[i].lo = (size_t)atol(argv[3]); st[i].hi = (size_t)atol(argv[4]); st[i].ops = atol(argv[5]);
     st[i].log_sizes = log_sizes;
     st[i].slots = slots;
@@ -312,25 +379,42 @@ int main(int argc, char** argv) {
   if (table_slots > 0) {   /* allocated before the clock starts, and by libc: not the allocator under test */
     tables = (table_t*)calloc((size_t)threads, sizeof(table_t));
     for (int i = 0; i < threads; i++) {
-      tables[i].rng = 0x1a750000ull + (uint64_t)i;
+      tables[i].rng = PERF_AB_LARSON_TABLE_SEED_BASE + (uint64_t)i;
       tables[i].slot = (void**)calloc((size_t)table_slots, sizeof(void*));
       tables[i].log_cap = (size_t)table_slots;
       tables[i].log = (size_t*)mi_malloc(tables[i].log_cap * sizeof(size_t));
     }
     pthread_barrier_init(&round_barrier, NULL, (unsigned)threads);
   }
+#if defined(PERF_AB_DIAGNOSTIC)
+  const phase_snapshot_t work_start = phase_snapshot_start();
+#else
   const double start = now_s();
+#endif
   for (int i = 0; i < threads; i++) pthread_create(&t[i], NULL, &worker_main, &st[i]);
   while (atomic_load(&drained) < threads) usleep(100);
+#if defined(PERF_AB_DIAGNOSTIC)
+  const phase_snapshot_t work_end = phase_snapshot();
+#else
   const double elapsed = now_s() - start;
   struct rusage ru; getrusage(RUSAGE_SELF, &ru);   /* (re-read at DRAIN_SHORT_MS) */
-  long rss_short = 0, rss_peak = 0;
+#endif
+#if !defined(PERF_AB_DIAGNOSTIC)
+  long rss_short = 0;
+  long rss_peak = 0;
+#endif
   const double drained_at = now_s();
   for (long i = 0; i < samples; i++) {   /* sample i at drained_at + i * RELEASE_SAMPLE_MS, without drift */
     const double wait = drained_at + (double)(i * RELEASE_SAMPLE_MS) * 1e-3 - now_s();
     if (wait > 0) usleep((useconds_t)(wait * 1e6));
     rss_at[i] = rss_bytes();
-    if (i * RELEASE_SAMPLE_MS == DRAIN_SHORT_MS) { getrusage(RUSAGE_SELF, &ru); rss_short = rss_at[i]; rss_peak = peak_rss_bytes(); }
+#if !defined(PERF_AB_DIAGNOSTIC)
+    if (i * RELEASE_SAMPLE_MS == DRAIN_SHORT_MS) {
+      rss_short = rss_at[i];
+      getrusage(RUSAGE_SELF, &ru);
+      rss_peak = peak_rss_bytes();
+    }
+#endif
   }
   const long rss_final = rss_at[samples - 1];
   long release_ms = 0;
@@ -339,8 +423,44 @@ int main(int argc, char** argv) {
   }
   double owner_cpu = 0;
   for (int i = 0; i < threads; i++) owner_cpu += st[i].cpu;
-  printf("%.1f %.4f %.4f %ld %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
-         owner_cpu, ru.ru_minflt, rss_peak, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
+#if defined(PERF_AB_DIAGNOSTIC)
+  {
+    const phase_snapshot_t drain_end = phase_snapshot();
+    uint64_t checksum = 0;
+    long completed = 0;
+    for (int i = 0; i < threads; i++) {
+      completed += st[i].completed;
+      /* A deterministic stream's final PRNG state, seed, parameters and operation count identify
+         its draw sequence. Hash them after work, so checksum collection adds no hot-loop cost. */
+      uint64_t state = st[i].rng ^ (uint64_t)st[i].completed ^ (uint64_t)st[i].lo
+                     ^ ((uint64_t)st[i].hi << 1) ^ ((uint64_t)st[i].slots << 32) ^ (uint64_t)i;
+      if (table_slots > 0) state ^= tables[i].rng ^ (uint64_t)table_slots;
+      checksum ^= next(&state);
+    }
+    printf("{\"protocol_version\":\"perf-ab-child-diagnostic-v1\",\"phase_definition\":\"%s\",\"work_start\":",
+           PERF_AB_PHASE_DEFINITION);
+    print_phase_snapshot(&work_start);
+    printf(",\"work_end\":");
+    print_phase_snapshot(&work_end);
+    printf(",\"drain_start\":");
+    print_phase_snapshot(&work_end);
+    printf(",\"drain_end\":");
+    print_phase_snapshot(&drain_end);
+    printf(",\"worker_cpu_s\":%.6f,\"completed_operations\":%ld,\"trace_checksum\":\"%016llx\","
+           "\"stream_seed_base\":\"%016llx\",\"larson_table_seed_base\":\"%016llx\","
+           "\"peak_work_rss_bytes\":%ld,\"rss_after_drain_bytes\":%ld,\"rss_at_release_bound_bytes\":%ld,"
+           "\"release_ms\":%ld}\n", owner_cpu, completed, (unsigned long long)checksum,
+           (unsigned long long)PERF_AB_STREAM_SEED_BASE, (unsigned long long)PERF_AB_LARSON_TABLE_SEED_BASE,
+           work_end.peak_rss_bytes,
+           rss_final, /* full drain-window end; the default publication still uses rss_short */
+           rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
+  }
+#else
+  {
+    printf("%.1f %.4f %.4f %ld %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
+           owner_cpu, ru.ru_minflt, rss_peak, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
+  }
+#endif
   atomic_store(&release_workers, 1);
   for (int i = 0; i < threads; i++) pthread_join(t[i], NULL);
   if (table_slots > 0) {

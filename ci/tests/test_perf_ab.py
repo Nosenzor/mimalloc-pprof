@@ -75,6 +75,22 @@ def test_build_passes_the_defines_to_cmake(
     assert configure[5 : 5 + len(perf_ab.FLAGS)] == perf_ab.FLAGS
 
 
+def test_diagnostic_child_compile_flag_does_not_change_default_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(perf_ab, "run", fake_cmake(calls))
+    for arm in ("base", "head"):
+        (tmp_path / f"src-{arm}").mkdir()
+        (tmp_path / f"bin-{arm}-plain").mkdir()
+    perf_ab.build("base", "OLD", tmp_path, "plain", [])
+    perf_ab.build("head", "NEW", tmp_path, "plain", [], diagnostic=True)
+    compiles = [call for call in calls if call and call[0] == "cc"]
+    assert len(compiles) == 2
+    assert "-DPERF_AB_DIAGNOSTIC=1" not in compiles[0]
+    assert "-DPERF_AB_DIAGNOSTIC=1" in compiles[1]
+
+
 def run_main(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *argv: str
 ) -> tuple[str, list[tuple[str, list[str]]], list[list[str]]]:
