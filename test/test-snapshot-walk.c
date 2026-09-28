@@ -207,6 +207,7 @@ static void run_subproc_row(const char* path) {
 }
 
 int main(int argc, char** argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);  // Preserve the last completed check if a platform crashes.
   const char* path = (argc > 1 ? argv[1] : "test-snapshot-walk.bin");
   keep_files = (argc > 2 && strcmp(argv[2], "--keep") == 0);
   // Before the first allocation: every arena of the process, the first one included, is then
