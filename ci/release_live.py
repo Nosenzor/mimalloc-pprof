@@ -158,9 +158,9 @@ class LiveDestination(destinations.ReadOnlyDestination):
         def release_id_shape(value: dict[str, object]) -> bool:
             return isinstance(value.get("id"), int)
 
-        raw = self._gh_required(
-            f"repos/{release.REPO}/releases/tags/{tag}", validate=release_id_shape
-        )
+        raw = self._release_by_tag(tag, validate=release_id_shape)
+        if raw is None:
+            raise release.ReleaseError("draft release disappeared before finalize")
         release_id = int(json.loads(raw)["id"])
         self._github(
             "gh",

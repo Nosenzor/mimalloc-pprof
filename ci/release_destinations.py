@@ -107,7 +107,7 @@ class ReadOnlyDestination:
                 and all(asset_shape(item) for item in cast(list[object], value.get("assets")))
             )
 
-        raw = self._gh_optional(f"repos/{release.REPO}/releases/tags/{tag}", validate=release_shape)
+        raw = self._release_by_tag(tag, validate=release_shape)
         if raw is None:
             return None
         data = json.loads(raw)
@@ -117,21 +117,50 @@ class ReadOnlyDestination:
         }
         return ReleaseState(str(data["target_commitish"]), bool(data["draft"]), assets)
 
+    @classmethod
+    def _release_by_tag(
+        cls,
+        tag: str,
+        *,
+        validate: Callable[[dict[str, object]], bool] = lambda _: True,
+    ) -> str | None:
+        """Find the release for a tag, drafts included.
+
+        GitHub's releases/tags/{tag} endpoint returns 404 for a draft, so the
+        post-upload verification of run 36468867757 saw its own draft as missing.
+        Only the list endpoint returns drafts.
+        """
+        return cls._gh_optional(
+            f"repos/{release.REPO}/releases?per_page=100",
+            validate=validate,
+            jq=f".[] | select(.tag_name == {json.dumps(tag)}) | @json",
+        )
+
     @staticmethod
     def _gh_optional(
         endpoint: str,
         *,
         validate: Callable[[dict[str, object]], bool] = lambda _: True,
+        jq: str | None = None,
     ) -> str | None:
+        """Read one GitHub object; with ``jq``, the at most one paginated match."""
+        query = ["--paginate", "--jq", jq] if jq is not None else []
         for attempt in range(10):
             result = subprocess.run(
-                ["gh", "api", endpoint],
+                ["gh", "api", endpoint, *query],
                 capture_output=True,
                 text=True,
                 check=False,
                 env=release.plain_cli_env(),
             )
             if result.returncode == 0:
+                if jq is not None:
+                    matches = result.stdout.splitlines()
+                    if not matches:
+                        return None
+                    if len(matches) > 1:
+                        raise release.ReleaseError(f"GitHub has several releases for {endpoint}")
+                    result.stdout = matches[0]
                 try:
                     value = json.loads(result.stdout)
                     if not isinstance(value, dict) or not validate(cast(dict[str, object], value)):

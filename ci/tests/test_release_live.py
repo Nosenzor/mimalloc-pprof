@@ -41,7 +41,7 @@ class LiveUploadTests(unittest.TestCase):
         destination = release_live.LiveDestination(444, Path("crate"))
         responses = iter(['{"id":null}', '{"id":123}'])
 
-        def required(_endpoint: str, *, validate: Callable[[dict[str, object]], bool]) -> str:
+        def by_tag(_tag: str, *, validate: Callable[[dict[str, object]], bool]) -> str:
             while True:
                 raw = next(responses)
                 value = cast(dict[str, object], json.loads(raw))
@@ -49,7 +49,7 @@ class LiveUploadTests(unittest.TestCase):
                     return raw
 
         with (
-            patch.object(destination, "_gh_required", side_effect=required),
+            patch.object(destination, "_release_by_tag", side_effect=by_tag),
             patch.object(destination, "_github") as write,
         ):
             destination.finalize("v1.0.1")
