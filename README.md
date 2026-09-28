@@ -187,19 +187,23 @@ These four scaling graphics use deterministic per-worker playback at 1, 2, 3, 4,
 and 8 workers. They request either exact powers of two from 64 KiB through 4 MiB or an
 unbiased uniformly random byte size over the same inclusive range. Both use the normal
 allocation API; “power-of-two” describes the requested size, not extra pointer alignment.
-The allocator rows show the empirical P5–P95 area and median from 40 paired runs.
-Within each metric every row—and both workloads—uses the same zero-based Y-axis domain and
-ticks, rounded upward from the maximum of all raw observations so outliers are not clipped.
-The four primary rows are TCMalloc, jemalloc, Microsoft mimalloc, and mimalloc-pprof; Bun
-mimalloc remains collected in a separately labelled supplemental row.
+Each chart overlays, on one panel, the median of 40 paired runs for all five allocators:
+TCMalloc, jemalloc, Microsoft mimalloc, Bun mimalloc, and mimalloc-pprof (drawn last and
+thicker). Within each metric both workloads share one zero-based Y axis, rounded upward
+from the largest raw observation so outliers are not clipped. The per-cell spread across
+runs is on the dashboard table and in `latest.json`, not on the chart. Every peak-RSS chart
+also draws a grey dashed **live data (theoretical minimum)** line: the process's own RSS
+before any worker starts, plus the requested bytes the workload holds at once. No allocator
+can go below it, so the gap between a line and the floor is that allocator's overhead.
+Throughput charts have no floor.
 
-[![Power-of-two requested sizes: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Power-of-two requested sizes: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Power-of-two requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Power-of-two requested sizes: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-power-of-two-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Uniformly random requested sizes: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Uniformly random requested sizes: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Uniformly random requested sizes: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Uniformly random requested sizes: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-random-large-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
 ### Short-lived threads
 
@@ -210,13 +214,27 @@ stream as 8 successive threads, and each thread exits while still owning live bl
 that the next one frees. Both share one Y axis per metric, so the gap between them is
 the cost of short-lived threads.
 
-[![Long-lived threads, 96-512 KiB: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Long-lived threads, 96-512 KiB: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Long-lived threads, 96-512 KiB: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Long-lived threads, 96-512 KiB: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-persistent-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Short-lived threads, 96-512 KiB: throughput median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Short-lived threads, 96-512 KiB: median throughput of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-throughput.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
 
-[![Short-lived threads, 96-512 KiB: peak RSS median and empirical P5–P95 by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+[![Short-lived threads, 96-512 KiB: median peak RSS of all five allocators by worker count](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-large-class-ephemeral-rss.svg)](https://zackees.github.io/mimalloc-pprof/#requested-size-distributions)
+
+### RSS after the work stops
+
+Peak RSS is only half of it. This chart runs the short-lived-thread stream again at 8
+workers, then joins every worker thread and keeps the process alive and idle, like a
+server between requests. Each process reads its own RSS 0.1, 0.5, 1, 1.5, 2 and 3 s
+after the last thread was joined. Each line is one allocator's median of 40 paired runs.
+The vertical dashed line is the release bound perf-ab enforces, and the grey horizontal
+one is the floor: nothing is live after the drain, so an allocator that returned
+everything would sit at the process's pre-worker RSS. The table under the chart gives
+each allocator's peak and its time to release: the first sample within 1 MiB of the 3 s
+one, the same definition perf-ab uses.
+
+[![RSS after the work stops: median resident memory of all five allocators at fixed times after every worker thread was joined, with a time-to-release table](https://raw.githubusercontent.com/zackees/mimalloc-pprof/benchmark-stats/benchmark-scaling-thread-churn-rss.svg)](https://zackees.github.io/mimalloc-pprof/#thread-churn)
 
 Full methodology, per-cell tables and the other benchmark families are in
 [Performance](#performance) below and on the
@@ -229,7 +247,9 @@ Full methodology, per-cell tables and the other benchmark families are in
 Throughput is half the question; the other half is whether the memory comes back when a
 burst of work drains. One churn workload — 150k × 512 B + 100k × 1 KiB + 50k × 2 KiB
 blocks, a scattered 1-in-20 kept alive, the rest freed — under four of the five pinned
-allocators, then 10 s of idle:
+allocators, then 10 s of idle. The grey dashed line is the theoretical minimum: the
+process's RSS before it allocated anything plus the bytes it still holds, which no
+allocator can go below.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/allocator-idle-rss-dark.svg" />
@@ -245,7 +265,8 @@ allocators, then 10 s of idle:
 
 **Hole purging's own contribution, isolated.** One binary, the scavenger on in both runs,
 `MIMALLOC_PURGE_HOLES` the only changed variable. Returning whole pages is worth 18 %;
-discarding the free runs *inside* still-used pages is worth 74 %.
+discarding the free runs *inside* still-used pages is worth 74 %. The grey dashed line is
+the same theoretical minimum as above, measured in this binary.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/hole-purging-rss-dark.svg" />
@@ -571,10 +592,10 @@ feature (`mimalloc-pprof = { version = "1", features = ["dhat"] }`) or CMake's
 MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json ./my_app
 ```
 
-> **Known issue:** `MIMALLOC_DHAT=1` is meant to start DHAT with no code at all, but today
-> it is ignored: the variable is read into a buffer below `_mi_getenv`'s 64-byte minimum,
-> so it is never seen and DHAT stays off. Call `mi_dhat_start()` / `dhat::start()` until
-> that is fixed.
+Builds with the [#549](https://github.com/zackees/mimalloc-pprof/issues/549) fix honor
+`MIMALLOC_DHAT=1` at process init. Releases up to 1.0.0 predate that fix and ignore
+`MIMALLOC_DHAT`, so call `mi_dhat_start()` / `dhat::start()` there instead.
+`MIMALLOC_DHAT_DUMP_AT_EXIT` was never affected.
 
 Built with `MI_NO_PROCESS_DETACH` (issue #268)? The automatic exit path that
 `*_DUMP_AT_EXIT` relies on is skipped by design — call `mi_prof_dump` / `mi_dhat_dump`
@@ -819,6 +840,7 @@ The fifteen this fork adds, each also settable as `MIMALLOC_<NAME>` in the envir
 | `snapshot_on_exit` | `0` | write a heap snapshot at process exit; `1` = on, `2` = with per-block freemaps (needs `MI_DIAGNOSTICS`) |
 | `page_reserve` | `1` | at thread exit, keep an empty large page for the next thread instead of freeing it; released after `MI_PAGE_RESERVE_RELEASE_MULT` (10) purge delays; 0 frees it (#493) |
 | `resident_first` | `1` | claim arena slices that are free but still resident (queued for purge) before any other free slices, so a new page reuses memory the retention window kept instead of faulting in fresh pages; 0 = the plain search only (#493) |
+| `large_span` | `1` | size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: a compact 1 MiB span first, doubling up to 4 MiB while the thread keeps filling that class's pages, stepping back down when it stops; 0 = every large page is 4 MiB (upstream) (#532) |
 
 Because they are positional, a stale Rust mirror of this enum would silently set the
 *wrong* option — which is why `tests/t19_layout.rs` checks every value against the C
@@ -915,11 +937,12 @@ third is what survives them:
   before it blocks. Bun's fork behaves identically, because this is Bun's mechanism.
 - **jemalloc can return this memory if you ask; it does not after idle — by
   default.** Its decay is advanced by allocation activity, not by time spent idle, so
-  the default-config line is flat for the whole window. The dashed line is the *same*
+  the default-config line is flat for the whole window. The orange dashed line is the *same*
   jemalloc given an explicit `mallctl("arena.<all>.purge")` on the same 100 ms tick:
   **74 %**. Its opt-in `background_thread:true` is measured too, and it lands on
   jemalloc's own boundary — the default `dirty_decay_ms` is 10 s, exactly this
-  window — so the committed run returns **0 %** inside 10 s and **74 %** over 30 s.
+  window — so in the committed run it returned **73 %** inside 10 s in only 1 of its 3
+  repetitions (0 % in the other two), and **74 %** over 30 s in all three.
   Both are in the diagnostics; the 30 s row is the one that settles what that thread
   can do. The claim is therefore a narrow one, and worth stating as such: jemalloc's
   *default* configuration keeps sitting on this memory for as long as the process
@@ -971,7 +994,7 @@ pair is the **best** of 3 (the rule that is most generous to every allocator, in
 the ones this fork is measured against). Each SVG names its own, and neither pair was
 rendered from the other's data.
 
-Both were measured at commit `be13eadf` with
+Both were measured at commit `da59442f` with
 [`ci/bench_hole_purging.py`](ci/bench_hole_purging.py): 150k 512 B + 100k 1 KiB +
 50k 2 KiB blocks, a scattered 1-in-20 kept alive, then idled for 10 s calling
 `mi_on_thread_idle()` every 100 ms — median of 3 runs, pinned to 4 CPUs. The table's
@@ -1365,6 +1388,21 @@ claim owners, **not** the work or OS calls after a claim succeeds.
 | [docs/upstreaming.md](docs/upstreaming.md) | Fixes prepared for submission back to microsoft/mimalloc |
 | [readme-upstream.md](readme-upstream.md) | Upstream mimalloc documentation (build modes, overrides, options) |
 | [MIMALLOC_FORKS.md](MIMALLOC_FORKS.md) | Survey of other mimalloc forks and what was (not) adopted |
+
+**Internals.** How each fork-owned subsystem works, written for contributors: data
+structures, hook sites, locks and memory orders, known defects and accepted limits, and the
+tests and CI gates that cover it.
+
+| Document | Contents |
+|---|---|
+| [docs/profiler-internals.md](docs/profiler-internals.md) | Sampled pprof profiler: per-thread sampling, sample records and the stack intern table, stack capture and module mappings per platform, the `profile.proto` encoder |
+| [docs/memory-events-internals.md](docs/memory-events-internals.md) | Memory events: the one-line hook sites, the observer word tested first, the `_slow` bodies, dispatch, counters and the callback contract |
+| [docs/dhat-internals.md](docs/dhat-internals.md) | Exact DHAT profiler: raw-OS bump arena, program-point and live-record tables, per-platform stacks, the DHAT v2 JSON field by field |
+| [docs/page-holes.md](docs/page-holes.md) | Page hole purging: the OS-page purged bitmap, the sweep, unformed-tail and slack discards, who drives it |
+| [docs/scavenger-and-idle-handoff.md](docs/scavenger-and-idle-handoff.md) | The background scavenger thread and the idle-handoff (park) protocol: states, claims, the two doors, memory orders |
+| [docs/fork-safety.md](docs/fork-safety.md) | `fork()` safety: the `pthread_atfork` handlers, the 15-level lock order, what the child resets, orphans and the fork generation |
+| [docs/heap-snapshot.md](docs/heap-snapshot.md) | Binary heap snapshots: format version 1 record by record, the writer, `mi-heapview` and the Python reference reader |
+| [docs/heap-dump-and-diagnostics.md](docs/heap-dump-and-diagnostics.md) | Live heap JSON dump (`MI_DIAGNOSTICS`), the diagnostic walk, and the `MI_DEBUG_FULL` lock diagnostics |
 
 Design history and milestone decisions are in
 [issue #2](https://github.com/zackees/mimalloc-pprof/issues/2).

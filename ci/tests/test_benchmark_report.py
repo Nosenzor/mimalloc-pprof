@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -22,6 +23,63 @@ from unittest import mock
 import benchmark_report as report
 
 FIXTURE = Path(__file__).parent / "fixtures" / "benchmark"
+
+
+# #508: synthetic post-drain curves (MiB at each offset). The fork returns its memory by
+# the 1.5 s sample, Bun's mimalloc part of it, the others hold it.
+THREAD_CHURN_CURVES_MIB: dict[str, tuple[int, ...]] = {
+    "tcmalloc": (190, 190, 190, 190, 190, 190),
+    "jemalloc": (120, 100, 90, 90, 90, 90),
+    "upstream-mimalloc": (175, 175, 175, 170, 170, 170),
+    "bun-mimalloc": (170, 170, 160, 150, 140, 140),
+    "mimalloc-pprof": (150, 90, 30, 6, 5, 5),
+}
+MIB = 1024 * 1024
+
+
+def rss_floors(
+    sweep: list[dict[str, object]], churn: list[dict[str, object]] | None = None
+) -> list[dict[str, object]]:
+    """#534: the floor summaries a producer derives from its raw samples."""
+
+    best: dict[tuple[str, int], tuple[int, int]] = {}
+    for sample in sweep:
+        if sample["pattern"] not in report.DISTRIBUTION_PATTERN_IDS:
+            continue
+        response = cast(dict[str, object], sample["response"])
+        candidate = (
+            cast(int, response["baseline_rss_bytes"]),
+            cast(int, sample["diagnostic_peak_live_requested_bytes"]),
+        )
+        key = (cast(str, sample["pattern"]), cast(int, sample["thread_count"]))
+        current = best.get(key)
+        if current is None or (sum(candidate), candidate[0]) < (sum(current), current[0]):
+            best[key] = candidate
+    floors: list[dict[str, object]] = [
+        {
+            "pattern": pattern,
+            "thread_count": threads,
+            "baseline_rss_bytes": baseline,
+            "peak_live_requested_bytes": live,
+            "floor_rss_bytes": baseline + live,
+        }
+        for (pattern, threads), (baseline, live) in sorted(best.items())
+    ]
+    if churn:
+        baseline = min(
+            cast(int, cast(dict[str, object], item["response"])["baseline_rss_bytes"])
+            for item in churn
+        )
+        floors.append(
+            {
+                "pattern": report.THREAD_CHURN_PATTERN,
+                "thread_count": report.THREAD_CHURN_THREADS,
+                "baseline_rss_bytes": baseline,
+                "peak_live_requested_bytes": 0,
+                "floor_rss_bytes": baseline,
+            }
+        )
+    return floors
 
 
 class BenchmarkReportTests(unittest.TestCase):
@@ -986,6 +1044,83 @@ class BenchmarkReportTests(unittest.TestCase):
                 "provenance must sit inside the memory section",
             )
 
+    @staticmethod
+    def floor_timeline_samples(
+        baseline_mib: int, live_mib: int, peak_mib: int
+    ) -> list[dict[str, object]]:
+        """#534: one timeline cell whose samples carry the floor's operands."""
+
+        samples: list[dict[str, object]] = []
+        for index, allocator in enumerate(report.ALLOCATOR_IDS):
+            peak = (peak_mib + 20 * index) * MIB
+            samples.append(
+                {
+                    "scenario_id": "large-objects",
+                    "thread_point": "1",
+                    "allocator_id": allocator,
+                    "baseline_rss_bytes": (baseline_mib + index) * MIB,
+                    "peak_live_requested_bytes": live_mib * MIB + index * 4096,
+                    "sampled_peak_rss_bytes": peak,
+                    "workload_active_ns": 10_000_000,
+                    "workload_drained_ns": 50_000_000,
+                    "post_drain_sample_100ms_ns": 150_000_000,
+                    "post_drain_sample_1s_ns": 1_050_000_000,
+                    "post_drain_sample_5s_ns": 5_050_000_000,
+                    "post_drain_rss_100ms_bytes": 160 * MIB,
+                    "post_drain_rss_1s_bytes": 140 * MIB,
+                    "post_drain_rss_5s_bytes": (130 + 5 * index) * MIB,
+                    "timeline": [
+                        {"elapsed_ns": 15_000_000, "rss_bytes": 150 * MIB},
+                        {"elapsed_ns": 35_000_000, "rss_bytes": peak},
+                        {"elapsed_ns": 45_000_000, "rss_bytes": 200 * MIB},
+                    ],
+                }
+            )
+        return samples
+
+    def test_rss_timeline_draws_the_live_data_floor_inside_its_domain(self) -> None:
+        # #534: baseline + concurrent live bytes, the smallest in the cell, drawn as a
+        # dashed horizontal line and never clipped by the RSS domain.
+        cells = report.timeline_cells(
+            {"raw_samples": self.floor_timeline_samples(baseline_mib=20, live_mib=64, peak_mib=300)}
+        )
+        self.assertEqual(cells[0]["floor"], 84 * MIB)
+        _t_min, _t_max, rss_min, rss_max = report.timeline_domain(cells)
+        self.assertLess(rss_min, 84 * MIB)
+        canvas = report.Canvas(report.TIMELINE_WIDTH, report.TIMELINE_HEIGHT, (248, 250, 252))
+        report.draw_rss_timeline(canvas, cells)
+        left, top, right, bottom = report.TIMELINE_SLOT_MARGINS
+        plot_height = report.TIMELINE_HEIGHT // report.TIMELINE_ROWS - top - bottom
+        y = round(report.timeline_y(84 * MIB, rss_min, rss_max, top, plot_height))
+        row = [
+            tuple(
+                canvas.pixels[
+                    (y * report.TIMELINE_WIDTH + x) * 3 : (y * report.TIMELINE_WIDTH + x) * 3 + 3
+                ]
+            )
+            for x in range(left, report.TIMELINE_WIDTH // report.TIMELINE_COLS - right)
+        ]
+        floor_pixels = row.count(report.TIMELINE_FLOOR_COLOR)
+        # Dashed: a good share of the row, not all of it.
+        self.assertGreater(floor_pixels, len(row) // 3)
+        self.assertLess(floor_pixels, len(row))
+
+    def test_rss_timeline_omits_a_floor_the_baseline_already_absorbed(self) -> None:
+        # A live set that fit in memory already resident before the workload leaves
+        # peak RSS under baseline + live: then that sum is not a floor, so none is drawn.
+        cells = report.timeline_cells(
+            {
+                "raw_samples": self.floor_timeline_samples(
+                    baseline_mib=200, live_mib=150, peak_mib=300
+                )
+            }
+        )
+        self.assertIsNone(cells[0]["floor"])
+        legacy = self.floor_timeline_samples(baseline_mib=20, live_mib=64, peak_mib=300)
+        for sample in legacy:
+            del sample["baseline_rss_bytes"]
+        self.assertIsNone(report.timeline_cells({"raw_samples": legacy})[0]["floor"])
+
     def test_rss_timeline_sawtooth_rises_falls_and_decay_markers_at_offsets(self) -> None:
         # One synthetic cell: every allocator gets a sawtooth timeline that
         # rises to a distinct peak, falls back, and then decays through the
@@ -1724,6 +1859,7 @@ class BenchmarkReportTests(unittest.TestCase):
                         }
                     )
                     source_sha, child_sha = allocator_sources[allocator]
+                    replayed = pattern in report.DISTRIBUTION_PATTERN_IDS
                     for block in range(blocks):
                         raw.append(
                             {
@@ -1737,6 +1873,10 @@ class BenchmarkReportTests(unittest.TestCase):
                                 "child_binary_sha256": child_sha,
                                 "operations_per_worker": 4096,
                                 "peak_rss_bytes": (32 + 4 * threads + index) * 1024 * 1024,
+                                # #534: the live-telemetry replay's concurrent peak.
+                                "diagnostic_peak_live_requested_bytes": (
+                                    (8 + 4 * threads) * MIB + block * 4096 if replayed else 0
+                                ),
                                 "reproduction_command": "benchmark-scaling-run --run-seed 1",
                                 "response": {
                                     "protocol_version": "throughput-scaling-sparse-child-v2",
@@ -1751,6 +1891,7 @@ class BenchmarkReportTests(unittest.TestCase):
                                     "remote_free_calls": 0,
                                     "producer_fallback_frees": 0,
                                     "setup_ns": 1,
+                                    "baseline_rss_bytes": 6 * MIB + index * 4096,
                                     "warmup_ns": 0,
                                     "elapsed_ns": 750_000_000,
                                     "teardown_ns": 1,
@@ -1829,6 +1970,7 @@ class BenchmarkReportTests(unittest.TestCase):
                     for threads in report.SCALING_THREAD_POINTS
                     for index, allocator in enumerate(report.ALLOCATOR_IDS)
                 ],
+                "floor_summaries": rss_floors(raw),
             },
         }
         pending = value["pending_metrics"]
@@ -1839,6 +1981,219 @@ class BenchmarkReportTests(unittest.TestCase):
             if not isinstance(item, dict) or item.get("metric_id") != "scaling"
         ]
         return value
+
+    def with_thread_churn(self, latest: dict[str, object]) -> dict[str, object]:
+        """A complete scaling section plus its #508 thread-churn side-car, whose raw
+        blocks replay the section's own large-class-ephemeral/8 blocks."""
+
+        value = self.with_complete_scaling(latest)
+        scaling = value["scaling"]
+        assert isinstance(scaling, dict)
+        sweep = cast(list[dict[str, object]], scaling["raw_samples"])
+        mib = 1024 * 1024
+        raw: list[dict[str, object]] = []
+        for source in sweep:
+            if (
+                source["pattern"] != report.THREAD_CHURN_SOURCE_PATTERN
+                or source["thread_count"] != report.THREAD_CHURN_THREADS
+            ):
+                continue
+            allocator = cast(str, source["allocator_id"])
+            block = cast(int, source["block_id"])
+            sample = copy.deepcopy(source)
+            sample["pattern"] = report.THREAD_CHURN_PATTERN
+            sample["peak_rss_bytes"] = (200 + block % 5) * mib
+            sample["diagnostic_peak_live_requested_bytes"] = 0
+            response = cast(dict[str, object], sample["response"])
+            response["baseline_rss_bytes"] = 4 * mib + (block % 3) * 4096
+            response["post_drain_offsets_ns"] = [
+                offset * 1_000_000 + 50_000 + block for offset in report.THREAD_CHURN_OFFSETS_MS
+            ]
+            response["post_drain_rss_bytes"] = [
+                value_mib * mib + (block % 3) * 4096
+                for value_mib in THREAD_CHURN_CURVES_MIB[allocator]
+            ]
+            raw.append(sample)
+
+        def rounded(values: list[int], probability: float) -> int:
+            return math.floor(report.latency_type7(values, probability) + 0.5)
+
+        summaries: list[dict[str, object]] = []
+        for allocator in report.ALLOCATOR_IDS:
+            runs = [item for item in raw if item["allocator_id"] == allocator]
+            peaks = [cast(int, item["peak_rss_bytes"]) for item in runs]
+            curves = [
+                cast(list[int], cast(dict[str, object], item["response"])["post_drain_rss_bytes"])
+                for item in runs
+            ]
+            releases = [report.thread_churn_release_ms(curve) for curve in curves]
+            summary: dict[str, object] = {
+                "allocator_id": allocator,
+                "block_count": report.THREAD_CHURN_BLOCKS,
+                "median_peak_rss_bytes": rounded(peaks, 0.5),
+                "p05_peak_rss_bytes": rounded(peaks, 0.05),
+                "p95_peak_rss_bytes": rounded(peaks, 0.95),
+                "median_release_ms": rounded(releases, 0.5),
+                "p95_release_ms": rounded(releases, 0.95),
+            }
+            for prefix, probability in (("median", 0.5), ("p05", 0.05), ("p95", 0.95)):
+                summary[f"{prefix}_post_drain_rss_bytes"] = [
+                    rounded([curve[index] for curve in curves], probability)
+                    for index in range(len(report.THREAD_CHURN_OFFSETS_MS))
+                ]
+            summaries.append(summary)
+        scaling["thread_churn"] = {
+            "metric_schema_version": report.THREAD_CHURN_SCHEMA,
+            "source_pattern": report.THREAD_CHURN_SOURCE_PATTERN,
+            "thread_count": report.THREAD_CHURN_THREADS,
+            "generations": report.THREAD_CHURN_GENERATIONS,
+            "block_count": report.THREAD_CHURN_BLOCKS,
+            "post_drain_offsets_ms": list(report.THREAD_CHURN_OFFSETS_MS),
+            "release_tolerance_bytes": report.THREAD_CHURN_RELEASE_TOLERANCE_BYTES,
+            "sampling": {
+                "peak_source": "external smaps_rollup peak",
+                "post_drain_source": "/proc/self/statm after every worker was joined",
+                "release_definition": "first sample within 1 MiB of the last",
+            },
+            "cell_summaries": summaries,
+            "raw_samples": raw,
+        }
+        rss = cast(dict[str, object], scaling["rss"])
+        rss["floor_summaries"] = rss_floors(sweep, raw)
+        return value
+
+    def test_thread_churn_chart_overlays_median_rss_after_the_drain(self) -> None:
+        # #508: one panel, time since the drain on x, one median line per allocator
+        # (the fork last and thicker), the release bound, and a time-to-release table.
+        latest = self.with_thread_churn(self.load_latest())
+        report.validate_latest(latest, "thread-churn fixture")
+        scaling = report.validate_scaling_report(latest["scaling"], "thread-churn fixture")
+        view = report.scaling_view_from_validated(scaling)
+        assert view.thread_churn is not None
+        svg = report.thread_churn_svg(view, 1300).decode()
+        self.assertIn("RSS after the work stops", svg)
+        self.assertEqual(svg.count(f'fill="{report.SCALING_INK["plot"]}"'), 1)
+        stroke = re.compile(r'<path [^>]*stroke="(#[0-9a-f]+)" stroke-width="([\d.]+)"')
+        strokes = stroke.findall(svg)
+        self.assertEqual(len(strokes), len(report.ALLOCATOR_IDS))
+        self.assertEqual(strokes[-1][0], report.SCALING_SERIES["mimalloc-pprof"])
+        for _color, width in strokes[:-1]:
+            self.assertGreater(float(strokes[-1][1]), float(width))
+        for offset in report.THREAD_CHURN_OFFSETS_MS:
+            self.assertIn(f">{offset / 1000:g} s<", svg)
+        self.assertIn("release bound 1.3 s", svg)
+        self.assertIn("released by", svg)
+        self.assertNotIn("<polygon", svg)
+        fork = next(
+            cell for cell in view.thread_churn.cells if cell.allocator_id == "mimalloc-pprof"
+        )
+        tcmalloc = next(cell for cell in view.thread_churn.cells if cell.allocator_id == "tcmalloc")
+        # The fork settles at the 1.5 s sample; tcmalloc never falls, so it "settles"
+        # at once -- perf-ab's definition measures when RSS stops moving.
+        self.assertEqual(fork.median_release_ms, 1500)
+        self.assertEqual(tcmalloc.median_release_ms, 100)
+        # The fork's path ends lower on the canvas (larger y) than tcmalloc's.
+        paths = dict(re.findall(r'<path d="([^"]+)" fill="none" stroke="(#[0-9a-f]+)"', svg))
+        by_color = {color: path for path, color in paths.items()}
+        fork_end = float(by_color[report.SCALING_SERIES["mimalloc-pprof"]].split()[-1])
+        tcmalloc_end = float(by_color[report.SCALING_SERIES["tcmalloc"]].split()[-1])
+        self.assertGreater(fork_end, tcmalloc_end)
+
+    def test_thread_churn_publishes_on_the_dashboard_and_site(self) -> None:
+        latest = self.with_thread_churn(self.load_latest())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            page = (site / "index.html").read_text(encoding="utf-8")
+            self.assertIn('<h2 id="thread-churn">RSS after the work stops</h2>', page)
+            self.assertIn(f'src="{report.THREAD_CHURN_PANEL}"', page)
+            self.assertIn("Released by P50 / P95", page)
+            panel = (site / report.THREAD_CHURN_PANEL).read_text(encoding="utf-8")
+            self.assertIn("released by", panel)
+            self.assertNotIn("pending", panel)
+            history = report.history_row(latest)
+            self.assertNotIn("thread_churn", cast(dict[str, object], history["scaling"]))
+
+    def test_scaling_without_thread_churn_renders_a_pending_panel(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "latest.json"
+            self.write_json(source, latest)
+            site = root / "site"
+            report.render(source, FIXTURE / "history.jsonl", site, root / "digest", False)
+            panel = (site / report.THREAD_CHURN_PANEL).read_text(encoding="utf-8")
+            self.assertIn("pending", panel)
+            self.assertIn('id="thread-churn"', (site / "index.html").read_text(encoding="utf-8"))
+
+    def test_thread_churn_side_car_is_validated_against_its_raw_samples(self) -> None:
+        def churn_of(value: dict[str, object]) -> dict[str, object]:
+            return cast(
+                dict[str, object], cast(dict[str, object], value["scaling"])["thread_churn"]
+            )
+
+        def first_raw(value: dict[str, object]) -> dict[str, object]:
+            return cast(list[dict[str, object]], churn_of(value)["raw_samples"])[0]
+
+        def rejects(mutate: Callable[[dict[str, object]], object], pattern: str) -> None:
+            latest = self.with_thread_churn(self.load_latest())
+            mutate(latest)
+            with self.assertRaisesRegex(report.ReportError, pattern):
+                report.validate_scaling_report(latest["scaling"], "tampered thread churn")
+
+        rejects(
+            lambda value: cast(list[dict[str, object]], churn_of(value)["cell_summaries"])[
+                0
+            ].__setitem__("median_release_ms", 3000),
+            "differs from its raw samples",
+        )
+        rejects(
+            lambda value: cast(
+                list[int],
+                cast(dict[str, object], first_raw(value)["response"])["post_drain_rss_bytes"],
+            ).pop(),
+            "missing, early, or out of order",
+        )
+        rejects(
+            lambda value: cast(
+                list[int],
+                cast(dict[str, object], first_raw(value)["response"])["post_drain_offsets_ns"],
+            ).__setitem__(0, 1),
+            "missing, early, or out of order",
+        )
+        # The block must replay large-class-ephemeral's stream in the same run.
+        rejects(
+            lambda value: cast(dict[str, object], first_raw(value)["response"]).__setitem__(
+                "checksum", 1
+            ),
+            "does not replay large-class-ephemeral",
+        )
+        rejects(
+            lambda value: first_raw(value).__setitem__("operations_per_worker", 1),
+            "does not replay large-class-ephemeral",
+        )
+        rejects(
+            lambda value: churn_of(value).__setitem__("post_drain_offsets_ms", [100, 500]),
+            "unsupported thread-churn schema",
+        )
+        rejects(
+            lambda value: cast(list[object], churn_of(value)["raw_samples"]).pop(),
+            "expected 200 samples",
+        )
+        rejects(
+            lambda value: first_raw(value).__setitem__("thread_count", 4),
+            "misplaced",
+        )
+        # History rows are compact and never carry the side-car.
+        latest = self.with_thread_churn(self.load_latest())
+        history = report.history_row(latest)
+        compact = cast(dict[str, object], history["scaling"])
+        compact["thread_churn"] = churn_of(latest)
+        with self.assertRaisesRegex(report.ReportError, "unexpected=\\['thread_churn'\\]"):
+            report.validate_scaling_report(compact, "history", compact=True)
 
     def test_complete_scaling_publishes_one_dark_panel_per_pattern(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())
@@ -1912,8 +2267,210 @@ class BenchmarkReportTests(unittest.TestCase):
         self.assertGreaterEqual(float(throughput_domains[0].group(1)), 99_000_000.0)  # type: ignore[union-attr]
         self.assertGreaterEqual(float(rss_domains[0].group(1)), 9_900_000_000.0)  # type: ignore[union-attr]
         for svg in (*throughput, *rss):
-            self.assertEqual(svg.count("(supplemental)"), 1)
-            self.assertIn("P5-P95 empirical area", svg)
+            self.assertNotIn("P5", svg)
+            self.assertIn(f"median of n={report.DISTRIBUTION_BLOCKS}", svg)
+
+    def test_distribution_chart_overlays_every_allocator_median_on_one_panel(self) -> None:
+        # #507: one plot panel, one median line per allocator, a legend, and no
+        # P5-P95 area; the spread stays in latest.json and the dashboard table.
+        latest = self.with_complete_scaling(self.load_latest())
+        scaling = report.validate_scaling_report(latest["scaling"], "distribution fixture")
+        view = report.scaling_view_from_validated(scaling)
+        stroke = re.compile(r'<path [^>]*stroke="(#[0-9a-f]+)" stroke-width="([\d.]+)"')
+        for pattern in report.DISTRIBUTION_PATTERN_IDS:
+            for metric in ("throughput", "rss"):
+                with self.subTest(pattern=pattern, metric=metric):
+                    svg = report.distribution_stack_svg(view, pattern, metric).decode()
+                    self.assertEqual(svg.count(f'fill="{report.SCALING_INK["plot"]}"'), 1)
+                    # #534: the RSS panel adds one dashed floor path, never an allocator's.
+                    floors = svg.count('data-series="floor"')
+                    self.assertEqual(floors, 1 if metric == "rss" else 0)
+                    self.assertEqual(svg.count("<path "), len(report.ALLOCATOR_IDS) + floors)
+                    svg = re.sub(r'<path [^>]*data-series="floor"[^>]*/>', "", svg)
+                    strokes = stroke.findall(svg)
+                    self.assertEqual(len(strokes), len(report.ALLOCATOR_IDS))
+                    colors = {color for color, _width in strokes}
+                    for allocator in report.ALLOCATOR_IDS:
+                        self.assertIn(report.SCALING_SERIES[allocator], colors)
+                        self.assertIn(report.allocator_label(allocator), svg)
+                    self.assertNotIn("<polygon", svg)
+                    self.assertNotIn("fill-opacity", svg)
+                    self.assertNotIn("P5", svg)
+                    self.assertIn(f"median of n={report.DISTRIBUTION_BLOCKS}", svg)
+                    last_color, last_width = strokes[-1]
+                    self.assertEqual(last_color, report.SCALING_SERIES["mimalloc-pprof"])
+                    for _color, width in strokes[:-1]:
+                        self.assertGreater(float(last_width), float(width))
+
+    def floor_view(self) -> report.ScalingView:
+        latest = self.with_thread_churn(self.load_latest())
+        report.validate_latest(latest, "floor fixture")
+        scaling = report.validate_scaling_report(latest["scaling"], "floor fixture")
+        return report.scaling_view_from_validated(scaling)
+
+    @staticmethod
+    def path_ys(path: str) -> list[float]:
+        # "M x y L x y ...": every third token from the third is a y.
+        return [float(value) for value in path.split()[2::3]]
+
+    def test_distribution_rss_panels_draw_the_live_data_floor_under_every_line(self) -> None:
+        # #534: one dashed, allocator-independent floor per RSS panel (baseline +
+        # concurrent live requested bytes), on the shared domain, never above a line.
+        view = self.floor_view()
+        floor = re.compile(r'<path d="([^"]+)" [^>]*data-series="floor"')
+        allocator_paths = re.compile(r'<path d="([^"]+)" fill="none" stroke="(#[0-9a-f]+)"')
+        for pattern in report.DISTRIBUTION_PATTERN_IDS:
+            with self.subTest(pattern=pattern):
+                svg = report.distribution_stack_svg(view, pattern, "rss").decode()
+                self.assertIn(report.RSS_FLOOR_LABEL, svg)
+                self.assertIn("stroke-dasharray", svg)
+                match = floor.search(svg)
+                assert match is not None, "the RSS panel has no floor line"
+                floor_ys = self.path_ys(match.group(1))
+                self.assertEqual(len(floor_ys), len(view.thread_points))
+                floors = [
+                    item.floor_rss_bytes
+                    for item in sorted(view.rss_floors, key=lambda item: item.thread_count)
+                    if item.pattern == pattern
+                ]
+                self.assertIn(f'data-floor-bytes="{" ".join(str(value) for value in floors)}"', svg)
+                ceiling = float(
+                    cast(re.Match[str], re.search(r'data-y-domain-max="([^"]+)"', svg)).group(1)
+                )
+                self.assertLessEqual(max(floors), ceiling)
+                lines = [path for path, _color in allocator_paths.findall(svg)]
+                self.assertEqual(len(lines), len(report.ALLOCATOR_IDS))
+                for line in lines:
+                    # SVG y grows downward: on or below every allocator's median.
+                    for floor_y, line_y in zip(floor_ys, self.path_ys(line)):
+                        self.assertGreaterEqual(floor_y, line_y)
+
+    def test_floor_sits_in_the_allocator_legend_row_as_theoretical_minimum(self) -> None:
+        # Owner request: the floor is a legend entry beside the allocators, labelled
+        # "theoretical minimum", on every chart that draws it.
+        view = self.floor_view()
+        assert view.thread_churn is not None
+        svgs = [
+            report.distribution_stack_svg(view, pattern, "rss").decode()
+            for pattern in report.DISTRIBUTION_PATTERN_IDS
+        ] + [report.thread_churn_svg(view, 1300).decode()]
+        text_y = re.compile(r'<text x="([\d.]+)" y="([\d.]+)"[^>]*>([^<]+)</text>')
+        for svg in svgs:
+            labels: dict[str, tuple[float, str]] = {}
+            for x, y, label in text_y.findall(svg):
+                # First occurrence: the legend row precedes the churn chart's table.
+                labels.setdefault(label, (float(x), y))
+            self.assertEqual(report.RSS_FLOOR_LEGEND_LABEL, "theoretical minimum")
+            self.assertIn(report.RSS_FLOOR_LEGEND_LABEL, labels)
+            fork = labels[report.allocator_label("mimalloc-pprof")]
+            floor = labels[report.RSS_FLOOR_LEGEND_LABEL]
+            self.assertEqual(floor[1], fork[1], "same legend row as the allocators")
+            self.assertGreater(floor[0], fork[0], "after the last allocator")
+            self.assertLess(
+                floor[0] + 7.4 * len(report.RSS_FLOOR_LEGEND_LABEL), report.DISTRIBUTION_WIDTH
+            )
+
+    def test_throughput_panels_never_draw_the_floor(self) -> None:
+        view = self.floor_view()
+        for pattern in report.DISTRIBUTION_PATTERN_IDS:
+            svg = report.distribution_stack_svg(view, pattern, "throughput").decode()
+            self.assertNotIn(report.RSS_FLOOR_LABEL, svg)
+            self.assertNotIn('data-series="floor"', svg)
+            self.assertNotIn("data-floor-bytes", svg)
+
+    def test_thread_churn_chart_draws_the_baseline_floor(self) -> None:
+        # After the drain nothing is live: the floor is the smallest baseline, flat.
+        view = self.floor_view()
+        assert view.thread_churn is not None
+        svg = report.thread_churn_svg(view, 1300).decode()
+        self.assertIn(report.RSS_FLOOR_LABEL, svg)
+        churn = next(
+            item for item in view.rss_floors if item.pattern == report.THREAD_CHURN_PATTERN
+        )
+        self.assertEqual(churn.peak_live_requested_bytes, 0)
+        self.assertIn(f'data-floor-bytes="{churn.floor_rss_bytes}"', svg)
+        line = re.search(
+            r'<line [^>]*y1="([\d.]+)" [^>]*y2="([\d.]+)" [^>]*data-series="floor"', svg
+        )
+        assert line is not None, "the thread-churn chart has no floor line"
+        self.assertEqual(line.group(1), line.group(2))
+        for path in re.findall(r'<path d="([^"]+)" fill="none" stroke="#', svg):
+            self.assertTrue(all(float(line.group(1)) >= y for y in self.path_ys(path)))
+
+    def test_rss_floor_is_validated_against_raw_samples_and_measured_peaks(self) -> None:
+        def floors_of(value: dict[str, object]) -> list[dict[str, object]]:
+            scaling = cast(dict[str, object], value["scaling"])
+            return cast(
+                list[dict[str, object]], cast(dict[str, object], scaling["rss"])["floor_summaries"]
+            )
+
+        good = self.with_thread_churn(self.load_latest())
+        report.validate_scaling_report(good["scaling"], "floor fixture")
+
+        tampered = copy.deepcopy(good)
+        floors_of(tampered)[0]["floor_rss_bytes"] = (
+            cast(int, floors_of(tampered)[0]["floor_rss_bytes"]) + 1
+        )
+        with self.assertRaisesRegex(report.ReportError, "floor"):
+            report.validate_scaling_report(tampered["scaling"], "tampered floor")
+
+        missing = copy.deepcopy(good)
+        del cast(dict[str, object], cast(dict[str, object], missing["scaling"])["rss"])[
+            "floor_summaries"
+        ]
+        with self.assertRaisesRegex(report.ReportError, "floor_summaries"):
+            report.validate_scaling_report(missing["scaling"], "missing floors")
+
+        # A floor above what an allocator was measured at can only be a
+        # measurement bug: the run fails instead of drawing it.
+        above = copy.deepcopy(good)
+        scaling = cast(dict[str, object], above["scaling"])
+        for sample in cast(list[dict[str, object]], scaling["raw_samples"]):
+            if sample["pattern"] == "random-large" and sample["thread_count"] == 1:
+                sample["diagnostic_peak_live_requested_bytes"] = 500 * MIB
+        churn = cast(dict[str, object], scaling["thread_churn"])
+        cast(dict[str, object], scaling["rss"])["floor_summaries"] = rss_floors(
+            cast(list[dict[str, object]], scaling["raw_samples"]),
+            cast(list[dict[str, object]], churn["raw_samples"]),
+        )
+        with self.assertRaisesRegex(report.ReportError, "above"):
+            report.validate_scaling_report(above["scaling"], "floor above a peak")
+
+    def test_v1_rss_side_car_without_floors_still_validates_and_renders(self) -> None:
+        latest = self.with_complete_scaling(self.load_latest())
+        rss = cast(dict[str, object], cast(dict[str, object], latest["scaling"])["rss"])
+        rss["metric_schema_version"] = report.LEGACY_SCALING_RSS_SCHEMA
+        del rss["floor_summaries"]
+        scaling = report.validate_scaling_report(latest["scaling"], "v1 side-car")
+        view = report.scaling_view_from_validated(scaling)
+        self.assertEqual(view.rss_floors, ())
+        svg = report.distribution_stack_svg(view, "random-large", "rss").decode()
+        self.assertNotIn(report.RSS_FLOOR_LABEL, svg)
+        self.assertIn("<td>-</td>", report.render_scaling_html(view))
+
+    def test_distribution_table_reports_the_floor_and_peak_over_floor(self) -> None:
+        view = self.floor_view()
+        page = report.render_scaling_html(view)
+        self.assertIn("<th>Floor MiB</th>", page)
+        self.assertIn("<th>Peak RSS P50 &#247; floor</th>", page)
+        floor = next(
+            item
+            for item in view.rss_floors
+            if item.pattern == "random-large" and item.thread_count == 8
+        )
+        cell = next(
+            item
+            for item in view.rss_cells
+            if item.pattern == "random-large"
+            and item.thread_count == 8
+            and item.allocator_id == "tcmalloc"
+        )
+        self.assertIn(
+            f"<td>{report.format_mib(floor.floor_rss_bytes)}</td>"
+            f"<td>{cell.median / floor.floor_rss_bytes:.2f}x</td>",
+            page,
+        )
+        self.assertIn(report.RSS_FLOOR_LABEL, page)
 
     def test_scaling_report_rejects_raw_values_that_disagree_with_summaries(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())
@@ -2088,6 +2645,8 @@ class BenchmarkReportTests(unittest.TestCase):
         rss["cell_summaries"] = [
             item for item in rss_summaries if isinstance(item, dict) and item["pattern"] in legacy
         ]
+        # #534: no legacy pattern replays live telemetry, so there is no floor.
+        rss["floor_summaries"] = []
 
         report.validate_latest(latest, "legacy four-pattern lineage")
         self.assertEqual(legacy, set(report.scaling_patterns_of(scaling)))

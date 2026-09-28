@@ -59,17 +59,18 @@ MIMALLOC_PROF_SAMPLE_INTERVAL=524288 \
 | `MIMALLOC_PROF_BT_MAX=32` | Maximum captured stack depth (compile-time cap 128) |
 | `MIMALLOC_PROF_MAX_BYTES=N` | Bound persistent profiler arena memory |
 | `MIMALLOC_PROF_SEED=N` | Deterministic sampling, for repeatable tests (see the note below) |
-| `MIMALLOC_PROF_DUMP_FORMAT=proto` | Meant to write pprof `profile.proto` instead of text. **Known issue:** ignored today (see below) |
+| `MIMALLOC_PROF_DUMP_FORMAT=proto` | Write pprof `profile.proto` instead of text. Releases up to 1.0.0 ignore it (see note below) |
 
 `MIMALLOC_PROF_SAMPLE_RATE` remains a compatibility alias for
 `MIMALLOC_PROF_SAMPLE_INTERVAL`; when both are set, `..._INTERVAL` wins.
 
-**Known issue: `MIMALLOC_PROF_DUMP_FORMAT` is ignored.** Both places that read it pass a
-32-byte buffer, and `_mi_getenv` rejects any buffer under 64 bytes, so `=proto` still
-produces a text exit dump. When the variable is set, a FALLBACK-mode `mi_prof_start_ex`
-also skips its own `dump_format`. Until that is fixed, get a `profile.proto` exit dump
-with `dump_format = MI_PROF_FORMAT_PROTO` in a `mi_prof_config_t` (OVERRIDE mode, or
-FALLBACK with the variable unset), or call `mi_prof_dump_proto` yourself.
+Builds with the [#549](https://github.com/zackees/mimalloc-pprof/issues/549) fix honor
+`MIMALLOC_PROF_DUMP_FORMAT`. Releases up to 1.0.0 predate that fix and ignore it, so an
+environment-driven exit dump is always text there. On those builds, set
+`dump_format = MI_PROF_FORMAT_PROTO` in an `MI_PROF_CONFIG_OVERRIDE` config for
+`mi_prof_start_ex`, or call `mi_prof_dump_proto` yourself. The same builds also let a
+FALLBACK config's `dump_at_exit` win over a `MIMALLOC_PROF_DUMP_AT_EXIT` path of 64 or
+more characters.
 
 **What `MIMALLOC_PROF_SEED` guarantees.** Two runs of the same workload with the same
 seed sample at the same points, **provided the threads are created in the same order** —

@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 040ba331 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 179880b7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -716,6 +716,7 @@ typedef enum mi_option_e {
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
+  mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2741,6 +2742,24 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #define MI_ARENA_PURGE_MULT_DEFAULT       (4)
 #endif
 
+// #506: ... but only a freed range of MORE than this many slices (a large or singleton page) gets
+// that long window. A range of at most this many (default: a small or medium page, 1 or 8 slices)
+// keeps the short one of one to two `purge_delay`s, as before #486: a server workload (larson:
+// 8-1000 B blocks freed by other threads) churns small pages through the arena, and holding each
+// one four times longer raised its peak RSS 10-30% over Bun's mimalloc, while #486's refaults were
+// all large ones (the bursty row). 0 gives every range the long window (the #486 behaviour).
+#ifndef MI_ARENA_RETAIN_SHORT_MAX_SLICES
+#define MI_ARENA_RETAIN_SHORT_MAX_SLICES  (MI_MEDIUM_PAGE_SIZE / MI_ARENA_SLICE_SIZE)
+#endif
+// #506: ... and so does the singleton page a growing realloc moved its block out of
+// (`_mi_realloc_free_old`): a Vec that doubles never asks for the size it outgrew, and holding
+// each outgrown buffer for the long window kept a growing buffer's peak at three times its size
+// instead of two (+10-18% peak RSS on perf-ab's larson rows, whose per-table log grows so). 0 gives
+// the outgrown buffer the long window (the #486 behaviour).
+#ifndef MI_REALLOC_RETAIN_SHORT
+#define MI_REALLOC_RETAIN_SHORT           (1)
+#endif
+
 // #493 (strategy 9): a new page first tries to claim free slices that are still resident (queued
 // for purge, see above) before the plain free-slice search, which knows nothing of residency and
 // would often fault in fresh or purged memory instead. At most this many queued runs long enough
@@ -2749,6 +2768,70 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // mostly stale, so the plain search is the better bet. Keeps the extra cost per page small.
 #ifndef MI_RESIDENT_FIRST_MAX_TRIES
 #define MI_RESIDENT_FIRST_MAX_TRIES       (8)
+#endif
+
+// #517: resident-first (#493) is only tried for claims of at least this many slices (default 16
+// = 1 MiB with 64 KiB slices: large and singleton pages). A small or medium page taking the first
+// queued run that fits bypasses the size-binned chunk layout of the plain search, so other size
+// classes' reusable runs are consumed and those classes spill into fresh chunks: the memory gate
+// peak rose 58.2 -> 61-63.7 MB (#514). Measured: >=16 restores 58.3 MB; #501's short-lived-thread
+// win comes from 4 MiB large pages (64 slices), which stay covered.
+#ifndef MI_RESIDENT_FIRST_MIN_SLICES
+#define MI_RESIDENT_FIRST_MIN_SLICES      (16)
+#endif
+
+// #532: a large page (blocks of ~84-512 KiB) is sized from what its size class ("bin") demands on
+// the theap that creates it, not fixed at MI_LARGE_PAGE_SIZE (src/large-span.c). Every thread used
+// to hold one 4 MiB page per large bin it touched, 98-99% of it never formed (#529, E4): about
+// 44 MiB per worker whatever its live bytes. A bin's page starts at a compact span; the span grows
+// geometrically up to MI_LARGE_PAGE_SIZE while that theap keeps filling the bin's pages, and decays
+// again when it stops. The accounting is per theap and per bin, kept in slow paths only (page full,
+// page creation); no thread count and no clock go into it. Compile-time opt-out: MI_LARGE_SPAN=0;
+// run-time: `mi_option_large_span` (MIMALLOC_LARGE_SPAN=0). Both give every large page 4 MiB.
+#ifndef MI_LARGE_SPAN
+#define MI_LARGE_SPAN                     (MI_ENABLE_LARGE_PAGES)
+#endif
+// the span of a bin's page before the theap has shown any demand beyond one page: 16 slices is
+// 1 MiB with 64 KiB slices (= MI_RESIDENT_FIRST_MIN_SLICES, so resident-first still applies), which
+// two blocks of every large bin fit in (see MI_LARGE_SPAN_MIN_BLOCKS)
+#ifndef MI_LARGE_SPAN_COMPACT_SLICES
+#define MI_LARGE_SPAN_COMPACT_SLICES      (16)
+#endif
+// each demand step multiplies the span by 2^MI_LARGE_SPAN_GROW_SHIFT (1: 1 -> 2 -> 4 MiB)
+#ifndef MI_LARGE_SPAN_GROW_SHIFT
+#define MI_LARGE_SPAN_GROW_SHIFT          (1)
+#endif
+// A page request comes when a bin has no page with a free block left on the theap. It is "full"
+// when a page of the bin filled up since the previous request (demand beyond what the theap holds)
+// and "quiet" otherwise (the bin's last page emptied and went away). The bin keeps a pressure
+// count, +1 per full and -1 per quiet request: the span steps up once it reaches
+// MI_LARGE_SPAN_GROW_REQUESTS and down once it reaches -MI_LARGE_SPAN_DECAY_REQUESTS. So a bin
+// that keeps filling its pages grows (every second request), while a single overflow -- one more
+// live block than a compact page holds, once -- does not (#532: on perf-ab's large-class rows the
+// top bins, two blocks per compact page, grew to 4 MiB on every such blip). At most 7 and 8.
+#ifndef MI_LARGE_SPAN_GROW_REQUESTS
+#define MI_LARGE_SPAN_GROW_REQUESTS       (2)
+#endif
+#ifndef MI_LARGE_SPAN_DECAY_REQUESTS
+#define MI_LARGE_SPAN_DECAY_REQUESTS      (4)
+#endif
+// a span always holds at least this many blocks, even when the page meta and a guard page sit in
+// it (an OS-allocated fallback page, MI_SECURE>=5): a page with one block would be a singleton
+#ifndef MI_LARGE_SPAN_MIN_BLOCKS
+#define MI_LARGE_SPAN_MIN_BLOCKS          (2)
+#endif
+// capacity of the per-theap table (the large bins: 11 with 64 KiB slices, fewer on 32-bit); a bin
+// past it just gets MI_LARGE_PAGE_SIZE
+#define MI_LARGE_SPAN_BINS                (16)
+
+#if MI_LARGE_SPAN
+// The demand accounting of one large bin on one theap (src/large-span.c), packed in one byte:
+// bits 0-2 the level (the span is MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT),
+// capped at MI_LARGE_PAGE_SIZE), bit 3 "a page of the bin filled up since the last page request",
+// bits 4-7 the pressure count, 4-bit two's complement (see MI_LARGE_SPAN_GROW_REQUESTS; 0 = none). One byte because
+// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes
+// keep it there, 64 would not.
+typedef uint8_t mi_large_span_bin_t;
 #endif
 
 
@@ -3149,6 +3232,9 @@ struct mi_theap_s {
   mi_page_queue_t       pages[MI_BIN_COUNT];                 // queue of pages for each size class (or "bin")
   mi_memid_t            memid;                               // provenance of the theap struct itself (meta or os)
   mi_stats_t            stats;                               // thread-local statistics
+  #if MI_LARGE_SPAN
+  mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
+  #endif
 };
 
 
@@ -3432,7 +3518,8 @@ typedef struct mi_arena_s {
   bool                is_exclusive;         // only allow allocations if specifically for this arena
   bool                is_auto_reserved;     // created by mi_arena_reserve, not a public reserve/manage API
   mi_decl_align(8)                          // needed on some 32-bit platforms
-  _Atomic(mi_msecs_t) purge_expire;         // expiration time when slices can be purged from `slices_purge`.
+  _Atomic(mi_msecs_t) purge_expire;         // the next purge pass: every `purge_delay` while anything is queued for purge
+  _Atomic(mi_msecs_t) purge_long_expire;    // #506: the deadline of the long-window queue (`slices_purge` / `_aged`), `arena_purge_mult` x `purge_delay` apart
   mi_commit_fun_t*    commit_fun;           // custom commit/decommit memory
   void*               commit_fun_arg;       // user argument for a custom commit function
 
@@ -3442,8 +3529,10 @@ typedef struct mi_arena_s {
   mi_bbitmap_t*       slices_free;          // is the slice free? (a binned bitmap with size classes)
   mi_bitmap_t*        slices_committed;     // is the slice committed? (i.e. accessible)
   mi_bitmap_t*        slices_dirty;         // is the slice potentially non-zero?
-  mi_bitmap_t*        slices_purge;         // slices that can be purged
+  mi_bitmap_t*        slices_purge;         // slices that can be purged (long window: large and singleton pages, #486)
   mi_bitmap_t*        slices_purge_aged;    // #457: ... and were already queued at the previous purge deadline
+  mi_bitmap_t*        slices_purge_short;   // #506: slices that can be purged (short window: small and medium pages, outgrown realloc buffers)
+  mi_bitmap_t*        slices_purge_short_aged; // #506: ... and were already queued at the previous purge pass
   mi_page_t*          pages_meta;           // pre-allocated `slice_count` page meta info -- only used if `MI_PAGE_META_IS_SEPARATED!=0`
   mi_arena_pages_t    pages_main;           // arena page bitmaps for the main heap are allocated up front as well
 
@@ -4980,10 +5069,15 @@ void          _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx /
 void          _mi_arenas_abandoned_page_free(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);  // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #271)
 void          _mi_arenas_page_abandon(mi_page_t* page, mi_theap_t* current_theap);
 bool          _mi_arenas_page_reserve(mi_page_t* page, mi_theap_t* current_theap);   // #493: keep an empty large page for the next thread; false: the caller frees it
+void          _mi_realloc_free_old(const mi_page_t* page, void* p, bool grown);        // #506: free the block a moving realloc left behind
 bool          _mi_arenas_release_reserved(mi_heap_t* heap, bool force);             // #493: free the reserved pages past their window (all if `force`); true while one is not
 void          _mi_arenas_page_unabandon(mi_page_t* page, mi_theap_t* current_theapx /* can be NULL */);
 bool          _mi_arenas_page_try_reabandon_to_mapped(mi_page_t* page);
 void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);  // Bun parity P10b, #317: frees the on-demand abandoned bitmaps then `arena_pages` itself
+
+// "large-span.c" (#532): demand-sized large-page spans (stubs when MI_LARGE_SPAN=0)
+size_t        _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead);  // the span of the theap's next page of this large bin (a page request)
+void          _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page);             // a page of the theap filled up
 
 // "page-map.c"
 bool          _mi_page_map_init(void);
@@ -5115,6 +5209,9 @@ bool        _mi_prof_maps_append(_mi_prof_dump_append_fun* append, void* arg);
 bool        _mi_prof_maps_visit(mi_prof_module_visit_fun* visitor, void* arg);
 void        _mi_prof_process_init(void);
 void        _mi_prof_process_done(void);
+// #550: drop the sample records of a heap whose pages are released without per-block frees
+// (`_mi_heap_force_destroy`), like `_mi_dhat_forget_heap`. Takes `prof_lock`; allocates nothing.
+void        _mi_prof_forget_heap(mi_heap_t* heap);
 // #270: fork-safety -- quiesce/reset `prof_lock` around fork(). Child-side policy:
 // continue (profiler records are ordinary process memory, safe copy-on-write across
 // fork; only the lock itself needs resetting). See fork.c's lock-order block.
@@ -6003,6 +6100,21 @@ void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner rese
 void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
 long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
+
+// #517: arena slice claims by kind, counted process-wide in `mi_arena_try_alloc_at` when
+// MI_DIAGNOSTICS=1. `plain_fresh` is a plain-search claim that includes at least one slice that
+// was never dirty (never handed out before); its `_slices` counts only those never-dirty slices.
+typedef struct mi_arena_claim_counters_s {
+  size_t resident_first_claims;
+  size_t resident_first_slices;
+  size_t plain_reused_claims;
+  size_t plain_reused_slices;
+  size_t plain_fresh_claims;
+  size_t plain_fresh_slices;
+} mi_arena_claim_counters_t;
+bool          _mi_arena_claim_counters(mi_arena_claim_counters_t* out);   // false (and *out zeroed) when not compiled in (MI_DIAGNOSTICS=0)
+void          _mi_arena_claim_counters_reset(void);
+
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
 bool          _mi_page_purge_os_page_blocks(size_t os_page_size, size_t block_size, uintptr_t page_start,
@@ -6026,6 +6138,53 @@ void          _mi_page_holes_assert_valid(const mi_page_t* page);   // MI_DEBUG 
    with a live block cannot be discarded, and this says how much of that there is and how
    few live blocks are holding it down.
    ------------------------------------------------------ */
+
+/* ------------------------------------------------------
+   Arena layout walk (#519, the rest of #517 item 2; `src/arena-layout.c`)
+
+   Per arena chunk: every data slice classified by the `slices_free` / `slices_dirty` /
+   `slices_purge` / `slices_purge_aged` bitmaps, and the maximal runs of each class inside the
+   chunk, summarised by the chunk's size class (`mi_chunkbin_t`, the bin the `slices_free`
+   bbitmap assigned it) with power-of-two run-length histograms. It is the table that located
+   #514 (small claims spilling into fresh chunks). Read-only, no memory, relaxed bitmap reads
+   only; compiled in with MI_DIAGNOSTICS=1, otherwise the walk zeroes its output and returns false.
+   ------------------------------------------------------ */
+
+typedef enum mi_arena_layout_kind_e {
+  MI_ARENA_LAYOUT_IN_USE,        // not in `slices_free`: a page (or a direct arena allocation) holds it
+  MI_ARENA_LAYOUT_FRESH,         // free and never dirty: costs nothing
+  MI_ARENA_LAYOUT_FREE_DIRTY,    // free, dirty, not queued for purge (purged earlier by reset, or never purgeable)
+  MI_ARENA_LAYOUT_QUEUED,        // free and queued for purge (`slices_purge`): still resident
+  MI_ARENA_LAYOUT_QUEUED_AGED,   // free and queued since the previous purge deadline (`slices_purge_aged`)
+  MI_ARENA_LAYOUT_KIND_COUNT
+} mi_arena_layout_kind_t;
+
+// Run lengths in slices, one power of two per bucket: 1, 2-3, 4-7, ..., up to MI_BCHUNK_BITS
+// (a run never crosses a chunk, so the last bucket holds exactly the whole-chunk runs).
+#define MI_ARENA_LAYOUT_RUN_BUCKETS  (MI_BCHUNK_BITS_SHIFT + 1)
+
+typedef struct mi_arena_layout_class_s {
+  size_t chunks;                                          // chunks in this size class
+  size_t slices[MI_ARENA_LAYOUT_KIND_COUNT];              // data slices of each kind
+  size_t committed_slices[MI_ARENA_LAYOUT_KIND_COUNT];    // of those, in `slices_committed` (address space on POSIX, see below)
+  size_t runs[MI_ARENA_LAYOUT_KIND_COUNT];                // maximal runs of each kind inside a chunk
+  size_t max_run[MI_ARENA_LAYOUT_KIND_COUNT];             // the longest such run, in slices
+  size_t run_hist[MI_ARENA_LAYOUT_KIND_COUNT][MI_ARENA_LAYOUT_RUN_BUCKETS];   // runs by floor(log2(length))
+} mi_arena_layout_class_t;
+
+typedef struct mi_arena_layout_s {
+  size_t arenas;                                  // arenas walked
+  size_t chunks;                                  // chunks walked (all classes)
+  size_t meta_slices;                             // the arenas' own info slices: not classified
+  mi_arena_layout_class_t cls[MI_CBIN_COUNT];     // by the chunk's size class, `mi_chunkbin_t` order
+} mi_arena_layout_t;
+
+// Walk every arena of `subproc` (or only `arena`, when not NULL) into `*out` (zeroed first).
+// Returns false when not compiled in (MI_DIAGNOSTICS=0). The caller must keep the arenas alive:
+// be inside the allocator (as `_mi_purge_holes_report_collect` is) or know no reclaim can run.
+bool          _mi_arena_layout_walk(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_layout_t* out);
+size_t        _mi_arena_layout_bucket(size_t run_slices);   // the `run_hist` bucket of a run length
+void          _mi_arena_layout_print(const mi_arena_layout_t* layout);
 
 #define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
 #define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
@@ -6075,6 +6234,10 @@ typedef struct mi_holes_report_s {
   size_t arena_free_dirty_bytes;     // slices in NO page that were touched at least once: the UPPER bound on arena slack still resident
   size_t arena_purge_pending_bytes;  // slices in NO page, scheduled for purge but not purged yet: definitely still resident (the purge delay)
   size_t arena_meta_bytes;           // the arenas' own bitmaps (`info_slices`) -- ROUGH: excludes the `mi_meta` heaps
+
+  // #519: the arena layout walk -- the slack above, broken down per chunk size class into runs.
+  // All zero unless MI_DIAGNOSTICS=1.
+  mi_arena_layout_t arena_layout;
 } mi_holes_report_t;
 
 size_t        mi_holes_granularity(size_t g);
@@ -9137,7 +9300,7 @@ static mi_decl_forceinline void* mi_theap_realloc_zero_ex(mi_theap_t* theap, voi
     if mi_likely(p != NULL) {
       mi_track_mem_defined(p,copy_size);  // _mi_useable_size may be too large for byte precise memory tracking..
       _mi_memcpy_aligned(newp, p, copy_size);
-      mi_free(p); // only free the original pointer if successful
+      _mi_realloc_free_old(page, p, newsize > size); // only free the original pointer if successful (#506: an outgrown buffer, see there)
     }
   }
   if (memevt_is_resize) {
@@ -10832,9 +10995,10 @@ bool _mi_bitmap_forall_setc_ranges(mi_bitmap_t* bitmap, mi_forall_set_fun_t* vis
 // Ranges will never cross chunk boundaries (and `slice_count <= MI_BCHUNK_BITS`).
 bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
-// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in `bitmap | bitmap2`
-// (`bitmap2` may be NULL), in index order, WITHOUT clearing them. Runs never cross a chunk.
-bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
+// #493: visit each maximal run of at least `n <= MI_BCHUNK_BITS` bits set in the union of the
+// `count` bitmaps (all of one size; #506: the arena's four purge queues), in index order,
+// WITHOUT clearing them. Runs never cross a chunk.
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* const* bitmaps, size_t count, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg);
 
 // Count all set bits in given range in the bitmap.
 size_t mi_bitmap_popcountN( mi_bitmap_t* bitmap, size_t idx, size_t n);
@@ -11165,6 +11329,7 @@ static size_t mi_page_full_size(mi_page_t* page) {
 // (`mi_bbitmap_try_find_and_clearN`) knows nothing of that and, measured on short-lived threads,
 // mostly handed out fresh or already purged slices while such ranges were waiting -- growing RSS
 // and zero-fill faulting the new range. So first try the queued runs, in index order.
+// Limited to claims of at least MI_RESIDENT_FIRST_MIN_SLICES slices (#517).
 typedef struct mi_resident_claim_s {
   size_t slice_count;   // wanted
   size_t tries;         // queued runs tried so far (at most MI_RESIDENT_FIRST_MAX_TRIES)
@@ -11188,6 +11353,8 @@ static bool mi_arena_resident_claim_visitor(size_t slice_index, size_t slice_cou
 }
 
 static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, size_t* slice_index) {
+  // Small and medium pages keep the size-binned plain search (MI_RESIDENT_FIRST_MIN_SLICES, #517).
+  if (slice_count < MI_RESIDENT_FIRST_MIN_SLICES) return false;
   // A pinned arena is never purged (all of it is resident); a range of more than a chunk is
   // beyond `mi_bbitmap_try_claimN`.
   if (arena->memid.is_pinned || slice_count > MI_BCHUNK_BITS) return false;
@@ -11204,9 +11371,11 @@ static bool mi_arena_try_claim_resident(mi_arena_t* arena, size_t slice_count, s
   // sampling is a debugging mode; it takes the plain search.
   if (mi_option_get(mi_option_guarded_sample_rate) != 0) return false;
   #endif
-  // young | aged: a range freed in two steps is one run even when half of it has aged
+  // young | aged: a range freed in two steps is one run even when half of it has aged; and both
+  // queues (#506): a freed medium page next to a freed large one is one resident run too
+  mi_bitmap_t* const queues[4] = { arena->slices_purge, arena->slices_purge_aged, arena->slices_purge_short, arena->slices_purge_short_aged };
   mi_resident_claim_t rc = { slice_count, 0, 0, false };
-  _mi_bitmap_forall_set_runsN(arena->slices_purge, arena->slices_purge_aged, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
+  _mi_bitmap_forall_set_runsN(queues, 4, slice_count, &mi_arena_resident_claim_visitor, arena, &rc);
   if (rc.claimed) { *slice_index = rc.slice_index; }
   return rc.claimed;
 }
@@ -11223,6 +11392,69 @@ static void mi_arena_unqueue_purge(mi_arena_t* arena, size_t slice_index, size_t
   if (!mi_bitmap_is_clearN(arena->slices_purge_aged, slice_index, slice_count)) {
     mi_bitmap_clearN(arena->slices_purge_aged, slice_index, slice_count);
   }
+  if (!mi_bitmap_is_clearN(arena->slices_purge_short, slice_index, slice_count)) {   // #506
+    mi_bitmap_clearN(arena->slices_purge_short, slice_index, slice_count);
+  }
+  if (!mi_bitmap_is_clearN(arena->slices_purge_short_aged, slice_index, slice_count)) {
+    mi_bitmap_clearN(arena->slices_purge_short_aged, slice_index, slice_count);
+  }
+}
+
+// #517: slice claims by kind (see `mi_arena_claim_counters_t`). Diagnostics builds only.
+#if MI_DIAGNOSTICS
+static _Atomic(size_t) mi_arena_claims_resident_first;
+static _Atomic(size_t) mi_arena_claims_resident_first_slices;
+static _Atomic(size_t) mi_arena_claims_plain_reused;
+static _Atomic(size_t) mi_arena_claims_plain_reused_slices;
+static _Atomic(size_t) mi_arena_claims_plain_fresh;
+static _Atomic(size_t) mi_arena_claims_plain_fresh_slices;
+
+// Must run before the claim sets the range's dirty bits: a never-dirty slice is a fresh one.
+static void mi_arena_count_claim(mi_arena_t* arena, size_t slice_index, size_t slice_count, bool resident) {
+  if (resident) {
+    mi_atomic_add_relaxed(&mi_arena_claims_resident_first, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_resident_first_slices, slice_count);
+    return;
+  }
+  const size_t dirty = mi_bitmap_popcountN(arena->slices_dirty, slice_index, slice_count);
+  mi_assert_internal(dirty <= slice_count);
+  const size_t fresh = slice_count - dirty;
+  if (fresh > 0) {
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_fresh, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_fresh_slices, fresh);
+  }
+  else {
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_reused, (size_t)1);
+    mi_atomic_add_relaxed(&mi_arena_claims_plain_reused_slices, slice_count);
+  }
+}
+#endif
+
+bool _mi_arena_claim_counters(mi_arena_claim_counters_t* out) {
+  if (out == NULL) return false;
+  #if MI_DIAGNOSTICS
+  out->resident_first_claims = mi_atomic_load_relaxed(&mi_arena_claims_resident_first);
+  out->resident_first_slices = mi_atomic_load_relaxed(&mi_arena_claims_resident_first_slices);
+  out->plain_reused_claims   = mi_atomic_load_relaxed(&mi_arena_claims_plain_reused);
+  out->plain_reused_slices   = mi_atomic_load_relaxed(&mi_arena_claims_plain_reused_slices);
+  out->plain_fresh_claims    = mi_atomic_load_relaxed(&mi_arena_claims_plain_fresh);
+  out->plain_fresh_slices    = mi_atomic_load_relaxed(&mi_arena_claims_plain_fresh_slices);
+  return true;
+  #else
+  _mi_memzero(out, sizeof(*out));
+  return false;
+  #endif
+}
+
+void _mi_arena_claim_counters_reset(void) {
+  #if MI_DIAGNOSTICS
+  mi_atomic_store_relaxed(&mi_arena_claims_resident_first, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_resident_first_slices, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_reused, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_reused_slices, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_fresh, (size_t)0);
+  mi_atomic_store_relaxed(&mi_arena_claims_plain_fresh_slices, (size_t)0);
+  #endif
 }
 
 static mi_decl_noinline void* mi_arena_try_alloc_at(
@@ -11231,9 +11463,14 @@ static mi_decl_noinline void* mi_arena_try_alloc_at(
   mi_assert_internal(arena!=NULL);
   mi_assert_internal(slice_count>0);
   size_t slice_index;
-  if (!mi_arena_try_claim_resident(arena, slice_count, &slice_index) &&
-      !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
+  const bool resident = mi_arena_try_claim_resident(arena, slice_count, &slice_index);
+  if (!resident && !mi_bbitmap_try_find_and_clearN(arena->slices_free, tseq, slice_count, &slice_index)) return NULL;
   if (!arena->memid.is_pinned) { mi_arena_unqueue_purge(arena, slice_index, slice_count); }
+  #if MI_DIAGNOSTICS
+  mi_arena_count_claim(arena, slice_index, slice_count, resident);   // before the dirty bits are set below
+  #else
+  MI_UNUSED(resident);
+  #endif
 
   // claimed it!
   void* p = mi_arena_slice_start(arena, slice_index);
@@ -11760,6 +11997,11 @@ static mi_page_t* mi_arenas_page_try_find_abandoned(mi_theap_t* theap, size_t sl
         mi_theap_stat_counter_increase(theap, pages_reclaim_on_alloc, 1);
 
         _mi_page_free_collect(page, false);  // update `used` count
+        // #532 (from #443's 8b569e56): the page was found by BIN, and the pages of a large bin do
+        // not all have one span (src/large-span.c). The caller's `slice_count` is only what a FRESH
+        // page of this bin would get; validating the claimed page over it would run past the end
+        // of a smaller page, into slices that belong to no page. Validate the page's own range.
+        (void)mi_page_arena_pages(page, &slice_index, &slice_count, NULL);
         mi_assert_internal(mi_bbitmap_is_clearN(arena->slices_free, slice_index, slice_count));
         mi_assert_internal(mi_page_slice_committed(page) > 0 || mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
         mi_assert_internal(mi_bitmap_is_setN(arena->slices_dirty, slice_index, slice_count));
@@ -11869,7 +12111,8 @@ static size_t mi_page_block_start(size_t block_size, bool os_align)
 // anymore, since the unpublish that happens inside it (the arena_pages->pages bit clear,
 // or, for an OS page, the caller's unlink from `heap->os_abandoned_pages` before calling
 // this) is what a concurrent `mi_heap_delete` waits for before it frees the heap.
-static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_arena_pages_t* arena_pages);
+static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_arena_pages_t* arena_pages, bool retain_short);
+static void mi_arenas_free_ex(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid, bool retain_short);
 
 // Allocate a fresh page
 static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_count, size_t block_size, size_t block_alignment, bool commit)
@@ -12016,7 +12259,7 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
 
   // register in the page map
   if mi_unlikely(!_mi_page_map_register(page)) {
-    mi_arenas_page_free_prim(page, _mi_theap_subproc(theap), arena_pages);
+    mi_arenas_page_free_prim(page, _mi_theap_subproc(theap), arena_pages, false);
     return NULL;
   }
 
@@ -12099,7 +12342,17 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   }
   #if MI_ENABLE_LARGE_PAGES
   else if (block_size <= MI_LARGE_MAX_OBJ_SIZE) {
+    #if MI_LARGE_SPAN
+    // #532: the span comes from the bin's demand on this theap (src/large-span.c). The overhead is
+    // the worst case (an OS fallback page carries its meta in front, MI_SECURE>=5 a guard page).
+    size_t overhead = mi_page_block_start(block_size, false);
+    #if MI_SECURE>=5
+    overhead += _mi_os_secure_guard_page_size();
+    #endif
+    page = mi_arenas_page_regular_alloc(theap, _mi_large_span_slices(theap, block_size, overhead), block_size);
+    #else
     page = mi_arenas_page_regular_alloc(theap, mi_slice_count_of_size(MI_LARGE_PAGE_SIZE), block_size);
+    #endif
   }
   #endif
   else {
@@ -12116,7 +12369,7 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   return page;
 }
 
-static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_arena_pages_t* arena_pages) {
+static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_arena_pages_t* arena_pages, bool retain_short) {
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
@@ -12192,7 +12445,7 @@ static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_
     }
   }
   if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // for assertion checking
-  _mi_arenas_free( subproc, mi_page_slice_start(page), mi_page_full_size(page), page->memid);
+  mi_arenas_free_ex( subproc, mi_page_slice_start(page), mi_page_full_size(page), page->memid, retain_short);
 }
 
 // adapted from oven-sh/mimalloc @ 942b8342, MIT (issue #271 / Bun parity P6, commit
@@ -12207,6 +12460,30 @@ static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_
 // saw the page unpublished, a real use-after-free (this port's before-matrix reproduced it
 // as a SIGSEGV in `mi_arenas_page_free_prim` -> `mi_page_subproc` -> `_mi_os_free`, from
 // `test-heap-teardown`'s `os-pages` case, Release build).
+// #506: the singleton page whose block a growing realloc is freeing right now. One process-wide
+// slot, not a thread-local (none in the free path, see `mi_hooks_tld_t`) and not a page field (the
+// page meta's size is a multiple of MI_MAX_ALIGN_SIZE by design): the realloc owns the block, so
+// no other thread can be freeing that page meanwhile, and two concurrent growing reallocs that
+// overwrite each other's name only cost the loser its short window.
+static _Atomic(mi_page_t*) mi_realloc_outgrown;
+
+// Free the old block `p` (in `page`) of a moving realloc. When the realloc grew the buffer and the
+// block is a singleton page, the arena queues the page's slices for the short retention window
+// instead of #486's long one (MI_REALLOC_RETAIN_SHORT): a doubling buffer never asks for the size
+// it outgrew. (A singleton page is abandoned from birth, as it is full, so this free goes through
+// the abandoned-page path with no theap -- hence the slot.)
+void _mi_realloc_free_old(const mi_page_t* page, void* p, bool grown) {
+  if (MI_REALLOC_RETAIN_SHORT && grown && mi_page_is_singleton(page)) {
+    mi_atomic_store_ptr_release(mi_page_t, &mi_realloc_outgrown, (mi_page_t*)page);
+    mi_free(p);
+    mi_page_t* expected = (mi_page_t*)page;
+    mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, &mi_realloc_outgrown, &expected, NULL);
+  }
+  else {
+    mi_free(p);
+  }
+}
+
 static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, bool unabandon) {
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
@@ -12243,6 +12520,10 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   mi_arena_pages_t* arena_pages = NULL;
   if (page->memid.memkind == MI_MEM_ARENA) { mi_page_arena_pages(page, NULL, NULL, &arena_pages); }
 
+  // #506: the singleton page a growing realloc outgrew (`_mi_realloc_free_old`) takes the short
+  // retention window.
+  const bool retain_short = (mi_atomic_load_ptr_relaxed(mi_page_t, &mi_realloc_outgrown) == page);
+
   if (current_theapx != NULL) {
     mi_theap_stat_decrease(current_theapx, page_bins[_mi_page_stats_bin(page)], 1);
     mi_theap_stat_decrease(current_theapx, pages, 1);
@@ -12254,7 +12535,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   if (unabandon) {
     _mi_arenas_page_unabandon(page, current_theapx);   // for an OS page this is where it is unpublished from the heap
   }
-  mi_arenas_page_free_prim(page, subproc, arena_pages);
+  mi_arenas_page_free_prim(page, subproc, arena_pages, retain_short);
 }
 
 void _mi_arenas_page_free(mi_page_t* page, mi_theap_t* current_theapx) {
@@ -12516,6 +12797,7 @@ static void mi_arena_purge_released(mi_arena_t* arena, size_t slice_index, size_
   if (arena->memid.is_pinned || mi_arena_purge_delay() < 0) return;
   if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     mi_bitmap_clearN(arena->slices_purge, slice_index, slice_count);   // queued by the free: done already
+    mi_bitmap_clearN(arena->slices_purge_short, slice_index, slice_count);   // (#506: whichever queue it was)
   }
 }
 
@@ -12708,7 +12990,8 @@ void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
       if (mi_bitmap_is_set(arena->slices_committed, i)) { rep->arena_committed_bytes += MI_ARENA_SLICE_SIZE; }
       if (!mi_bbitmap_is_setN(arena->slices_free, i, 1)) continue;   // in a page (or reserved meta): not slack
       if (mi_bitmap_is_set(arena->slices_dirty, i)) { rep->arena_free_dirty_bytes += MI_ARENA_SLICE_SIZE; }
-      if (mi_bitmap_is_set(arena->slices_purge, i) || mi_bitmap_is_set(arena->slices_purge_aged, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
+      if (mi_bitmap_is_set(arena->slices_purge, i) || mi_bitmap_is_set(arena->slices_purge_aged, i) ||
+          mi_bitmap_is_set(arena->slices_purge_short, i) || mi_bitmap_is_set(arena->slices_purge_short_aged, i)) { rep->arena_purge_pending_bytes += MI_ARENA_SLICE_SIZE; }
     }
   }
   mi_forall_arenas_end();
@@ -12718,9 +13001,10 @@ void _mi_arenas_holes_committed(mi_heap_t* heap, mi_holes_report_t* rep) {
 /* -----------------------------------------------------------
   Arena free
 ----------------------------------------------------------- */
-static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slices);
+static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slices, bool retain_short);
 
-void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid) {
+// `retain_short` (#506): the range takes the short retention window whatever its size
+static void mi_arenas_free_ex(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid, bool retain_short) {
   if (p==NULL) return;
   if (size==0) return;
 
@@ -12757,7 +13041,7 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
     // potentially decommit
     if (!arena->memid.is_pinned /* && !arena->memid.initially_committed */) { // todo: allow decommit even if initially committed?
       // (delay) purge the page
-      mi_arena_schedule_purge(arena, slice_index, slice_count);
+      mi_arena_schedule_purge(arena, slice_index, slice_count, retain_short);
     }
 
     // and make it available to others again
@@ -12787,6 +13071,10 @@ void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t mem
 
   // try to purge expired decommits
   // _mi_arenas_try_purge(false, false, NULL);
+}
+
+void _mi_arenas_free(mi_subproc_t* subproc, void* p, size_t size, mi_memid_t memid) {
+  mi_arenas_free_ex(subproc, p, size, memid, false);
 }
 
 // Purge the arenas; if `force_purge` is true, amenable parts are purged even if not yet expired
@@ -12924,7 +13212,7 @@ static size_t mi_arena_info_slices_needed(size_t slice_count, size_t* bitmap_bas
   if (slice_count == 0) slice_count = MI_BCHUNK_BITS;
   mi_assert_internal((slice_count % MI_BCHUNK_BITS) == 0);
   const size_t base_size = _mi_align_up(sizeof(mi_arena_t), MI_BCHUNK_SIZE);
-  const size_t bitmaps_count = 5; // commit, dirty, purge, purge_aged (#457), and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
+  const size_t bitmaps_count = 7; // commit, dirty, purge, purge_aged (#457), purge_short, purge_short_aged (#506), and pages (the abandoned bitmaps are allocated on demand, Bun parity P10b #317)
   const size_t bitmaps_size = bitmaps_count * mi_bitmap_size(slice_count, NULL) + mi_bbitmap_size(slice_count, NULL); // + free
   #if MI_PAGE_META_IS_SEPARATED
   const size_t pages_size = slice_count * sizeof(mi_page_t);
@@ -13140,6 +13428,7 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
     arena->numa_node = numa_node;
   }
   arena->purge_expire = 0;
+  arena->purge_long_expire = 0;
   arena->commit_fun = commit_fun;
   arena->commit_fun_arg = commit_fun_arg;
   arena->parent = parent;
@@ -13152,6 +13441,8 @@ static mi_arena_t* mi_arena_initialize(mi_subproc_t* subproc, void* start,
   arena->slices_dirty = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_purge = mi_arena_bitmap_init(slice_count, &base);
   arena->slices_purge_aged = mi_arena_bitmap_init(slice_count, &base);
+  arena->slices_purge_short = mi_arena_bitmap_init(slice_count, &base);
+  arena->slices_purge_short_aged = mi_arena_bitmap_init(slice_count, &base);
   arena->pages_main.pages = mi_arena_bitmap_init(slice_count, &base);
   // Allocated on first abandon (Bun parity P10b, #317, ported from oven-sh/mimalloc @
   // 787be2a8, MIT); the arena's own memory is not yet fully zeroed at this point in every
@@ -13409,7 +13700,7 @@ static size_t mi_debug_show_page_bfield(char* buf, size_t* k, mi_arena_t* arena,
       else if (slice_index + bit < arena->info_slices) { c = 'i'; color = MI_GRAY; }
       // else if (mi_bitmap_is_setN(arena->pages_purge, slice_index + bit, NULL)) { c = '*'; }
       else if (mi_bbitmap_is_setN(arena->slices_free, slice_index+bit,1)) {
-        if (mi_bitmap_is_set(arena->slices_purge, slice_index + bit)) { c = '~'; color = MI_ORANGE; }
+        if (mi_bitmap_is_set(arena->slices_purge, slice_index + bit) || mi_bitmap_is_set(arena->slices_purge_short, slice_index + bit)) { c = '~'; color = MI_ORANGE; }
         else if (mi_bitmap_is_set(arena->slices_committed, slice_index + bit)) { c = '_'; color = MI_GRAY; }
         else { c = '.'; color = MI_GRAY; }
       }
@@ -13645,6 +13936,20 @@ static long mi_arena_purge_delay(void) {
   return (long)total;
 }
 
+// #506: the short window, and the cadence of the purge passes while anything is queued: one
+// `purge_delay` (never more than the long window above). Same signs as `mi_arena_purge_delay`.
+static long mi_arena_purge_period(void) {
+  const long window = mi_arena_purge_delay();
+  if (window <= 0) return window;
+  const long delay = mi_option_get(mi_option_purge_delay);
+  return (delay < window ? delay : window);
+}
+
+// #506: does a freed range of `slice_count` slices get the short window (small and medium pages)?
+static bool mi_arena_purge_is_short(size_t slice_count) {
+  return (slice_count <= MI_ARENA_RETAIN_SHORT_MAX_SLICES);
+}
+
 // reset or decommit in an arena and update the commit bitmap
 // assumes we own the area (i.e. slices_free is claimed by us)
 // returns if the memory is no longer committed (versus reset which keeps the commit)
@@ -13711,7 +14016,7 @@ static bool mi_arena_purge(mi_arena_t* arena, size_t slice_index, size_t slice_c
 
 // Schedule a purge. This is usually delayed to avoid repeated decommit/commit calls.
 // Note: assumes we (still) own the area as we may purge immediately
-static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_t slice_count, bool retain_short) {
   const long delay = mi_arena_purge_delay();
   if (arena->memid.is_pinned || delay < 0 || _mi_preloading()) return;  // is purging allowed at all?
 
@@ -13724,8 +14029,16 @@ static void mi_arena_schedule_purge(mi_arena_t* arena, size_t slice_index, size_
     // schedule purge. #457: queue the range BEFORE arming, so a purge that runs concurrently
     // either sees the range (ages it, and re-arms) or has already cleared the deadline (so the
     // CAS below arms it); in the other order the range could land in a queue with no deadline.
-    mi_bitmap_setN(arena->slices_purge, slice_index, slice_count, NULL);
-    const mi_msecs_t expire = _mi_clock_now() + delay;
+    // #506: a small or medium page queues for the short window, anything larger for the long
+    // one, which has its own deadline; the passes themselves run every short period.
+    const bool is_short = (retain_short || mi_arena_purge_is_short(slice_count));
+    mi_bitmap_setN(is_short ? arena->slices_purge_short : arena->slices_purge, slice_index, slice_count, NULL);
+    const mi_msecs_t now = _mi_clock_now();
+    if (!is_short) {
+      mi_msecs_t long0 = 0;
+      mi_atomic_casi64_strong_acq_rel(&arena->purge_long_expire, &long0, now + delay);
+    }
+    const mi_msecs_t expire = now + mi_arena_purge_period();
     mi_msecs_t expire0 = 0;
     if (mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, expire)) {
       // expiration was not yet set
@@ -13757,6 +14070,18 @@ typedef struct mi_purge_visit_info_s {
   bool take_young;   // #457: forced purge -- ranges freed again since they were aged are purged too
 } mi_purge_visit_info_t;
 
+// #457/#506: was the slice freed again since it was aged? It is then young again, in either queue
+// (a range aged in one queue can be taken by a page of the other size class and freed again).
+static bool mi_arena_purge_is_young(mi_arena_t* arena, size_t slice_index) {
+  return (mi_bitmap_is_set(arena->slices_purge, slice_index) || mi_bitmap_is_set(arena->slices_purge_short, slice_index));
+}
+
+// #457/#506: the aged queue a young range moves into (`mi_arena_age_purge_visitor`)
+typedef struct mi_purge_age_info_s {
+  mi_bitmap_t* aged;
+  bool any;
+} mi_purge_age_info_t;
+
 static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
   mi_assert(slice_count < MI_BCHUNK_BITS);
   if (mi_bbitmap_try_clearNC(arena->slices_free, slice_index, slice_count)) {
@@ -13775,9 +14100,18 @@ static bool mi_arena_try_purge_range(mi_arena_t* arena, size_t slice_index, size
 
 // #457: move a range queued in this period into the aged queue (see `mi_arena_try_purge`)
 static bool mi_arena_age_purge_visitor(size_t slice_index, size_t slice_count, mi_arena_t* arena, void* arg) {
-  *(bool*)arg = true;
-  mi_bitmap_setN(arena->slices_purge_aged, slice_index, slice_count, NULL);
+  MI_UNUSED(arena);
+  mi_purge_age_info_t* const age = (mi_purge_age_info_t*)arg;
+  age->any = true;
+  mi_bitmap_setN(age->aged, slice_index, slice_count, NULL);
   return true;
+}
+
+// age everything in `young` into `aged`; returns whether anything was
+static bool mi_arena_age_purge(mi_arena_t* arena, mi_bitmap_t* young, mi_bitmap_t* aged) {
+  mi_purge_age_info_t age = { aged, false };
+  _mi_bitmap_forall_setc_ranges(young, &mi_arena_age_purge_visitor, arena, &age);
+  return age.any;
 }
 
 static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo);
@@ -13788,11 +14122,12 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   // waits for its own deadline. #497: only that slice -- the run handed to us is a maximal run of
   // aged bits, already cleared, so skipping all of it would lose the parts that did stay free
   // for the whole period (they are in neither queue after this).
-  if (!vinfo->take_young && !mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count)) {
+  if (!vinfo->take_young && (!mi_bitmap_is_clearN(arena->slices_purge, slice_index, slice_count) ||
+                             !mi_bitmap_is_clearN(arena->slices_purge_short, slice_index, slice_count))) {
     for (size_t i = 0; i < slice_count; ) {
-      if (mi_bitmap_is_set(arena->slices_purge, slice_index + i)) { i++; continue; }
+      if (mi_arena_purge_is_young(arena, slice_index + i)) { i++; continue; }
       size_t n = 1;
-      while (i + n < slice_count && !mi_bitmap_is_set(arena->slices_purge, slice_index + i + n)) { n++; }
+      while (i + n < slice_count && !mi_arena_purge_is_young(arena, slice_index + i + n)) { n++; }
       mi_arena_try_purge_run(arena, slice_index + i, n, vinfo);
       i += n;
     }
@@ -13845,19 +14180,40 @@ static int mi_arena_try_purge(mi_arena_t* arena, mi_msecs_t now, bool force)
   // #457: two generations. Purge only what was already queued at the previous deadline, is
   // still free, and was not freed again since: memory freed moments ago is about to be reused,
   // and purging it would only make the next allocation re-fault it. Then age this period's
-  // queue and re-arm, so idle memory goes back between one and two `delay`s after its free.
+  // queue and re-arm, so idle memory goes back between one and two periods after its free.
   // A forced purge (`mi_collect(true)`, `mi_purge_all`) takes both queues right away.
   // The visitors clear each range atomically as they go (so a concurrent free is kept for next time).
+  // #506: two such queues. The short one (small and medium pages) moves on every pass, one
+  // `purge_delay` apart; the long one (#486: large and singleton pages) only at its own deadline,
+  // `arena_purge_mult` times further apart.
   const long delay = mi_arena_purge_delay();
+  const long period = mi_arena_purge_period();
   mi_purge_visit_info_t vinfo = { now, delay, true /*all?*/, false /*any?*/, force /*young?*/ };
   // we purge by at least `minslices` to not fragment transparent huge pages for example
   const size_t minslices = mi_slice_count_of_size(_mi_os_minimal_purge_size());
-  if (force) { _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo); }
-  _mi_bitmap_forall_setc_rangesn(arena->slices_purge_aged, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
-  bool aged = false;
-  _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
-  mi_msecs_t expire0 = 0;
-  if (aged && delay > 0) { mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, now + delay); }
+  if (force) { _mi_bitmap_forall_setc_rangesn(arena->slices_purge_short, minslices, &mi_arena_try_purge_visitor, arena, &vinfo); }
+  _mi_bitmap_forall_setc_rangesn(arena->slices_purge_short_aged, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
+  const bool short_aged = mi_arena_age_purge(arena, arena->slices_purge_short, arena->slices_purge_short_aged);
+  const mi_msecs_t long_expire = mi_atomic_loadi64_relaxed(&arena->purge_long_expire);
+  if (force || (long_expire != 0 && long_expire <= now)) {
+    // cleared before the queue is aged, as `purge_expire` above: a free from here on re-arms it
+    mi_atomic_storei64_release(&arena->purge_long_expire, (mi_msecs_t)0);
+    if (force) { _mi_bitmap_forall_setc_rangesn(arena->slices_purge, minslices, &mi_arena_try_purge_visitor, arena, &vinfo); }
+    _mi_bitmap_forall_setc_rangesn(arena->slices_purge_aged, minslices, &mi_arena_try_purge_visitor, arena, &vinfo);
+    const bool long_aged = mi_arena_age_purge(arena, arena->slices_purge, arena->slices_purge_aged);
+    mi_msecs_t long0 = 0;
+    if (long_aged && delay > 0) { mi_atomic_casi64_strong_acq_rel(&arena->purge_long_expire, &long0, now + delay); }
+  }
+  // the next pass: one period on while the short queue holds anything, and never after the long
+  // deadline. (Also one period on while only the long queue waits, so that a small page freed
+  // meanwhile never waits for the long deadline: arming only ever moves a deadline from 0.)
+  const mi_msecs_t long_next = mi_atomic_loadi64_relaxed(&arena->purge_long_expire);
+  if ((short_aged || long_next != 0) && period > 0) {
+    mi_msecs_t next = now + period;
+    if (long_next != 0 && long_next < next) { next = long_next; }
+    mi_msecs_t expire0 = 0;
+    mi_atomic_casi64_strong_acq_rel(&arena->purge_expire, &expire0, next);
+  }
   return (vinfo.any_purged ? 1 : -1);
 }
 
@@ -13912,8 +14268,11 @@ void _mi_arenas_purge_now(mi_subproc_t* subproc) {
     const mi_msecs_t expire = mi_atomic_loadi64_relaxed(&arena->purge_expire);
     if (expire == 0) continue;                 // nothing queued for this arena
     any_scheduled = true;
-    bool aged = false;                         // #457: the caller is idle, so everything queued counts as aged
-    _mi_bitmap_forall_setc_ranges(arena->slices_purge, &mi_arena_age_purge_visitor, arena, &aged);
+    // #457: the caller is idle, so everything queued counts as aged -- in both queues (#506)
+    mi_arena_age_purge(arena, arena->slices_purge_short, arena->slices_purge_short_aged);
+    mi_arena_age_purge(arena, arena->slices_purge, arena->slices_purge_aged);
+    const mi_msecs_t long_expire = mi_atomic_loadi64_relaxed(&arena->purge_long_expire);
+    if (long_expire > now) { mi_atomic_storei64_release(&arena->purge_long_expire, now); }
     if (expire > now) { mi_atomic_storei64_release(&arena->purge_expire, now); }
   }
   if (!any_scheduled) return;
@@ -16303,13 +16662,16 @@ bool _mi_bitmap_forall_setc_rangesn(mi_bitmap_t* bitmap, size_t rngslices, mi_fo
 // the runs are only hints (the arena claims them atomically in `slices_free`), so the loads are
 // relaxed. A run never crosses a chunk, so it can be claimed with `mi_bbitmap_try_clearNC`.
 // Stops, returning false, as soon as `visit` returns false.
-bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
+bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* const* bitmaps, size_t count, size_t n, mi_forall_set_fun_t* visit, mi_arena_t* arena, void* arg) {
   mi_assert_internal(n > 0 && n <= MI_BCHUNK_BITS);
-  mi_assert_internal(bitmap2 == NULL || mi_bitmap_chunk_count(bitmap2) == mi_bitmap_chunk_count(bitmap));
-  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmap), MI_BFIELD_BITS);
+  mi_assert_internal(count > 0);
+  const size_t chunkmap_max = _mi_divide_up(mi_bitmap_chunk_count(bitmaps[0]), MI_BFIELD_BITS);
   for (size_t i = 0; i < chunkmap_max; i++) {
-    mi_bfield_t cmap_entry = mi_atomic_load_relaxed(&bitmap->chunkmap.bfields[i]);
-    if (bitmap2 != NULL) { cmap_entry |= mi_atomic_load_relaxed(&bitmap2->chunkmap.bfields[i]); }
+    mi_bfield_t cmap_entry = 0;
+    for (size_t k = 0; k < count; k++) {
+      mi_assert_internal(mi_bitmap_chunk_count(bitmaps[k]) == mi_bitmap_chunk_count(bitmaps[0]));
+      cmap_entry |= mi_atomic_load_relaxed(&bitmaps[k]->chunkmap.bfields[i]);
+    }
     size_t cmap_idx;
     // for each chunk (corresponding to a set bit in a chunkmap entry)
     while (mi_bfield_foreach_bit(&cmap_entry, &cmap_idx)) {
@@ -16318,8 +16680,8 @@ bool _mi_bitmap_forall_set_runsN(mi_bitmap_t* bitmap, mi_bitmap_t* bitmap2, size
       size_t run_start = 0;   // chunk-relative start of the current run
       size_t run_len = 0;     // and its length so far (0 = none); a run can span bfields
       for (size_t j = 0; j < MI_BCHUNK_FIELDS; j++) {
-        mi_bfield_t b = mi_atomic_load_relaxed(&bitmap->chunks[chunk_idx].bfields[j]);
-        if (bitmap2 != NULL) { b |= mi_atomic_load_relaxed(&bitmap2->chunks[chunk_idx].bfields[j]); }
+        mi_bfield_t b = 0;
+        for (size_t k = 0; k < count; k++) { b |= mi_atomic_load_relaxed(&bitmaps[k]->chunks[chunk_idx].bfields[j]); }
         size_t bidx;
         while (mi_bfield_find_least_bit(b, &bidx)) {
           const size_t rng = mi_ctz(~(b>>bidx));   // all the set bits from bidx
@@ -17395,6 +17757,9 @@ void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
   mi_heap_detach_theaps(heap);
   _mi_dhat_forget_heap(heap);
+  #if MI_PPROF
+  _mi_prof_forget_heap(heap);  // #550: likewise the profiler's sample records, before the pages go
+  #endif
   _mi_heap_destroy_pages(heap);
   mi_heap_free_theaps(heap);
   // Free unless this is the PROCESS main heap (which is statically allocated and must
@@ -19364,6 +19729,9 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   MI_PAGE_QUEUES_EMPTY,
   MI_MEMID_STATIC,
   MI_STATS_NULL,          // stats
+  #if MI_LARGE_SPAN
+  { 0 },                  // large_span (#532): every bin starts compact
+  #endif
 };
 
 #undef MI_STAT_COUNT
@@ -21359,10 +21727,10 @@ void* mi_unwrapped_realloc(void* p, size_t new_size, size_t alignment) mi_attr_n
    runs/tests, not production profiling. It is independent of MI_PPROF and of
    mi_memory_set_callbacks: both observers can run simultaneously.
 
-   Start explicitly with mi_dhat_start(). MIMALLOC_DHAT=1 before process initialization
-   is meant to start it too, but that is a KNOWN ISSUE today: dhat_resolve_env reads the
-   variable into an 8-byte buffer, below _mi_getenv's 64-byte minimum, so it is never seen
-   and DHAT stays off. Until that is fixed, call mi_dhat_start() (Rust: dhat::start()).
+   Start explicitly with mi_dhat_start(), or set MIMALLOC_DHAT=1 (any non-empty
+   value not starting with '0') before process initialization, where it is read
+   once. Builds that predate issue #549, including every release up to 1.0.0,
+   ignore MIMALLOC_DHAT: call mi_dhat_start() there.
    MIMALLOC_DHAT_DUMP_AT_EXIT=<path> writes a standard DHAT v2
    JSON report at process exit. MIMALLOC_DHAT_MAX_BYTES bounds raw-OS-backed
    collector state (default 64 MiB); exhaustion is fail-soft and is exposed via
@@ -21403,7 +21771,9 @@ mi_decl_nodiscard mi_decl_export bool mi_dhat_is_enabled(void) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept;
 
 /* Writes a DHAT file-version-2 heap JSON document. `tu` is monotonic milliseconds,
-   not Valgrind instruction counts; bkacc is always false. */
+   not Valgrind instruction counts; bkacc is always false. Returns false if the file
+   cannot be opened or closed, or if the frame table's temporary index cannot be
+   allocated (the file is then left empty). */
 mi_decl_nodiscard mi_decl_export bool mi_dhat_dump(const char* path) mi_attr_noexcept;
 
 #ifdef __cplusplus
@@ -21424,10 +21794,39 @@ mi_decl_nodiscard mi_decl_export bool mi_dhat_dump(const char* path) mi_attr_noe
 #define DHAT_UNINIT 0
 #define DHAT_DISABLED 1
 #define DHAT_ENABLED 2
+/* Tuning constants; a build can override each with -D (test-dhat-one-bucket builds
+   with DHAT_BUCKETS=1 so every program point shares one hash chain). */
+#ifndef DHAT_STACK_MAX
 #define DHAT_STACK_MAX 64
+#endif
+#ifndef DHAT_CHUNK_SIZE
 #define DHAT_CHUNK_SIZE (64*1024)
+#endif
+#ifndef DHAT_DEFAULT_BUDGET
 #define DHAT_DEFAULT_BUDGET (64*1024*1024)
+#endif
+#ifndef DHAT_BUCKETS
 #define DHAT_BUCKETS 4096
+#endif
+#if DHAT_BUCKETS < 1 || (DHAT_BUCKETS & (DHAT_BUCKETS - 1)) != 0
+#error "DHAT_BUCKETS must be a power of two: both tables index with hash & (DHAT_BUCKETS - 1)"
+#endif
+#ifndef DHAT_FRAME_MAP_MIN_SLOTS
+#define DHAT_FRAME_MAP_MIN_SLOTS 1024  // first size of a dump's PC -> ftbl index map
+#endif
+#if DHAT_FRAME_MAP_MIN_SLOTS < 2 || (DHAT_FRAME_MAP_MIN_SLOTS & (DHAT_FRAME_MAP_MIN_SLOTS - 1)) != 0
+#error "DHAT_FRAME_MAP_MIN_SLOTS must be a power of two of at least 2"
+#endif
+
+/* #549: result buffer for a short environment value (MIMALLOC_DHAT, MIMALLOC_DHAT_MAX_BYTES).
+   `_mi_getenv` (src/libc.c, upstream) refuses any buffer under 64 bytes with ENOENT, the
+   same code as "not set", so a smaller buffer silently ignores the variable. */
+#ifndef MI_DHAT_ENV_VALUE_SIZE
+#define MI_DHAT_ENV_VALUE_SIZE 64
+#endif
+#if MI_DHAT_ENV_VALUE_SIZE < 64
+#error "MI_DHAT_ENV_VALUE_SIZE must be at least 64: _mi_getenv (src/libc.c) treats a smaller buffer as an unset variable"
+#endif
 
 typedef struct dhat_chunk_s {
   struct dhat_chunk_s* next;
@@ -21580,18 +21979,20 @@ static void* dhat_arena_alloc(size_t size) {
 
 static void dhat_mark_dropped(void) { mi_atomic_increment_relaxed(&dhat_dropped); mi_atomic_store_relaxed(&dhat_incomplete, (size_t)1); }
 
+/* #551: both tables come from ONE arena allocation, so they exist together or not at all.
+   Two separate allocations let a budget admit only the first; the half-built pair then
+   refused every later event without counting it. Now each refusal is a counted drop. */
+typedef struct dhat_tables_s {
+  dhat_record_t* live[DHAT_BUCKETS];
+  dhat_pp_t* pps[DHAT_BUCKETS];
+} dhat_tables_t;
+
 static bool dhat_init_tables_locked(void) {
-  if (dhat_live_table != NULL || dhat_pp_table != NULL) {
-    /* A partial first attempt cannot safely be completed: the budget may have
-       been exhausted after one table allocation. Keep the collector fail-soft
-       instead of dereferencing a missing sibling table. */
-    return (dhat_live_table != NULL && dhat_pp_table != NULL);
-  }
-  dhat_live_table = (dhat_record_t**)dhat_arena_alloc(DHAT_BUCKETS * sizeof(*dhat_live_table));
-  dhat_pp_table = (dhat_pp_t**)dhat_arena_alloc(DHAT_BUCKETS * sizeof(*dhat_pp_table));
-  if (dhat_live_table == NULL || dhat_pp_table == NULL) { dhat_mark_dropped(); return false; }
-  _mi_memzero(dhat_live_table, DHAT_BUCKETS * sizeof(*dhat_live_table));
-  _mi_memzero(dhat_pp_table, DHAT_BUCKETS * sizeof(*dhat_pp_table));
+  if (dhat_pp_table != NULL) return true;
+  dhat_tables_t* const tables = (dhat_tables_t*)dhat_arena_alloc(sizeof(dhat_tables_t));
+  if (tables == NULL) { dhat_mark_dropped(); return false; }
+  _mi_memzero(tables, sizeof(*tables));
+  dhat_live_table = tables->live; dhat_pp_table = tables->pps;
   return true;
 }
 
@@ -21716,7 +22117,7 @@ static void dhat_commit_resize_locked(dhat_event_t* ev) {
 }
 
 static bool dhat_env_size(const char* name, size_t* out) {
-  char buf[64];
+  char buf[MI_DHAT_ENV_VALUE_SIZE];
   if (_mi_getenv(name, buf, sizeof(buf)) != 0 || buf[0] == 0) return false;
   char* end = NULL;
   const unsigned long long v = strtoull(buf, &end, 10);
@@ -21741,7 +22142,7 @@ static void dhat_publish_armed(size_t state) {
 
 static void dhat_resolve_env(void) {
   if (_mi_atomic_once_enter(&dhat_once)) {
-    char value[8] = { 0 };
+    char value[MI_DHAT_ENV_VALUE_SIZE] = { 0 };
     /* DHAT has its own opt-in switch; it must never inherit the unrelated
        MIMALLOC_MEMORY_EVENTS activation state. */
     const bool env_enabled = (_mi_getenv("MIMALLOC_DHAT", value, sizeof(value)) == 0 && value[0] != 0 && value[0] != '0');
@@ -21899,36 +22300,74 @@ bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept {
   mi_lock_release(&dhat_lock); return true;
 }
 
-/* Frame-table order is the order we visit program points below.  The dump is a
-   diagnostic operation, so this allocation-free O(frames^3) lookup is preferable to
-   adding a second persistent hash table solely for serialization. */
-static bool dhat_frame_seen_before_locked(const dhat_pp_t* stop_pp, size_t stop_frame, const void* pc) {
-  for (size_t i = 0; i < DHAT_BUCKETS; i++) {
-    for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
-      const size_t limit = (pp == stop_pp ? stop_frame : pp->depth);
-      for (size_t frame = 0; frame < limit; frame++) if (pp->pcs[frame] == pc) return true;
-      if (pp == stop_pp) return false;
-    }
-  }
-  return false;
+/* #551: `fs` and `ftbl` share ONE numbering: each distinct PC takes the next index at its
+   first occurrence in dump order (bucket, then chain, then frame). They used to dedup
+   with two separate scans that disagreed for program points sharing a bucket, so `ftbl`
+   lost PCs that `fs` still referenced; the index scan was also O(frames^3) under
+   dhat_lock. The PC -> index map is dump-time scratch straight from the raw OS layer
+   (rule 4), outside the session budget, and released before the dump returns. It holds
+   one entry per DISTINCT PC, and it starts small and doubles at half load, so it stays
+   far smaller than the program points it indexes (they repeat hook-chain and caller PCs). */
+typedef struct dhat_frame_entry_s {
+  const void* pc;
+  size_t index1;     // 0 for an empty slot, else the PC's ftbl index + 1
+} dhat_frame_entry_t;
+
+typedef struct dhat_frame_map_s {
+  dhat_frame_entry_t* slots;  // open addressing with linear probing; NULL until the first PC
+  size_t mask;                // slot count - 1 (a power of two)
+  size_t count;               // distinct PCs numbered so far
+  mi_memid_t memid;
+} dhat_frame_map_t;
+
+static dhat_frame_entry_t* dhat_frame_find(const dhat_frame_map_t* map, const void* pc) {
+  size_t slot = (size_t)dhat_hash_ptr(pc) & map->mask;
+  while (map->slots[slot].index1 != 0 && map->slots[slot].pc != pc) slot = (slot + 1) & map->mask;
+  return &map->slots[slot];
 }
-static size_t dhat_frame_index_locked(const dhat_pp_t* wanted, size_t wanted_frame) {
-  size_t index = 0;
+static size_t dhat_frame_index(const dhat_frame_map_t* map, const void* pc) {
+  const dhat_frame_entry_t* const entry = dhat_frame_find(map, pc);
+  mi_assert_internal(entry->index1 != 0);  // the build pass numbered every PC
+  return entry->index1 - 1;
+}
+static void dhat_frame_map_free(dhat_frame_map_t* map) {
+  if (map->slots != NULL) _mi_os_free(_mi_subproc_main(), map->slots, (map->mask + 1) * sizeof(dhat_frame_entry_t), map->memid);
+  map->slots = NULL;
+}
+/* Moves the map to `slot_count` (a power of two) fresh slots, rehashing what it holds. */
+static bool dhat_frame_map_resize(dhat_frame_map_t* map, size_t slot_count) {
+  if (slot_count > SIZE_MAX / sizeof(dhat_frame_entry_t)) return false;
+  const size_t size = slot_count * sizeof(dhat_frame_entry_t);
+  mi_memid_t memid;
+  dhat_frame_entry_t* const slots = (dhat_frame_entry_t*)_mi_os_alloc(_mi_subproc_main(), size, &memid);
+  if (slots == NULL) return false;
+  if (!memid.initially_zero) _mi_memzero(slots, size);
+  dhat_frame_map_t resized = { slots, slot_count - 1, map->count, memid };
+  if (map->slots != NULL) {
+    for (size_t i = 0; i <= map->mask; i++) if (map->slots[i].index1 != 0) *dhat_frame_find(&resized, map->slots[i].pc) = map->slots[i];
+    dhat_frame_map_free(map);
+  }
+  *map = resized;
+  return true;
+}
+static bool dhat_frame_map_build_locked(dhat_frame_map_t* map) {
+  _mi_memzero(map, sizeof(*map));
+  if (dhat_pp_table == NULL) return true;
   for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
     for (size_t frame = 0; frame < pp->depth; frame++) {
-      if (pp == wanted && frame == wanted_frame) {
-        if (!dhat_frame_seen_before_locked(pp, frame, pp->pcs[frame])) return index;
-        /* Locate the matching first occurrence, whose index is the count of unique
-           frames that preceded it. */
-        for (size_t j = 0; j < DHAT_BUCKETS; j++) for (dhat_pp_t* prior = dhat_pp_table[j]; prior != NULL; prior = prior->next) {
-          const size_t limit = (prior == pp ? frame : prior->depth);
-          for (size_t pf = 0; pf < limit; pf++) if (prior->pcs[pf] == pp->pcs[frame]) return dhat_frame_index_locked(prior, pf);
-        }
+      const void* const pc = pp->pcs[frame];
+      if (map->slots != NULL && dhat_frame_find(map, pc)->index1 != 0) continue;  // numbered already
+      const size_t slot_count = (map->slots == NULL ? 0 : map->mask + 1);
+      if (2 * (map->count + 1) > slot_count &&
+          !dhat_frame_map_resize(map, slot_count == 0 ? DHAT_FRAME_MAP_MIN_SLOTS : 2 * slot_count)) {
+        dhat_frame_map_free(map);
+        return false;
       }
-      else if (!dhat_frame_seen_before_locked(pp, frame, pp->pcs[frame])) index++;
+      dhat_frame_entry_t* const entry = dhat_frame_find(map, pc);
+      entry->pc = pc; entry->index1 = ++map->count;
     }
   }
-  return 0;
+  return true;
 }
 /* Compute every live record's contribution once, rather than scanning the full
    live table for each program point while the global collector lock is held. */
@@ -21944,7 +22383,10 @@ static void dhat_prepare_dump_lifetimes_locked(uint64_t now) {
     }
   }
 }
-static void dhat_write_json_locked(FILE* f) {
+/* Returns false, having written nothing, if the frame map's scratch cannot be allocated. */
+static bool dhat_write_json_locked(FILE* f) {
+  dhat_frame_map_t frames;
+  if (!dhat_frame_map_build_locked(&frames)) return false;
   const uint64_t elapsed = dhat_elapsed_now();
   const uint64_t now = (uint64_t)dhat_effective_end();
   dhat_prepare_dump_lifetimes_locked(now);
@@ -21954,21 +22396,30 @@ static void dhat_write_json_locked(FILE* f) {
   fprintf(f, "{\n  \"dhatFileVersion\": 2,\n  \"mode\": \"mimalloc-heap\",\n  \"verb\": \"Allocated\",\n  \"bklt\": true,\n  \"bkacc\": false,\n  \"tu\": \"ms\",\n  \"Mtu\": \"ms\",\n  \"tuth\": 1,\n  \"cmd\": \"\",\n  \"pid\": 0,\n  \"tg\": %llu,\n  \"te\": %llu,\n  \"mi_dhat_incomplete\": %s,\n  \"pps\": [\n", (unsigned long long)dhat_peak_at, (unsigned long long)elapsed, (mi_atomic_load_relaxed(&dhat_incomplete) ? "true" : "false"));
   if (dhat_pp_table == NULL) {
     fprintf(f, "\n  ],\n  \"ftbl\": []\n}\n");
-    return;
   }
-  bool first_pp = true;
-  for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
-    fprintf(f, "%s    {\"tb\": %llu, \"tbk\": %llu, \"tl\": %llu, \"mb\": %llu, \"mbk\": %llu, \"gb\": %llu, \"gbk\": %llu, \"eb\": %llu, \"ebk\": %llu, \"fs\": [", first_pp ? "" : ",\n", (unsigned long long)pp->tb, (unsigned long long)pp->tbk, (unsigned long long)pp->dump_tl, (unsigned long long)pp->mb, (unsigned long long)pp->mbk, (unsigned long long)pp->gb, (unsigned long long)pp->gbk, (unsigned long long)pp->live, (unsigned long long)pp->livek);
-    for (size_t frame = 0; frame < pp->depth; frame++) fprintf(f, "%s%llu", frame == 0 ? "" : ", ", (unsigned long long)dhat_frame_index_locked(pp, frame));
-    fprintf(f, "]}"); first_pp = false;
+  else {
+    bool first_pp = true;
+    for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
+      fprintf(f, "%s    {\"tb\": %llu, \"tbk\": %llu, \"tl\": %llu, \"mb\": %llu, \"mbk\": %llu, \"gb\": %llu, \"gbk\": %llu, \"eb\": %llu, \"ebk\": %llu, \"fs\": [", first_pp ? "" : ",\n", (unsigned long long)pp->tb, (unsigned long long)pp->tbk, (unsigned long long)pp->dump_tl, (unsigned long long)pp->mb, (unsigned long long)pp->mbk, (unsigned long long)pp->gb, (unsigned long long)pp->gbk, (unsigned long long)pp->live, (unsigned long long)pp->livek);
+      for (size_t frame = 0; frame < pp->depth; frame++) fprintf(f, "%s%llu", frame == 0 ? "" : ", ", (unsigned long long)dhat_frame_index(&frames, pp->pcs[frame]));
+      fprintf(f, "]}"); first_pp = false;
+    }
+    fprintf(f, "\n  ],\n  \"ftbl\": [");
+    /* The same traversal handed out the indices, so each PC's first occurrence is where
+       the next unwritten index turns up: this writes ftbl in index order. */
+    size_t written = 0;
+    for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
+      for (size_t frame = 0; frame < pp->depth; frame++) {
+        if (dhat_frame_index(&frames, pp->pcs[frame]) != written) continue;
+        fprintf(f, "%s\n    \"0x%llx\"", written == 0 ? "" : ",", (unsigned long long)(uintptr_t)pp->pcs[frame]);
+        written++;
+      }
+    }
+    mi_assert_internal(written == frames.count);
+    fprintf(f, "\n  ]\n}\n");
   }
-  fprintf(f, "\n  ],\n  \"ftbl\": [");
-  bool first_frame = true;
-  for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) for (size_t frame = 0; frame < pp->depth; frame++) {
-    bool seen = false; for (size_t j = 0; j <= i && !seen; j++) for (dhat_pp_t* prior = dhat_pp_table[j]; prior != NULL && !seen; prior = prior->next) { const size_t lim = (prior == pp ? frame : prior->depth); for (size_t pf = 0; pf < lim; pf++) if (prior->pcs[pf] == pp->pcs[frame]) { seen = true; break; } }
-    if (!seen) { fprintf(f, "%s\n    \"0x%llx\"", first_frame ? "" : ",", (unsigned long long)(uintptr_t)pp->pcs[frame]); first_frame = false; }
-  }
-  fprintf(f, "\n  ]\n}\n");
+  dhat_frame_map_free(&frames);
+  return true;
 }
 bool mi_dhat_dump(const char* path) mi_attr_noexcept {
   if (path == NULL) return false;
@@ -21996,12 +22447,12 @@ bool mi_dhat_dump(const char* path) mi_attr_noexcept {
     return false;
   }
   mi_lock_acquire(&dhat_lock);
-  dhat_write_json_locked(f);
+  const bool written = dhat_write_json_locked(f);
   mi_lock_release(&dhat_lock);
-  const bool ok = (fclose(f) == 0);
+  const bool closed = (fclose(f) == 0);
   _mi_memevt_suppress_end();
   hooks->dhat_observer_depth--;
-  return ok;
+  return written && closed;
 }
 void _mi_dhat_process_init(void) { dhat_resolve_env(); }
 void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool dumped = mi_dhat_dump(dhat_dump_at_exit); MI_UNUSED(dumped); } }
@@ -22018,7 +22469,21 @@ void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool d
 // src/fork.c's file comment).
 void _mi_dhat_fork_prepare(void) { mi_lock_acquire(&dhat_lock); }
 void _mi_dhat_fork_parent(void)  { mi_lock_release(&dhat_lock); }
-void _mi_dhat_fork_child(void)   { mi_lock_init(&dhat_lock); _mi_atomic_once_fork_child_reset(&dhat_once); }
+// #551: only the forking thread survives, so an event another thread had in flight never
+// finishes in the child, and neither does a stop another thread was draining. Left as
+// inherited, they made mi_dhat_stop spin forever and mi_dhat_start always fail. Keep only
+// this thread's own contribution: an event it armed (fork() from a memory-change callback)
+// still finishes here and decrements, so zeroing unconditionally would underflow.
+void _mi_dhat_fork_child(void) {
+  mi_lock_init(&dhat_lock);
+  _mi_atomic_once_fork_child_reset(&dhat_once);
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  mi_atomic_store_relaxed(&dhat_inflight, (size_t)(hooks != NULL && hooks->dhat_event.armed ? 1 : 0));
+  if (mi_atomic_load_relaxed(&dhat_stopping) != 0) {
+    dhat_ended = _mi_clock_now();  // what the interrupted stop would have stamped after draining
+    mi_atomic_store_relaxed(&dhat_stopping, (size_t)0);
+  }
+}
 
 #else
 /* #371: MI_DHAT=0 -- the observer is compiled out and costs nothing.
@@ -22288,6 +22753,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 0,      MI_OPTION_UNINIT, MI_OPTION(snapshot_on_exit) }       // write a heap snapshot on process exit (=0). 1=on, 2=on+blocks. Bun parity (#338)
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
+  ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(large_span) }             // #532: demand-sized large-page spans (MIMALLOC_LARGE_SPAN); 0 = every large page is MI_LARGE_PAGE_SIZE
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -24849,6 +25315,9 @@ static void mi_page_to_full(mi_page_t* page, mi_page_queue_t* pq) {
   mi_assert_internal(!mi_page_is_in_full(page));
 
   mi_theap_t* theap = mi_page_theap(page);
+  #if MI_LARGE_SPAN
+  _mi_large_span_on_full(theap, page);   // #532: demand beyond this page (src/large-span.c)
+  #endif
   if (theap->allow_page_abandon) {
     // abandon full pages (this is the usual case in order to allow for sharing of memory between theaps)
     _mi_page_abandon(page, pq);
@@ -27543,6 +28012,8 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
     _mi_fprintf(NULL, NULL, "      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\n");
   }
 
+  _mi_arena_layout_print(&rep->arena_layout);   // #519: prints nothing unless MI_DIAGNOSTICS
+
   _mi_fprintf(NULL, NULL, "%10s %8s %10s %10s %18s %13s %13s\n",
               "size_class", "pages", "live_MB", "free_MB", "undiscardable_MB", "discarded_MB", "avg_live_blocks_per_pinned_ospage");
   _mi_memzero(&total, sizeof(total));
@@ -27652,7 +28123,10 @@ void _mi_purge_holes_report_collect(mi_holes_report_t* rep) {
     }
     // The committed partition is a property of the subprocess's arenas, not of a heap, so count it
     // once: every heap of this thread reaches the same arenas.
-    if (heap_count > 0) { _mi_arenas_holes_committed(heaps[0], rep); }
+    if (heap_count > 0) {
+      _mi_arenas_holes_committed(heaps[0], rep);
+      (void)_mi_arena_layout_walk(heaps[0]->subproc, NULL, &rep->arena_layout);   // #519: zeroed unless MI_DIAGNOSTICS
+    }
   }
   MI_GATE_LEAVE(tld);
 }
@@ -27663,6 +28137,153 @@ void mi_purge_holes_report(void) mi_attr_noexcept {
   _mi_page_holes_report_print(&rep);
 }
 /* ---- end inlined: src/page-holes.c ---- */
+/* ---- begin inlined: src/large-span.c ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2026, the mimalloc-pprof authors
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+
+/* -----------------------------------------------------------
+  Demand-sized large-page spans  (#532, supersedes #443)
+
+  Upstream gives every page of a large bin (blocks of ~84-512 KiB) the same 4 MiB span
+  (MI_LARGE_PAGE_SIZE). Each thread holds one such page per large bin it uses, so a thread that
+  touches all eleven bins holds ~44 MiB of large pages whether it keeps 5 or 50 MiB of blocks in
+  them. #529 (E4) measured it: 98-99% of that memory was never formed into blocks, and it was
+  resident all the same (2 MiB transparent huge pages fault it in with the first block, and a
+  page carved over resident slices keeps the previous tenant's bytes). At a fixed live budget the
+  peak grew ~49 MiB per added worker.
+
+  So a new large page is sized from what its bin demands on the theap that asks for it:
+
+  - Accounting, per theap and per large bin, in slow paths only:
+      * `_mi_large_span_on_full` (page.c, `mi_page_to_full`): a page of the bin filled up;
+      * `_mi_large_span_slices` (arena.c, `_mi_arenas_page_alloc`): a page request, which comes
+        only when the bin has no page with a free block left on the theap.
+    Nothing is allocated (rule 4) and the malloc/free fast paths are untouched (rule 6): the
+    state is a small table at the end of `mi_theap_t`.
+  - Policy: a request after a page of the bin filled up is demand beyond the pages the theap has;
+    a request without one means the bin's last page emptied and went away. The bin counts them
+    against each other (+1 / -1): at MI_LARGE_SPAN_GROW_REQUESTS the span steps up
+    (x 2^MI_LARGE_SPAN_GROW_SHIFT, up to MI_LARGE_PAGE_SIZE), at -MI_LARGE_SPAN_DECAY_REQUESTS it
+    steps back down. A bin's first page is compact (MI_LARGE_SPAN_COMPACT_SLICES). A bin a theap
+    keeps filling reaches and keeps the full span; a bin with a few live blocks stays compact, and
+    one extra block now and then (a compact page of the top bins holds two) does not grow it.
+  - Deterministic per theap: no thread count, no clock. (#443 chose the span from the number of
+    live threads at the time the page was created; the owner rejected that.)
+
+  A consequence every reader of a large page must respect: the pages of one bin no longer all have
+  the same span, so a page found by bin does not imply its size. Everything reads the span from the
+  page itself (`page->memid`, `mi_page_arena_pages`); `mi_arenas_page_try_find_abandoned` used to
+  validate a reclaimed page over the size a fresh page of the caller would get, and now reads the
+  page's own (the out-of-range read #443 found, test/test-large-span.c case c).
+----------------------------------------------------------- */
+
+
+#if MI_LARGE_SPAN
+
+// the table index of a large block size, or MI_LARGE_SPAN_BINS if it is not a large one
+static size_t mi_large_span_index(size_t block_size) {
+  if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return MI_LARGE_SPAN_BINS;
+  const size_t bin_lo = _mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin = _mi_bin(block_size);
+  mi_assert_internal(bin >= bin_lo);
+  const size_t idx = bin - bin_lo;
+  mi_assert_internal(idx < MI_LARGE_SPAN_BINS);   // MI_LARGE_SPAN_BINS must cover every large bin
+  return (idx < MI_LARGE_SPAN_BINS ? idx : MI_LARGE_SPAN_BINS);
+}
+
+#if MI_LARGE_SPAN_GROW_REQUESTS < 1 || MI_LARGE_SPAN_GROW_REQUESTS > 7 || MI_LARGE_SPAN_DECAY_REQUESTS < 1 || MI_LARGE_SPAN_DECAY_REQUESTS > 8
+#error "MI_LARGE_SPAN_GROW_REQUESTS must be 1..7 and MI_LARGE_SPAN_DECAY_REQUESTS 1..8 (a 4-bit signed count, see mi_large_span_bin_t)"
+#endif
+#if MI_LARGE_SPAN_GROW_SHIFT < 1 || MI_LARGE_SPAN_COMPACT_SLICES < 1
+#error "MI_LARGE_SPAN_GROW_SHIFT and MI_LARGE_SPAN_COMPACT_SLICES must be at least 1"
+#endif
+
+// the fields of the one-byte state of a bin (see mi_large_span_bin_t in types.h); all zero is a
+// bin that has seen nothing: compact, no pressure
+#define MI_LARGE_SPAN_LEVEL_MASK      (0x07)
+#define MI_LARGE_SPAN_FULL_BIT        (0x08)
+#define MI_LARGE_SPAN_PRESSURE_SHIFT  (4)
+
+static size_t mi_large_span_level(mi_large_span_bin_t b) { return (b & MI_LARGE_SPAN_LEVEL_MASK); }
+static long mi_large_span_pressure(mi_large_span_bin_t b) {
+  const long p = (long)(b >> MI_LARGE_SPAN_PRESSURE_SHIFT);   // 0..15
+  return (p >= 8 ? p - 16 : p);                               // -8..7
+}
+static mi_large_span_bin_t mi_large_span_pack(size_t level, long pressure) {
+  mi_assert_internal(level <= MI_LARGE_SPAN_LEVEL_MASK && pressure >= -8 && pressure <= 7);
+  return (mi_large_span_bin_t)((((unsigned long)pressure & 0x0F) << MI_LARGE_SPAN_PRESSURE_SHIFT) | level);   // (the full bit clear)
+}
+
+// the span of `level`, uncapped (the shift is bounded: a level only grows while below the full span)
+static size_t mi_large_span_level_slices(size_t level) {
+  return ((size_t)MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT));
+}
+
+void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
+  if (theap == NULL) return;
+  const size_t idx = mi_large_span_index(mi_page_block_size(page));
+  if (idx >= MI_LARGE_SPAN_BINS) return;
+  theap->large_span[idx] |= MI_LARGE_SPAN_FULL_BIT;
+}
+
+// A page request of a large bin on `theap`: account it, and return the span (in slices) of the
+// page to create for it if no abandoned page of the bin is reclaimed instead. `overhead` is what a
+// page of `block_size` spends besides its blocks in the worst case (meta in front, guard page).
+size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
+  if (!mi_option_is_enabled(mi_option_large_span)) return full;
+  const size_t idx = mi_large_span_index(block_size);
+  if (idx >= MI_LARGE_SPAN_BINS) return full;
+
+  const mi_large_span_bin_t b = theap->large_span[idx];
+  size_t level = mi_large_span_level(b);
+  long pressure = mi_large_span_pressure(b);
+  if ((b & MI_LARGE_SPAN_FULL_BIT) != 0) {
+    // a page of the bin filled up since its last request: demand beyond what the theap holds
+    pressure++;
+    if (pressure >= MI_LARGE_SPAN_GROW_REQUESTS) {
+      if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; }
+      pressure = 0;
+    }
+  }
+  else if (level > 0) {
+    // the bin's last page emptied and went away without filling up
+    pressure--;
+    if (pressure <= -MI_LARGE_SPAN_DECAY_REQUESTS) {
+      level--;
+      pressure = 0;
+    }
+  }
+  else if (pressure > 0) {
+    pressure--;   // (at the compact span only a pending step up can fade)
+  }
+  theap->large_span[idx] = mi_large_span_pack(level, pressure);
+
+  size_t slices = mi_large_span_level_slices(level);
+  const size_t min_slices = mi_slice_count_of_size(MI_LARGE_SPAN_MIN_BLOCKS * block_size + overhead);
+  if (slices < min_slices) { slices = min_slices; }
+  if (slices > full) { slices = full; }
+  return slices;
+}
+
+#else // !MI_LARGE_SPAN: every large page gets MI_LARGE_PAGE_SIZE (and the hook sites compile out)
+
+size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  MI_UNUSED(theap); MI_UNUSED(block_size); MI_UNUSED(overhead);
+  return mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+}
+
+void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
+  MI_UNUSED(theap); MI_UNUSED(page);
+}
+
+#endif // MI_LARGE_SPAN
+/* ---- end inlined: src/large-span.c ---- */
 /* ---- begin inlined: src/purge-all.c ---- */
 /* ----------------------------------------------------------------------------
 Copyright (c) 2026, the mimalloc-pprof contributors
@@ -27969,14 +28590,18 @@ int mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_
   // A. arenas: everything due (or, forced, everything purgeable) goes back to the OS first
   mi_purge_all_arenas(force);
 
+  // The caller's tld is used for hole-sweep bookkeeping in B as well as for its own
+  // sweep in C. In a gated build it may be PARKED between allocator calls, allowing
+  // the scavenger to claim it unless we enter the owner gate for both phases.
+  MI_GATE_ENTER(my_theap);
+
   // B. abandoned pages of every heap of every subproc
+  MI_GATE_ASSERT_HELD(my_theap);
   mi_purge_all_abandoned(my_tld);
 
-  // C. our own tld, through the OWNER door: `mi_theap_collect` is a public (gated) entry, and
-  //    the hole sweep is not, so both run under one enter / one leave of our own gate -- in a
-  //    gated build we are PARKED between allocator calls and the scavenger could otherwise be
-  //    sweeping these very free lists. (Ungated: the macros expand to nothing; we are RUNNING.)
-  MI_GATE_ENTER(my_theap);
+  // C. our own tld, through the OWNER door: `mi_theap_collect` is a public (gated) entry,
+  //    and the hole sweep is not. Both remain under the gate entered before B.
+  //    (Ungated: the macros expand to nothing; we are RUNNING.)
   mi_theap_collect(my_theap, force);
   _mi_purge_holes_of(my_tld, force);
   MI_GATE_LEAVE(my_tld);
@@ -28483,6 +29108,208 @@ void _mi_arenas_reclaim_now(mi_tld_t* my_tld, size_t wait_ms, mi_arena_reclaim_r
   }
 }
 /* ---- end inlined: src/arena-reclaim.c ---- */
+/* ---- begin inlined: src/arena-layout.c ---- */
+/* The arena layout walk (#519, the rest of #517 item 2), part of `mi_purge_holes_report`.
+
+   WHY
+
+   #514's memory-gate regression (58 -> 62 MB peak RSS) was located by hand: a walk over every
+   arena slice, classified by the `slices_free` / `slices_purge` / `slices_purge_aged` bitmaps,
+   showed the thread churn ending with 54 MB of free-and-queued runs instead of 32 MB, because
+   resident-first claims of small and medium pages took other size classes' queued runs and
+   those classes spilled into fresh chunks. This file makes that walk permanent, so the next
+   such regression is attributed to chunk fragmentation from the report instead of a bisect.
+
+   WHAT
+
+   Every DATA slice of an arena (the `info_slices` in front are the arena's own metadata and are
+   only counted) is classified into exactly one `mi_arena_layout_kind_t`:
+
+     IN_USE       not in `slices_free`: a page (or a direct arena allocation) owns it
+     FRESH        free and not dirty: never handed out (or purged to zero), costs nothing
+     FREE_DIRTY   free, dirty and not queued: purged earlier by a reset (the dirty bit survives
+                  it, so this is an UPPER bound on residency) or in an arena that never purges
+     QUEUED       free and in `slices_purge` (or `slices_purge_short`, #506): waiting for the purge
+                  delay, certainly resident
+     QUEUED_AGED  free and in `slices_purge_aged` (or `slices_purge_short_aged`): queued since the
+                  previous purge deadline of its queue
+
+   and, orthogonally, counted as committed when its `slices_committed` bit is set (address
+   space, not residency, on POSIX: see `mi_holes_report_t`). Then, walking each chunk
+   (MI_BCHUNK_BITS slices) in index order, every maximal run of one kind inside the chunk is
+   counted with its length. Everything is summed per chunk SIZE CLASS -- the `mi_chunkbin_t` the
+   `slices_free` bbitmap assigned the chunk (small / other / medium / large / huge, or none for
+   a chunk nothing claimed yet) -- because keeping the size classes in separate chunks is what
+   `mi_bbitmap_try_find_and_clearN` relies on to limit fragmentation, and #514 was exactly one
+   class eating another's runs. Run lengths go into power-of-two buckets
+   (`_mi_arena_layout_bucket`), so "many short queued runs in `other` chunks next to fresh
+   `small` chunks" is one glance at the table.
+
+   HOW (the safety rules)
+
+   Read-only: relaxed loads of the arena bitmaps, the same reads `_mi_arenas_holes_committed`
+   makes, so a concurrent claim or free can move a slice between kinds while we look (the counts
+   are a snapshot, not an atomic one). It takes no page ownership, no lock, and allocates
+   nothing: the output is a fixed-size struct the caller owns (CLAUDE.md rule 4). The arenas
+   must stay alive while it runs, which the caller guarantees by being inside the allocator
+   (`_mi_purge_holes_report_collect` walks under its owner gate, so the free-arena reclaim of
+   `mi_purge_all_ex(MI_PURGE_RECLAIM)` cannot run). It is never called from an allocation path.
+
+   Compiled in only with MI_DIAGNOSTICS=1 (#414: every observability subsystem is opt-in); the
+   `#else` stubs zero the output and print nothing, so `mi_holes_report_t` and its callers are
+   identical in every configuration. */
+
+
+// The `run_hist` bucket of a run of `run_slices` slices: floor(log2(run_slices)), so bucket b
+// holds the lengths [2^b, 2^(b+1)). Needs no build flag: it is pure arithmetic.
+size_t _mi_arena_layout_bucket(size_t run_slices) {
+  size_t b = 0;
+  if (!mi_bsr(run_slices, &b)) return 0;   // (a zero-length run is not a run)
+  return (b < MI_ARENA_LAYOUT_RUN_BUCKETS ? b : MI_ARENA_LAYOUT_RUN_BUCKETS - 1);
+}
+
+#if MI_DIAGNOSTICS
+
+static mi_arena_layout_kind_t mi_arena_layout_kind_at(mi_arena_t* arena, size_t slice_index) {
+  if (!mi_bbitmap_is_setN(arena->slices_free, slice_index, 1)) return MI_ARENA_LAYOUT_IN_USE;
+  if (mi_bitmap_is_set(arena->slices_purge_aged, slice_index) || mi_bitmap_is_set(arena->slices_purge_short_aged, slice_index)) return MI_ARENA_LAYOUT_QUEUED_AGED;
+  if (mi_bitmap_is_set(arena->slices_purge, slice_index) || mi_bitmap_is_set(arena->slices_purge_short, slice_index))      return MI_ARENA_LAYOUT_QUEUED;
+  if (mi_bitmap_is_set(arena->slices_dirty, slice_index))      return MI_ARENA_LAYOUT_FREE_DIRTY;
+  return MI_ARENA_LAYOUT_FRESH;
+}
+
+static void mi_arena_layout_add_run(mi_arena_layout_class_t* cls, mi_arena_layout_kind_t kind, size_t run_slices) {
+  if (run_slices == 0) return;
+  cls->runs[kind]++;
+  cls->run_hist[kind][_mi_arena_layout_bucket(run_slices)]++;
+  if (run_slices > cls->max_run[kind]) { cls->max_run[kind] = run_slices; }
+}
+
+static void mi_arena_layout_walk_arena(mi_arena_t* arena, mi_arena_layout_t* out) {
+  const size_t slice_count = arena->slice_count;
+  const size_t info_slices = arena->info_slices;
+  out->arenas++;
+  out->meta_slices += info_slices;
+  const size_t chunk_count = _mi_divide_up(slice_count, MI_BCHUNK_BITS);
+  for (size_t chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
+    const size_t chunk_start = chunk_idx * MI_BCHUNK_BITS;
+    const size_t start = (chunk_start > info_slices ? chunk_start : info_slices);
+    const size_t end   = (chunk_start + MI_BCHUNK_BITS < slice_count ? chunk_start + MI_BCHUNK_BITS : slice_count);
+    if (start >= end) continue;   // the chunk holds only the arena's own info slices
+
+    const mi_chunkbin_t bin = mi_bbitmap_debug_get_bin(arena->slices_free->chunkmap_bins, chunk_idx);
+    mi_assert_internal(bin < MI_CBIN_COUNT);
+    mi_arena_layout_class_t* const cls = &out->cls[bin];
+    cls->chunks++;
+    out->chunks++;
+
+    mi_arena_layout_kind_t run_kind = MI_ARENA_LAYOUT_IN_USE;
+    size_t run_slices = 0;
+    for (size_t i = start; i < end; i++) {
+      const mi_arena_layout_kind_t kind = mi_arena_layout_kind_at(arena, i);
+      cls->slices[kind]++;
+      if (mi_bitmap_is_set(arena->slices_committed, i)) { cls->committed_slices[kind]++; }
+      if (run_slices > 0 && kind == run_kind) {
+        run_slices++;
+      }
+      else {
+        mi_arena_layout_add_run(cls, run_kind, run_slices);
+        run_kind = kind;
+        run_slices = 1;
+      }
+    }
+    mi_arena_layout_add_run(cls, run_kind, run_slices);   // runs never cross a chunk
+  }
+}
+
+bool _mi_arena_layout_walk(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_layout_t* out) {
+  if (out == NULL) return false;
+  _mi_memzero(out, sizeof(*out));
+  if (subproc == NULL) return false;
+  if (arena != NULL) {
+    if (arena->subproc != subproc) return false;
+    mi_arena_layout_walk_arena(arena, out);
+    return true;
+  }
+  const size_t arena_count = mi_atomic_load_relaxed(&subproc->arena_count);
+  for (size_t i = 0; i < arena_count; i++) {
+    mi_arena_t* const a = mi_atomic_load_ptr_acquire(mi_arena_t, &subproc->arenas[i]);
+    if (a != NULL) { mi_arena_layout_walk_arena(a, out); }   // a reclaimed slot is NULL
+  }
+  return true;
+}
+
+/* ---- printing (from `_mi_page_holes_report_print`) ----------------------- */
+
+static const char* const mi_arena_layout_class_name[MI_CBIN_COUNT] = { "small", "other", "medium", "large", "huge", "none" };
+static const char* const mi_arena_layout_kind_name[MI_ARENA_LAYOUT_KIND_COUNT] = { "in_use", "fresh", "free_dirty", "queued", "queued_aged" };
+
+static void mi_arena_layout_mb(size_t slices, char* buf, size_t bufsize) {
+  const size_t bytes = mi_size_of_slices(slices);
+  _mi_snprintf(buf, bufsize, "%zu.%02zu", bytes / MI_MiB, ((bytes % MI_MiB) * 100) / MI_MiB);
+}
+
+static size_t mi_arena_layout_total(const mi_arena_layout_t* layout, mi_arena_layout_kind_t kind) {
+  size_t n = 0;
+  for (size_t c = 0; c < MI_CBIN_COUNT; c++) { n += layout->cls[c].slices[kind]; }
+  return n;
+}
+
+void _mi_arena_layout_print(const mi_arena_layout_t* layout) {
+  if (layout == NULL || layout->arenas == 0) return;
+  char s[MI_ARENA_LAYOUT_KIND_COUNT][32], smeta[32];
+  for (size_t k = 0; k < MI_ARENA_LAYOUT_KIND_COUNT; k++) {
+    mi_arena_layout_mb(mi_arena_layout_total(layout, (mi_arena_layout_kind_t)k), s[k], sizeof(s[k]));
+  }
+  mi_arena_layout_mb(layout->meta_slices, smeta, sizeof(smeta));
+  _mi_fprintf(NULL, NULL, "  arena layout (#519): %zu arenas, %zu chunks of %zu slices, %s MB arena meta\n",
+              layout->arenas, layout->chunks, (size_t)MI_BCHUNK_BITS, smeta);
+  _mi_fprintf(NULL, NULL, "    in use %s MB; free: queued %s MB + aged %s MB (resident), dirty not queued %s MB (upper bound), fresh %s MB\n",
+              s[MI_ARENA_LAYOUT_IN_USE], s[MI_ARENA_LAYOUT_QUEUED], s[MI_ARENA_LAYOUT_QUEUED_AGED],
+              s[MI_ARENA_LAYOUT_FREE_DIRTY], s[MI_ARENA_LAYOUT_FRESH]);
+  _mi_fprintf(NULL, NULL, "    %-7s %7s %10s %10s %10s %10s %10s   (MB per chunk size class)\n",
+              "class", "chunks", "in_use", "fresh", "free_dirty", "queued", "aged");
+  for (size_t c = 0; c < MI_CBIN_COUNT; c++) {
+    const mi_arena_layout_class_t* const cls = &layout->cls[c];
+    if (cls->chunks == 0) continue;
+    for (size_t k = 0; k < MI_ARENA_LAYOUT_KIND_COUNT; k++) { mi_arena_layout_mb(cls->slices[k], s[k], sizeof(s[k])); }
+    _mi_fprintf(NULL, NULL, "    %-7s %7zu %10s %10s %10s %10s %10s\n", mi_arena_layout_class_name[c], cls->chunks,
+                s[MI_ARENA_LAYOUT_IN_USE], s[MI_ARENA_LAYOUT_FRESH], s[MI_ARENA_LAYOUT_FREE_DIRTY],
+                s[MI_ARENA_LAYOUT_QUEUED], s[MI_ARENA_LAYOUT_QUEUED_AGED]);
+  }
+  _mi_fprintf(NULL, NULL, "    runs per class and kind (a run never crosses a chunk): count, longest, then length:count by power of two\n");
+  for (size_t c = 0; c < MI_CBIN_COUNT; c++) {
+    const mi_arena_layout_class_t* const cls = &layout->cls[c];
+    for (size_t k = 0; k < MI_ARENA_LAYOUT_KIND_COUNT; k++) {
+      if (cls->runs[k] == 0) continue;
+      char hist[MI_ARENA_LAYOUT_RUN_BUCKETS * 24];
+      size_t len = 0;
+      hist[0] = 0;
+      for (size_t b = 0; b < MI_ARENA_LAYOUT_RUN_BUCKETS && len + 1 < sizeof(hist); b++) {
+        if (cls->run_hist[k][b] == 0) continue;
+        _mi_snprintf(hist + len, sizeof(hist) - len, " %zu:%zu", (size_t)1 << b, cls->run_hist[k][b]);
+        len += _mi_strlen(hist + len);
+      }
+      _mi_fprintf(NULL, NULL, "    %-7s %-11s runs %6zu  longest %4zu |%s\n", mi_arena_layout_class_name[c],
+                  mi_arena_layout_kind_name[k], cls->runs[k], cls->max_run[k], hist);
+    }
+  }
+}
+
+#else  // !MI_DIAGNOSTICS: the stubs keep `mi_holes_report_t` and its callers identical
+
+bool _mi_arena_layout_walk(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_layout_t* out) {
+  MI_UNUSED(subproc); MI_UNUSED(arena);
+  if (out != NULL) { _mi_memzero(out, sizeof(*out)); }
+  return false;
+}
+
+void _mi_arena_layout_print(const mi_arena_layout_t* layout) {
+  MI_UNUSED(layout);
+}
+
+#endif
+/* ---- end inlined: src/arena-layout.c ---- */
 /* ---- begin inlined: src/profile.c ---- */
 /* Allocation sampling profiler.  Its records never use mimalloc: the arena
    below is backed directly by _mi_os_alloc so profiler bookkeeping cannot
@@ -28685,6 +29512,15 @@ mi_decl_export size_t  mi_heap_get_seq(mi_heap_t* heap) mi_attr_noexcept;
 #if MI_PPROF
 
 #define MI_PROF_CHUNK_SIZE (64*1024)
+/* #549: result buffer for a short environment value (a decimal size, a format name).
+   `_mi_getenv` (src/libc.c, upstream) refuses any buffer under 64 bytes with ENOENT, the
+   same code as "not set", so a smaller buffer silently ignores the variable. */
+#ifndef MI_PROF_ENV_VALUE_SIZE
+#define MI_PROF_ENV_VALUE_SIZE 64
+#endif
+#if MI_PROF_ENV_VALUE_SIZE < 64
+#error "MI_PROF_ENV_VALUE_SIZE must be at least 64: _mi_getenv (src/libc.c) treats a smaller buffer as an unset variable"
+#endif
 
 typedef struct mi_prof_chunk_s {
   struct mi_prof_chunk_s* next;
@@ -28757,14 +29593,16 @@ static inline size_t prof_max(size_t x, size_t y) { return (x > y ? x : y); }
 
 /* ---- small helpers shared by mi_prof_start_ex's env/struct precedence resolution -----------
    (see mi_prof_config_t's mode documentation in profile.h for the FALLBACK/OVERRIDE contract). */
+/* #549: a value that does not fit the buffer reads as absent, so the probe must hold the
+   longest value it checks -- the MIMALLOC_PROF_DUMP_AT_EXIT path. */
 static bool prof_env_present(const char* name) {
-  char buf[64];
+  char buf[sizeof(prof_dump_at_exit)];
   return (_mi_getenv(name, buf, sizeof(buf)) == 0);
 }
 /* Tiny local decimal parser (mirrors options.c's mi_option_init, minus the KiB-suffix and
    boolean-string handling those don't apply to a raw byte count like MIMALLOC_PROF_SAMPLE_INTERVAL). */
 static bool prof_env_get_size(const char* name, size_t* out) {
-  char buf[64];
+  char buf[MI_PROF_ENV_VALUE_SIZE];
   if (_mi_getenv(name, buf, sizeof(buf)) != 0) return false;
   if (buf[0] == 0) return false;
   char* end = buf;
@@ -29025,7 +29863,7 @@ bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
       prof_dump_at_exit_format = config->dump_format;
     }
     else if (env_present) {
-      char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
+      char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
       if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
     }
   }
@@ -29561,7 +30399,7 @@ static void prof_auto_start(void) {
     if (mi_option_is_enabled(mi_option_prof)) { const bool started = mi_prof_start(0); MI_UNUSED(started); }
     (void)_mi_getenv("MIMALLOC_PROF_DUMP_AT_EXIT", prof_dump_at_exit, sizeof(prof_dump_at_exit));
     /* So pure-env users (no mi_prof_start_ex call at all) still get profile.proto exit dumps. */
-    char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
+    char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
     if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
   }
 }
@@ -29795,6 +30633,45 @@ void _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size) {
   mi_lock_acquire(&prof_lock); prof_realloc_in_place(page,p,size); mi_lock_release(&prof_lock);
 }
 
+// #550: `_mi_heap_force_destroy` (mi_heap_destroy, and mi_subproc_destroy for every heap of the
+// sub-process, its main heap included) releases a heap's pages without freeing their blocks one
+// by one, so the free hooks above never see those blocks go. This is the profiler's analogue of
+// `_mi_dhat_forget_heap`, called from the same spot: after the heap's theaps are detached (no new
+// record can appear for it) and while its pages are still valid. Before it existed the records
+// outlived their pages, the live counters stayed inflated, and `mi_prof_stop` wrote
+// `metadata`/`has_metadata` into pages already returned to the arena or the OS.
+//
+// The teardown counts as a free: live counters and the stacks' current counts drop, cumulative
+// (accum) ones do not move. Nothing is allocated (CLAUDE.md rule 4); records go back on
+// `prof_free`. The walk is O(live records), like the `prof_all` unlink of every sampled free.
+static void prof_forget_heap(mi_heap_t* heap) {
+  mi_prof_record_t** cur = &prof_all;
+  while (*cur != NULL) {
+    mi_prof_record_t* const rec = *cur;
+    mi_page_t* const page = rec->page;
+    if (mi_page_heap(page) != heap) { cur = &rec->all_next; continue; }
+    *cur = rec->all_next;
+    // A page belongs to one heap, so this walk takes every record on its chain.
+    page->metadata = NULL; page->has_metadata = false;
+    mi_atomic_decrement_relaxed(&prof_records); mi_atomic_sub_relaxed(&prof_bytes, rec->size);
+    _mi_prof_stack_free(rec->stack, rec->size);
+    _mi_prof_stack_release(rec->stack);
+    rec->next = prof_free; prof_free = rec;
+  }
+}
+// Always takes the lock, never an unlocked "no records" test first: a racing `mi_prof_stop`
+// writes into these same pages under `prof_lock`, and only acquiring it orders those writes
+// before the pages are freed. A heap teardown is not a hot path. `prof_lock` is innermost, so
+// taking it with `subproc->heaps_lock` held (mi_subproc_destroy) respects the lock order. A
+// destroy from inside a `mi_prof_visit` callback already owns the lock (see `_mi_prof_on_free`);
+// the visit pinned every stack entry, so `_mi_prof_stack_release` moves none of them.
+void _mi_prof_forget_heap(mi_heap_t* heap) {
+  if (heap == NULL) return;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_forget_heap(heap); return; }
+  mi_lock_acquire(&prof_lock); prof_forget_heap(heap); mi_lock_release(&prof_lock);
+}
+
 #else
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { MI_UNUSED(sample_rate); return false; }
 bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept { MI_UNUSED(sample_rate); MI_UNUSED(seed); return false; }
@@ -29815,6 +30692,7 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
 void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { MI_UNUSED(snap); }
 void _mi_prof_process_init(void) { }
 void _mi_prof_process_done(void) { }
+void _mi_prof_forget_heap(mi_heap_t* heap) { MI_UNUSED(heap); }  // #550: no records to forget
 // #270: no `prof_lock` exists when MI_PPROF is off -- nothing to quiesce.
 void _mi_prof_fork_prepare(void) { }
 void _mi_prof_fork_parent(void)  { }

@@ -126,6 +126,14 @@ impl LinkedAdapter {
         self.identity
     }
 
+    /// Exercise the allocator's null-free path used by perf-ab diagnostic streams.
+    pub fn free_null(&self) {
+        #[cfg(benchmark_native_adapter)]
+        unsafe {
+            bench_free(std::ptr::null_mut())
+        }
+    }
+
     #[cfg(benchmark_native_adapter)]
     pub fn alloc(&self, size: usize) -> Result<NonNull<u8>, AdapterError> {
         if size == 0 {

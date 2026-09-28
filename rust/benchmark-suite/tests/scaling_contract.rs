@@ -12,6 +12,7 @@ use benchmark_suite::scaling::{
     stream_seed, validate_scaling_raw_run, validate_scaling_report, PlannedAction, ScalingCounts,
     ScalingPattern, ScalingRawRun, WorkerPlanner, SCALING_BLOCKS, SCALING_CHILD_PROTOCOL_VERSION,
     SCALING_PATTERNS, SCALING_RIGOR_LABEL, SCALING_SCHEMA_VERSION, SCALING_THREAD_POINTS,
+    THREAD_CHURN_BLOCKS, THREAD_CHURN_POST_DRAIN_OFFSETS_MS, THREAD_CHURN_THREADS,
 };
 use benchmark_suite::scaling::{merge_scaling_runs, scaling_thread_points_for_shard};
 
@@ -422,6 +423,10 @@ fn split_fixture(raw: &ScalingRawRun, shard_count: usize) -> Vec<ScalingRawRun> 
             shard
                 .samples
                 .retain(|value| threads.contains(&value.thread_count));
+            // thread-churn runs on the shard that measures its worker count.
+            if !threads.contains(&THREAD_CHURN_THREADS) {
+                shard.thread_churn_samples.clear();
+            }
             shard.run.generated_at_utc = format!("2026-08-13T00:00:0{shard_index}Z");
             shard
         })
@@ -478,6 +483,84 @@ fn scaling_merge_rejects_mismatch_missing_and_overlap() {
     let mut shards = split_fixture(&raw, 6);
     shards.push(shards[0].clone());
     assert!(merge_scaling_runs(shards).unwrap_err().contains("overlap"));
+
+    // thread-churn is recorded by exactly one shard.
+    let mut shards = split_fixture(&raw, 6);
+    shards[0].thread_churn_samples = raw.thread_churn_samples.clone();
+    assert!(merge_scaling_runs(shards)
+        .unwrap_err()
+        .contains("thread-churn"));
+
+    // A merge without the thread-churn blocks is not complete.
+    let mut shards = split_fixture(&raw, 6);
+    for shard in &mut shards {
+        shard.thread_churn_samples.clear();
+    }
+    assert_eq!(merge_scaling_runs(shards).unwrap().status, "incomplete");
+}
+
+#[test]
+fn complete_raw_run_requires_the_thread_churn_blocks() {
+    let raw = sample_run();
+    assert_eq!(
+        raw.thread_churn_samples.len(),
+        THREAD_CHURN_BLOCKS as usize * 5
+    );
+    let mut missing = raw.clone();
+    missing.thread_churn_samples.clear();
+    assert!(validate_scaling_raw_run(&missing)
+        .unwrap_err()
+        .contains("thread-churn"));
+    // A thread-churn sample must not hide in the sweep matrix.
+    let mut smuggled = raw.clone();
+    let sample = smuggled.thread_churn_samples.pop().unwrap();
+    smuggled.samples.push(sample);
+    assert!(validate_scaling_raw_run(&smuggled).is_err());
+    // The ephemeral cell's frozen count is what thread-churn must replay.
+    let mut moved = raw.clone();
+    moved
+        .calibrations
+        .iter_mut()
+        .find(|value| {
+            value.pattern == ScalingPattern::LargeClassEphemeral.as_str()
+                && value.thread_count == THREAD_CHURN_THREADS
+        })
+        .unwrap()
+        .operations_per_worker += 1;
+    assert!(validate_scaling_raw_run(&moved).is_err());
+}
+
+#[test]
+fn report_carries_a_thread_churn_side_car_derived_from_its_raw_samples() {
+    let raw = sample_run();
+    let report = build_scaling_report(&raw).unwrap();
+    let churn = report.thread_churn.as_ref().expect("thread-churn side-car");
+    assert_eq!(churn.cell_summaries.len(), 5);
+    assert_eq!(
+        churn.post_drain_offsets_ms,
+        THREAD_CHURN_POST_DRAIN_OFFSETS_MS.to_vec()
+    );
+    let fork = churn
+        .cell_summaries
+        .iter()
+        .find(|summary| summary.allocator_id == "mimalloc-pprof")
+        .unwrap();
+    // The fixture's fork releases by the 1.5 s sample; tcmalloc never falls.
+    assert_eq!(fork.median_release_ms, 1500);
+    assert_eq!(fork.median_post_drain_rss_bytes.len(), 6);
+    let history = report.history_projection();
+    let text = serde_json::to_string(&history).unwrap();
+    assert!(!text.contains("thread_churn"), "history rows stay compact");
+
+    let mut tampered = report.clone();
+    tampered.thread_churn.as_mut().unwrap().cell_summaries[0].median_release_ms += 1;
+    assert!(validate_scaling_report(&tampered).is_err());
+    let mut dropped = report.clone();
+    dropped.thread_churn = None;
+    assert!(validate_scaling_report(&dropped).is_err());
+    let mut offsets = report.clone();
+    offsets.thread_churn.as_mut().unwrap().post_drain_offsets_ms[0] = 50;
+    assert!(validate_scaling_report(&offsets).is_err());
 }
 
 #[test]
@@ -819,4 +902,148 @@ fn counts_helper_sums_every_allocator_call() {
         checksum: 9,
     };
     assert_eq!(counts.operation_count(), 12);
+}
+
+/// #534: the child reads its own RSS after setup, before any worker thread
+/// exists, so the floor charts have a baseline under every allocator's line.
+#[cfg(target_os = "linux")]
+#[test]
+fn child_reports_its_baseline_rss_before_any_worker_starts() {
+    for pattern in [ScalingPattern::RandomLarge, ScalingPattern::Larson] {
+        let adapter = MockAdapter::new("upstream-mimalloc");
+        let request = request_for(pattern, 2, 0, "upstream-mimalloc", 200);
+        let response = execute_scaling_child_request(&adapter, request).unwrap();
+        assert!(
+            response.baseline_rss_bytes > 0,
+            "{} reported no baseline RSS",
+            pattern.as_str()
+        );
+    }
+}
+
+/// The floor the report publishes for one replayed cell: the smallest
+/// baseline + concurrent live peak of any sample there, ties broken by the
+/// smaller baseline.
+fn expected_floor(raw: &ScalingRawRun, pattern: &str, threads: u32) -> (u64, u64) {
+    raw.samples
+        .iter()
+        .filter(|sample| sample.pattern == pattern && sample.thread_count == threads)
+        .map(|sample| {
+            (
+                sample.response.baseline_rss_bytes,
+                sample.diagnostic_peak_live_requested_bytes,
+            )
+        })
+        .min_by_key(|(baseline, live)| (baseline + live, *baseline))
+        .expect("cell has samples")
+}
+
+#[test]
+fn report_publishes_a_live_data_floor_for_every_memory_chart_cell() {
+    use benchmark_suite::scaling::{SCALING_RSS_FLOOR_THREAD_CHURN, SCALING_RSS_SCHEMA_VERSION};
+
+    let raw = sample_run();
+    let report = build_scaling_report(&raw).unwrap();
+    validate_scaling_report(&report).expect("a report with floors is publishable");
+    let rss = report.rss.as_ref().expect("RSS side-car");
+    assert_eq!(rss.metric_schema_version, SCALING_RSS_SCHEMA_VERSION);
+    let replayed = SCALING_PATTERNS
+        .into_iter()
+        .filter(|pattern| pattern.replays_live_telemetry(false))
+        .collect::<Vec<_>>();
+    assert!(!replayed.is_empty());
+    assert_eq!(
+        rss.floor_summaries.len(),
+        replayed.len() * SCALING_THREAD_POINTS.len() + 1
+    );
+    for pattern in &replayed {
+        for threads in SCALING_THREAD_POINTS {
+            let floor = rss
+                .floor_summaries
+                .iter()
+                .find(|floor| floor.pattern == pattern.as_str() && floor.thread_count == threads)
+                .unwrap_or_else(|| panic!("no floor for {}/{threads}", pattern.as_str()));
+            let (baseline, live) = expected_floor(&raw, pattern.as_str(), threads);
+            assert_eq!(floor.baseline_rss_bytes, baseline);
+            assert_eq!(floor.peak_live_requested_bytes, live);
+            assert_eq!(floor.floor_rss_bytes, baseline + live);
+            // Never above what an allocator was seen to use.
+            let lowest_peak = rss
+                .cell_summaries
+                .iter()
+                .filter(|cell| cell.pattern == pattern.as_str() && cell.thread_count == threads)
+                .map(|cell| cell.min_peak_rss_bytes)
+                .min()
+                .unwrap();
+            assert!(floor.floor_rss_bytes <= lowest_peak);
+        }
+    }
+    // After the drain nothing is live: the churn floor is the smallest baseline.
+    let churn = rss
+        .floor_summaries
+        .iter()
+        .find(|floor| floor.pattern == SCALING_RSS_FLOOR_THREAD_CHURN)
+        .expect("thread-churn floor");
+    let smallest = raw
+        .thread_churn_samples
+        .iter()
+        .map(|sample| sample.response.baseline_rss_bytes)
+        .min()
+        .unwrap();
+    assert_eq!(churn.thread_count, THREAD_CHURN_THREADS);
+    assert_eq!(
+        (
+            churn.baseline_rss_bytes,
+            churn.peak_live_requested_bytes,
+            churn.floor_rss_bytes
+        ),
+        (smallest, 0, smallest)
+    );
+}
+
+#[test]
+fn validator_rejects_a_floor_that_is_inconsistent_or_above_a_measured_peak() {
+    let raw = sample_run();
+    let good = build_scaling_report(&raw).unwrap();
+
+    let mut above = good.clone();
+    let rss = above.rss.as_mut().unwrap();
+    let floor = &mut rss.floor_summaries[0];
+    let lowest_peak = rss
+        .cell_summaries
+        .iter()
+        .filter(|cell| cell.pattern == floor.pattern && cell.thread_count == floor.thread_count)
+        .map(|cell| cell.min_peak_rss_bytes)
+        .min()
+        .unwrap();
+    floor.peak_live_requested_bytes += lowest_peak;
+    floor.floor_rss_bytes += lowest_peak;
+    assert!(
+        validate_scaling_report(&above).is_err(),
+        "a floor above a peak is a bug"
+    );
+
+    let mut unsummed = good.clone();
+    unsummed.rss.as_mut().unwrap().floor_summaries[0].floor_rss_bytes -= 1;
+    assert!(validate_scaling_report(&unsummed).is_err());
+
+    let mut missing = good;
+    missing.rss.as_mut().unwrap().floor_summaries.pop();
+    assert!(validate_scaling_report(&missing).is_err());
+}
+
+#[test]
+fn raw_run_without_a_baseline_rss_is_rejected() {
+    let mut raw = sample_run();
+    let sample = raw
+        .samples
+        .iter_mut()
+        .find(|sample| sample.pattern == ScalingPattern::RandomLarge.as_str())
+        .unwrap();
+    sample.response.baseline_rss_bytes = 0;
+    assert!(validate_scaling_raw_run(&raw).is_err());
+
+    let mut churn = sample_run();
+    churn.thread_churn_samples[0].response.baseline_rss_bytes = 0;
+    assert!(validate_scaling_raw_run(&churn).is_err());
 }

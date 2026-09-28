@@ -12,6 +12,7 @@ use std::fmt;
 pub const CORE_THROUGHPUT_V1: &str = "core-throughput-v1";
 
 const BATCH_WIDTH: u32 = 16;
+pub const PERF_AB_SLOT_COUNT: usize = 8;
 const SAWTOOTH_WIDTH: u32 = 12;
 const REALLOC_STEPS: u32 = 6;
 const CHURN_GENERATIONS: u32 = 8;
@@ -22,6 +23,7 @@ pub const MAX_REQUESTS_PER_TRANSACTION: usize = 3 * BATCH_WIDTH as usize;
 /// calibrations reproducible, this lets the controller derive data-dependent
 /// touch checksums without regenerating millions of transactions.
 pub const REQUEST_CYCLE_OPERATIONS: u64 = 20;
+pub const LARGE_OBJECT_128K_DIAGNOSTIC_SIZE_BYTES: usize = 128 * 1024;
 
 /// A declared point, before it is expanded using runner topology.  Keeping
 /// these symbolic is important: a machine with 12 physical cores must not
@@ -31,6 +33,7 @@ pub const REQUEST_CYCLE_OPERATIONS: u64 = 20;
 pub enum ThreadPoint {
     One,
     Two,
+    Eight,
     PhysicalCores,
     TwiceLogicalCores,
 }
@@ -40,6 +43,7 @@ impl ThreadPoint {
         match self {
             Self::One => "1",
             Self::Two => "2",
+            Self::Eight => "8",
             Self::PhysicalCores => "physical-core",
             Self::TwiceLogicalCores => "2x-logical",
         }
@@ -49,6 +53,7 @@ impl ThreadPoint {
         match value {
             "1" => Some(Self::One),
             "2" => Some(Self::Two),
+            "8" => Some(Self::Eight),
             "physical-core" => Some(Self::PhysicalCores),
             "2x-logical" => Some(Self::TwiceLogicalCores),
             _ => None,
@@ -93,6 +98,17 @@ impl Topology {
                     Ok(2)
                 }
             }
+            ThreadPoint::Eight => {
+                if self.logical_cores < 8 {
+                    Err(ScenarioError::InvalidExpansion {
+                        point,
+                        threads: 8,
+                        logical_cores: self.logical_cores,
+                    })
+                } else {
+                    Ok(8)
+                }
+            }
             ThreadPoint::PhysicalCores => Ok(self.physical_cores),
             ThreadPoint::TwiceLogicalCores => self
                 .logical_cores
@@ -126,6 +142,7 @@ pub enum ScenarioError {
         operation: u64,
         transactions: u64,
     },
+    LatencyOnlyCard,
 }
 
 impl fmt::Display for ScenarioError {
@@ -158,6 +175,10 @@ impl fmt::Display for ScenarioError {
                 f,
                 "operation {operation} is outside a {transactions}-transaction worker stream"
             ),
+            Self::LatencyOnlyCard => write!(
+                f,
+                "stateful diagnostic cards are available only through the latency executor"
+            ),
         }
     }
 }
@@ -188,6 +209,10 @@ impl OperationUnit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SizeDistribution {
     Fixed(usize),
+    UniformRange {
+        min: usize,
+        max: usize,
+    },
     LogParetoLike {
         min: usize,
         max: usize,
@@ -203,6 +228,7 @@ pub enum SizeDistribution {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifetimeRule {
     ImmediateFree,
+    AllocatorSlotStream,
     BatchLifo,
     BatchFifo,
     CrossThreadProducerConsumer,
@@ -225,6 +251,7 @@ pub enum TouchRule {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScenarioInvariant {
     AllocTouchFree,
+    AllocatorSlotStream,
     FreeOrderIsLifo,
     FreeOrderIsFifo,
     FreeIsRemote,
@@ -254,10 +281,13 @@ pub enum CardId {
     SawtoothRetainDrain,
     ThreadChurn,
     RepresentativeMix,
+    LargeObject128KiB,
+    RandomLargeBursty,
+    LargeClassPersistent,
 }
 
 impl CardId {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 18] = [
         Self::TinyFixed16,
         Self::TinyFixed64,
         Self::SmallLogMixed,
@@ -273,6 +303,9 @@ impl CardId {
         Self::SawtoothRetainDrain,
         Self::ThreadChurn,
         Self::RepresentativeMix,
+        Self::LargeObject128KiB,
+        Self::RandomLargeBursty,
+        Self::LargeClassPersistent,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -292,6 +325,9 @@ impl CardId {
             Self::SawtoothRetainDrain => "sawtooth-retain-drain",
             Self::ThreadChurn => "thread-churn",
             Self::RepresentativeMix => "representative-mix",
+            Self::LargeObject128KiB => "large-object-128k-diagnostic",
+            Self::RandomLargeBursty => "random-large-bursty-diagnostic",
+            Self::LargeClassPersistent => "large-class-diagnostic",
         }
     }
 
@@ -325,6 +361,9 @@ impl ScenarioCard {
             CardId::BatchLifo | CardId::BatchFifo | CardId::RepresentativeMix => {
                 BATCH_WIDTH as usize
             }
+            CardId::LargeObject128KiB
+            | CardId::RandomLargeBursty
+            | CardId::LargeClassPersistent => PERF_AB_SLOT_COUNT,
             CardId::SawtoothRetainDrain => SAWTOOTH_WIDTH as usize,
             _ => 1,
         }
@@ -344,6 +383,17 @@ impl ScenarioCard {
             CardId::LargeObjects => SizeDistribution::LogParetoLike {
                 min: 1024 * 1024,
                 max: 16 * 1024 * 1024,
+            },
+            CardId::LargeObject128KiB => {
+                SizeDistribution::Fixed(LARGE_OBJECT_128K_DIAGNOSTIC_SIZE_BYTES)
+            }
+            CardId::RandomLargeBursty => SizeDistribution::UniformRange {
+                min: 64 * 1024,
+                max: 4 * 1024 * 1024,
+            },
+            CardId::LargeClassPersistent => SizeDistribution::UniformRange {
+                min: 96 * 1024,
+                max: 512 * 1024,
             },
             CardId::BatchLifo
             | CardId::BatchFifo
@@ -369,6 +419,9 @@ impl ScenarioCard {
             | CardId::LargeObjects
             | CardId::CallocZero
             | CardId::AlignedRange => LifetimeRule::ImmediateFree,
+            CardId::LargeObject128KiB
+            | CardId::RandomLargeBursty
+            | CardId::LargeClassPersistent => LifetimeRule::AllocatorSlotStream,
             CardId::BatchLifo => LifetimeRule::BatchLifo,
             CardId::BatchFifo => LifetimeRule::BatchFifo,
             CardId::CrossThreadProducerConsumer => LifetimeRule::CrossThreadProducerConsumer,
@@ -382,7 +435,10 @@ impl ScenarioCard {
 
     pub const fn touch_rule(self) -> TouchRule {
         match self.id {
-            CardId::LargeObjects => TouchRule::PagePattern,
+            CardId::LargeObjects
+            | CardId::LargeObject128KiB
+            | CardId::RandomLargeBursty
+            | CardId::LargeClassPersistent => TouchRule::PagePattern,
             CardId::CallocZero => TouchRule::ZeroThenBytePattern,
             CardId::AlignedRange => TouchRule::AlignedAddressAndPattern,
             CardId::ReallocGeometric => TouchRule::PreserveThenBytePattern,
@@ -397,6 +453,9 @@ impl ScenarioCard {
             | CardId::SmallLogMixed
             | CardId::MediumLogMixed
             | CardId::LargeObjects => ScenarioInvariant::AllocTouchFree,
+            CardId::LargeObject128KiB
+            | CardId::RandomLargeBursty
+            | CardId::LargeClassPersistent => ScenarioInvariant::AllocatorSlotStream,
             CardId::BatchLifo => ScenarioInvariant::FreeOrderIsLifo,
             CardId::BatchFifo => ScenarioInvariant::FreeOrderIsFifo,
             CardId::CrossThreadProducerConsumer => ScenarioInvariant::FreeIsRemote,
@@ -525,8 +584,31 @@ pub const fn core_scenarios() -> &'static [ScenarioCard; 15] {
 }
 
 pub fn card(id: CardId) -> &'static ScenarioCard {
-    // `CardId::ALL` and CARDS intentionally have matching stable order.
-    &CARDS[id as usize]
+    // The diagnostic card is deliberately outside the published core catalogue.
+    static LARGE_OBJECT_128K_DIAGNOSTIC: ScenarioCard = ScenarioCard {
+        id: CardId::LargeObject128KiB,
+        operation_unit: OperationUnit::Transaction,
+        thread_points: &[ThreadPoint::One, ThreadPoint::Eight],
+        description: "diagnostic fixed 128 KiB requests with page touching",
+    };
+    static RANDOM_LARGE_BURSTY: ScenarioCard = ScenarioCard {
+        id: CardId::RandomLargeBursty,
+        operation_unit: OperationUnit::Transaction,
+        thread_points: &[ThreadPoint::Eight],
+        description: "perf-ab random-large-bursty/8: 40,000 C-style slot operations per worker, eight bursts, 300 ms inter-burst idle",
+    };
+    static LARGE_CLASS: ScenarioCard = ScenarioCard {
+        id: CardId::LargeClassPersistent,
+        operation_unit: OperationUnit::Transaction,
+        thread_points: &[ThreadPoint::Eight],
+        description: "perf-ab large-class/8: 400,000 C-style slot operations per persistent worker",
+    };
+    match id {
+        CardId::LargeObject128KiB => &LARGE_OBJECT_128K_DIAGNOSTIC,
+        CardId::RandomLargeBursty => &RANDOM_LARGE_BURSTY,
+        CardId::LargeClassPersistent => &LARGE_CLASS,
+        _ => &CARDS[id as usize],
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -729,7 +811,18 @@ impl ScenarioCell {
                 point: thread_point,
             });
         }
-        let threads = topology.resolve(thread_point)?;
+        let threads = if matches!(
+            card_id,
+            CardId::LargeObject128KiB | CardId::RandomLargeBursty | CardId::LargeClassPersistent
+        ) && thread_point == ThreadPoint::Eight
+        {
+            // The opt-in perf-ab diagnostic replays eight workers even on a
+            // smaller runner. Keep the actual CPU topology in its provenance.
+            topology.validate()?;
+            8
+        } else {
+            topology.resolve(thread_point)?
+        };
         let total_transactions = transactions_per_worker
             .checked_mul(threads as u64)
             .ok_or(ScenarioError::CountOverflow)?;
@@ -773,6 +866,12 @@ impl ScenarioCell {
         operation: u64,
         requests: &mut Vec<Request>,
     ) -> Result<(), ScenarioError> {
+        if matches!(
+            self.card,
+            CardId::LargeObject128KiB | CardId::RandomLargeBursty | CardId::LargeClassPersistent
+        ) {
+            return Err(ScenarioError::LatencyOnlyCard);
+        }
         if worker >= self.threads {
             return Err(ScenarioError::WorkerOutOfRange {
                 worker,
@@ -1005,6 +1104,16 @@ impl ScenarioCell {
             }
             CardId::LargeObjects => {
                 self.simple_alloc_free(txn, large_size(entropy), entropy, out, checksum)
+            }
+            CardId::LargeObject128KiB => self.simple_alloc_free(
+                txn,
+                LARGE_OBJECT_128K_DIAGNOSTIC_SIZE_BYTES,
+                entropy,
+                out,
+                checksum,
+            ),
+            CardId::RandomLargeBursty | CardId::LargeClassPersistent => {
+                unreachable!("latency-only cards are rejected by fill_worker_transaction")
             }
             CardId::BatchLifo => self.batch(txn, entropy, true, out, checksum),
             CardId::BatchFifo => self.batch(txn, entropy, false, out, checksum),
@@ -1394,6 +1503,9 @@ fn counts_for_operations(card: CardId, operations: u64) -> ExpectedCounts {
         | CardId::SmallLogMixed
         | CardId::MediumLogMixed
         | CardId::LargeObjects
+        | CardId::LargeObject128KiB
+        | CardId::RandomLargeBursty
+        | CardId::LargeClassPersistent
         | CardId::CrossThreadProducerConsumer
         | CardId::RandomOwnership => {
             counts.alloc_calls = operations;

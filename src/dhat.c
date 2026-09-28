@@ -19,10 +19,39 @@
 #define DHAT_UNINIT 0
 #define DHAT_DISABLED 1
 #define DHAT_ENABLED 2
+/* Tuning constants; a build can override each with -D (test-dhat-one-bucket builds
+   with DHAT_BUCKETS=1 so every program point shares one hash chain). */
+#ifndef DHAT_STACK_MAX
 #define DHAT_STACK_MAX 64
+#endif
+#ifndef DHAT_CHUNK_SIZE
 #define DHAT_CHUNK_SIZE (64*1024)
+#endif
+#ifndef DHAT_DEFAULT_BUDGET
 #define DHAT_DEFAULT_BUDGET (64*1024*1024)
+#endif
+#ifndef DHAT_BUCKETS
 #define DHAT_BUCKETS 4096
+#endif
+#if DHAT_BUCKETS < 1 || (DHAT_BUCKETS & (DHAT_BUCKETS - 1)) != 0
+#error "DHAT_BUCKETS must be a power of two: both tables index with hash & (DHAT_BUCKETS - 1)"
+#endif
+#ifndef DHAT_FRAME_MAP_MIN_SLOTS
+#define DHAT_FRAME_MAP_MIN_SLOTS 1024  // first size of a dump's PC -> ftbl index map
+#endif
+#if DHAT_FRAME_MAP_MIN_SLOTS < 2 || (DHAT_FRAME_MAP_MIN_SLOTS & (DHAT_FRAME_MAP_MIN_SLOTS - 1)) != 0
+#error "DHAT_FRAME_MAP_MIN_SLOTS must be a power of two of at least 2"
+#endif
+
+/* #549: result buffer for a short environment value (MIMALLOC_DHAT, MIMALLOC_DHAT_MAX_BYTES).
+   `_mi_getenv` (src/libc.c, upstream) refuses any buffer under 64 bytes with ENOENT, the
+   same code as "not set", so a smaller buffer silently ignores the variable. */
+#ifndef MI_DHAT_ENV_VALUE_SIZE
+#define MI_DHAT_ENV_VALUE_SIZE 64
+#endif
+#if MI_DHAT_ENV_VALUE_SIZE < 64
+#error "MI_DHAT_ENV_VALUE_SIZE must be at least 64: _mi_getenv (src/libc.c) treats a smaller buffer as an unset variable"
+#endif
 
 typedef struct dhat_chunk_s {
   struct dhat_chunk_s* next;
@@ -175,18 +204,20 @@ static void* dhat_arena_alloc(size_t size) {
 
 static void dhat_mark_dropped(void) { mi_atomic_increment_relaxed(&dhat_dropped); mi_atomic_store_relaxed(&dhat_incomplete, (size_t)1); }
 
+/* #551: both tables come from ONE arena allocation, so they exist together or not at all.
+   Two separate allocations let a budget admit only the first; the half-built pair then
+   refused every later event without counting it. Now each refusal is a counted drop. */
+typedef struct dhat_tables_s {
+  dhat_record_t* live[DHAT_BUCKETS];
+  dhat_pp_t* pps[DHAT_BUCKETS];
+} dhat_tables_t;
+
 static bool dhat_init_tables_locked(void) {
-  if (dhat_live_table != NULL || dhat_pp_table != NULL) {
-    /* A partial first attempt cannot safely be completed: the budget may have
-       been exhausted after one table allocation. Keep the collector fail-soft
-       instead of dereferencing a missing sibling table. */
-    return (dhat_live_table != NULL && dhat_pp_table != NULL);
-  }
-  dhat_live_table = (dhat_record_t**)dhat_arena_alloc(DHAT_BUCKETS * sizeof(*dhat_live_table));
-  dhat_pp_table = (dhat_pp_t**)dhat_arena_alloc(DHAT_BUCKETS * sizeof(*dhat_pp_table));
-  if (dhat_live_table == NULL || dhat_pp_table == NULL) { dhat_mark_dropped(); return false; }
-  _mi_memzero(dhat_live_table, DHAT_BUCKETS * sizeof(*dhat_live_table));
-  _mi_memzero(dhat_pp_table, DHAT_BUCKETS * sizeof(*dhat_pp_table));
+  if (dhat_pp_table != NULL) return true;
+  dhat_tables_t* const tables = (dhat_tables_t*)dhat_arena_alloc(sizeof(dhat_tables_t));
+  if (tables == NULL) { dhat_mark_dropped(); return false; }
+  _mi_memzero(tables, sizeof(*tables));
+  dhat_live_table = tables->live; dhat_pp_table = tables->pps;
   return true;
 }
 
@@ -311,7 +342,7 @@ static void dhat_commit_resize_locked(dhat_event_t* ev) {
 }
 
 static bool dhat_env_size(const char* name, size_t* out) {
-  char buf[64];
+  char buf[MI_DHAT_ENV_VALUE_SIZE];
   if (_mi_getenv(name, buf, sizeof(buf)) != 0 || buf[0] == 0) return false;
   char* end = NULL;
   const unsigned long long v = strtoull(buf, &end, 10);
@@ -336,7 +367,7 @@ static void dhat_publish_armed(size_t state) {
 
 static void dhat_resolve_env(void) {
   if (_mi_atomic_once_enter(&dhat_once)) {
-    char value[8] = { 0 };
+    char value[MI_DHAT_ENV_VALUE_SIZE] = { 0 };
     /* DHAT has its own opt-in switch; it must never inherit the unrelated
        MIMALLOC_MEMORY_EVENTS activation state. */
     const bool env_enabled = (_mi_getenv("MIMALLOC_DHAT", value, sizeof(value)) == 0 && value[0] != 0 && value[0] != '0');
@@ -494,36 +525,74 @@ bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept {
   mi_lock_release(&dhat_lock); return true;
 }
 
-/* Frame-table order is the order we visit program points below.  The dump is a
-   diagnostic operation, so this allocation-free O(frames^3) lookup is preferable to
-   adding a second persistent hash table solely for serialization. */
-static bool dhat_frame_seen_before_locked(const dhat_pp_t* stop_pp, size_t stop_frame, const void* pc) {
-  for (size_t i = 0; i < DHAT_BUCKETS; i++) {
-    for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
-      const size_t limit = (pp == stop_pp ? stop_frame : pp->depth);
-      for (size_t frame = 0; frame < limit; frame++) if (pp->pcs[frame] == pc) return true;
-      if (pp == stop_pp) return false;
-    }
-  }
-  return false;
+/* #551: `fs` and `ftbl` share ONE numbering: each distinct PC takes the next index at its
+   first occurrence in dump order (bucket, then chain, then frame). They used to dedup
+   with two separate scans that disagreed for program points sharing a bucket, so `ftbl`
+   lost PCs that `fs` still referenced; the index scan was also O(frames^3) under
+   dhat_lock. The PC -> index map is dump-time scratch straight from the raw OS layer
+   (rule 4), outside the session budget, and released before the dump returns. It holds
+   one entry per DISTINCT PC, and it starts small and doubles at half load, so it stays
+   far smaller than the program points it indexes (they repeat hook-chain and caller PCs). */
+typedef struct dhat_frame_entry_s {
+  const void* pc;
+  size_t index1;     // 0 for an empty slot, else the PC's ftbl index + 1
+} dhat_frame_entry_t;
+
+typedef struct dhat_frame_map_s {
+  dhat_frame_entry_t* slots;  // open addressing with linear probing; NULL until the first PC
+  size_t mask;                // slot count - 1 (a power of two)
+  size_t count;               // distinct PCs numbered so far
+  mi_memid_t memid;
+} dhat_frame_map_t;
+
+static dhat_frame_entry_t* dhat_frame_find(const dhat_frame_map_t* map, const void* pc) {
+  size_t slot = (size_t)dhat_hash_ptr(pc) & map->mask;
+  while (map->slots[slot].index1 != 0 && map->slots[slot].pc != pc) slot = (slot + 1) & map->mask;
+  return &map->slots[slot];
 }
-static size_t dhat_frame_index_locked(const dhat_pp_t* wanted, size_t wanted_frame) {
-  size_t index = 0;
+static size_t dhat_frame_index(const dhat_frame_map_t* map, const void* pc) {
+  const dhat_frame_entry_t* const entry = dhat_frame_find(map, pc);
+  mi_assert_internal(entry->index1 != 0);  // the build pass numbered every PC
+  return entry->index1 - 1;
+}
+static void dhat_frame_map_free(dhat_frame_map_t* map) {
+  if (map->slots != NULL) _mi_os_free(_mi_subproc_main(), map->slots, (map->mask + 1) * sizeof(dhat_frame_entry_t), map->memid);
+  map->slots = NULL;
+}
+/* Moves the map to `slot_count` (a power of two) fresh slots, rehashing what it holds. */
+static bool dhat_frame_map_resize(dhat_frame_map_t* map, size_t slot_count) {
+  if (slot_count > SIZE_MAX / sizeof(dhat_frame_entry_t)) return false;
+  const size_t size = slot_count * sizeof(dhat_frame_entry_t);
+  mi_memid_t memid;
+  dhat_frame_entry_t* const slots = (dhat_frame_entry_t*)_mi_os_alloc(_mi_subproc_main(), size, &memid);
+  if (slots == NULL) return false;
+  if (!memid.initially_zero) _mi_memzero(slots, size);
+  dhat_frame_map_t resized = { slots, slot_count - 1, map->count, memid };
+  if (map->slots != NULL) {
+    for (size_t i = 0; i <= map->mask; i++) if (map->slots[i].index1 != 0) *dhat_frame_find(&resized, map->slots[i].pc) = map->slots[i];
+    dhat_frame_map_free(map);
+  }
+  *map = resized;
+  return true;
+}
+static bool dhat_frame_map_build_locked(dhat_frame_map_t* map) {
+  _mi_memzero(map, sizeof(*map));
+  if (dhat_pp_table == NULL) return true;
   for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
     for (size_t frame = 0; frame < pp->depth; frame++) {
-      if (pp == wanted && frame == wanted_frame) {
-        if (!dhat_frame_seen_before_locked(pp, frame, pp->pcs[frame])) return index;
-        /* Locate the matching first occurrence, whose index is the count of unique
-           frames that preceded it. */
-        for (size_t j = 0; j < DHAT_BUCKETS; j++) for (dhat_pp_t* prior = dhat_pp_table[j]; prior != NULL; prior = prior->next) {
-          const size_t limit = (prior == pp ? frame : prior->depth);
-          for (size_t pf = 0; pf < limit; pf++) if (prior->pcs[pf] == pp->pcs[frame]) return dhat_frame_index_locked(prior, pf);
-        }
+      const void* const pc = pp->pcs[frame];
+      if (map->slots != NULL && dhat_frame_find(map, pc)->index1 != 0) continue;  // numbered already
+      const size_t slot_count = (map->slots == NULL ? 0 : map->mask + 1);
+      if (2 * (map->count + 1) > slot_count &&
+          !dhat_frame_map_resize(map, slot_count == 0 ? DHAT_FRAME_MAP_MIN_SLOTS : 2 * slot_count)) {
+        dhat_frame_map_free(map);
+        return false;
       }
-      else if (!dhat_frame_seen_before_locked(pp, frame, pp->pcs[frame])) index++;
+      dhat_frame_entry_t* const entry = dhat_frame_find(map, pc);
+      entry->pc = pc; entry->index1 = ++map->count;
     }
   }
-  return 0;
+  return true;
 }
 /* Compute every live record's contribution once, rather than scanning the full
    live table for each program point while the global collector lock is held. */
@@ -539,7 +608,10 @@ static void dhat_prepare_dump_lifetimes_locked(uint64_t now) {
     }
   }
 }
-static void dhat_write_json_locked(FILE* f) {
+/* Returns false, having written nothing, if the frame map's scratch cannot be allocated. */
+static bool dhat_write_json_locked(FILE* f) {
+  dhat_frame_map_t frames;
+  if (!dhat_frame_map_build_locked(&frames)) return false;
   const uint64_t elapsed = dhat_elapsed_now();
   const uint64_t now = (uint64_t)dhat_effective_end();
   dhat_prepare_dump_lifetimes_locked(now);
@@ -549,21 +621,30 @@ static void dhat_write_json_locked(FILE* f) {
   fprintf(f, "{\n  \"dhatFileVersion\": 2,\n  \"mode\": \"mimalloc-heap\",\n  \"verb\": \"Allocated\",\n  \"bklt\": true,\n  \"bkacc\": false,\n  \"tu\": \"ms\",\n  \"Mtu\": \"ms\",\n  \"tuth\": 1,\n  \"cmd\": \"\",\n  \"pid\": 0,\n  \"tg\": %llu,\n  \"te\": %llu,\n  \"mi_dhat_incomplete\": %s,\n  \"pps\": [\n", (unsigned long long)dhat_peak_at, (unsigned long long)elapsed, (mi_atomic_load_relaxed(&dhat_incomplete) ? "true" : "false"));
   if (dhat_pp_table == NULL) {
     fprintf(f, "\n  ],\n  \"ftbl\": []\n}\n");
-    return;
   }
-  bool first_pp = true;
-  for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
-    fprintf(f, "%s    {\"tb\": %llu, \"tbk\": %llu, \"tl\": %llu, \"mb\": %llu, \"mbk\": %llu, \"gb\": %llu, \"gbk\": %llu, \"eb\": %llu, \"ebk\": %llu, \"fs\": [", first_pp ? "" : ",\n", (unsigned long long)pp->tb, (unsigned long long)pp->tbk, (unsigned long long)pp->dump_tl, (unsigned long long)pp->mb, (unsigned long long)pp->mbk, (unsigned long long)pp->gb, (unsigned long long)pp->gbk, (unsigned long long)pp->live, (unsigned long long)pp->livek);
-    for (size_t frame = 0; frame < pp->depth; frame++) fprintf(f, "%s%llu", frame == 0 ? "" : ", ", (unsigned long long)dhat_frame_index_locked(pp, frame));
-    fprintf(f, "]}"); first_pp = false;
+  else {
+    bool first_pp = true;
+    for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
+      fprintf(f, "%s    {\"tb\": %llu, \"tbk\": %llu, \"tl\": %llu, \"mb\": %llu, \"mbk\": %llu, \"gb\": %llu, \"gbk\": %llu, \"eb\": %llu, \"ebk\": %llu, \"fs\": [", first_pp ? "" : ",\n", (unsigned long long)pp->tb, (unsigned long long)pp->tbk, (unsigned long long)pp->dump_tl, (unsigned long long)pp->mb, (unsigned long long)pp->mbk, (unsigned long long)pp->gb, (unsigned long long)pp->gbk, (unsigned long long)pp->live, (unsigned long long)pp->livek);
+      for (size_t frame = 0; frame < pp->depth; frame++) fprintf(f, "%s%llu", frame == 0 ? "" : ", ", (unsigned long long)dhat_frame_index(&frames, pp->pcs[frame]));
+      fprintf(f, "]}"); first_pp = false;
+    }
+    fprintf(f, "\n  ],\n  \"ftbl\": [");
+    /* The same traversal handed out the indices, so each PC's first occurrence is where
+       the next unwritten index turns up: this writes ftbl in index order. */
+    size_t written = 0;
+    for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) {
+      for (size_t frame = 0; frame < pp->depth; frame++) {
+        if (dhat_frame_index(&frames, pp->pcs[frame]) != written) continue;
+        fprintf(f, "%s\n    \"0x%llx\"", written == 0 ? "" : ",", (unsigned long long)(uintptr_t)pp->pcs[frame]);
+        written++;
+      }
+    }
+    mi_assert_internal(written == frames.count);
+    fprintf(f, "\n  ]\n}\n");
   }
-  fprintf(f, "\n  ],\n  \"ftbl\": [");
-  bool first_frame = true;
-  for (size_t i = 0; i < DHAT_BUCKETS; i++) for (dhat_pp_t* pp = dhat_pp_table[i]; pp != NULL; pp = pp->next) for (size_t frame = 0; frame < pp->depth; frame++) {
-    bool seen = false; for (size_t j = 0; j <= i && !seen; j++) for (dhat_pp_t* prior = dhat_pp_table[j]; prior != NULL && !seen; prior = prior->next) { const size_t lim = (prior == pp ? frame : prior->depth); for (size_t pf = 0; pf < lim; pf++) if (prior->pcs[pf] == pp->pcs[frame]) { seen = true; break; } }
-    if (!seen) { fprintf(f, "%s\n    \"0x%llx\"", first_frame ? "" : ",", (unsigned long long)(uintptr_t)pp->pcs[frame]); first_frame = false; }
-  }
-  fprintf(f, "\n  ]\n}\n");
+  dhat_frame_map_free(&frames);
+  return true;
 }
 bool mi_dhat_dump(const char* path) mi_attr_noexcept {
   if (path == NULL) return false;
@@ -591,12 +672,12 @@ bool mi_dhat_dump(const char* path) mi_attr_noexcept {
     return false;
   }
   mi_lock_acquire(&dhat_lock);
-  dhat_write_json_locked(f);
+  const bool written = dhat_write_json_locked(f);
   mi_lock_release(&dhat_lock);
-  const bool ok = (fclose(f) == 0);
+  const bool closed = (fclose(f) == 0);
   _mi_memevt_suppress_end();
   hooks->dhat_observer_depth--;
-  return ok;
+  return written && closed;
 }
 void _mi_dhat_process_init(void) { dhat_resolve_env(); }
 void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool dumped = mi_dhat_dump(dhat_dump_at_exit); MI_UNUSED(dumped); } }
@@ -613,7 +694,21 @@ void _mi_dhat_process_done(void) { if (dhat_dump_at_exit[0] != 0) { const bool d
 // src/fork.c's file comment).
 void _mi_dhat_fork_prepare(void) { mi_lock_acquire(&dhat_lock); }
 void _mi_dhat_fork_parent(void)  { mi_lock_release(&dhat_lock); }
-void _mi_dhat_fork_child(void)   { mi_lock_init(&dhat_lock); _mi_atomic_once_fork_child_reset(&dhat_once); }
+// #551: only the forking thread survives, so an event another thread had in flight never
+// finishes in the child, and neither does a stop another thread was draining. Left as
+// inherited, they made mi_dhat_stop spin forever and mi_dhat_start always fail. Keep only
+// this thread's own contribution: an event it armed (fork() from a memory-change callback)
+// still finishes here and decrements, so zeroing unconditionally would underflow.
+void _mi_dhat_fork_child(void) {
+  mi_lock_init(&dhat_lock);
+  _mi_atomic_once_fork_child_reset(&dhat_once);
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  mi_atomic_store_relaxed(&dhat_inflight, (size_t)(hooks != NULL && hooks->dhat_event.armed ? 1 : 0));
+  if (mi_atomic_load_relaxed(&dhat_stopping) != 0) {
+    dhat_ended = _mi_clock_now();  // what the interrupted stop would have stamped after draining
+    mi_atomic_store_relaxed(&dhat_stopping, (size_t)0);
+  }
+}
 
 #else
 /* #371: MI_DHAT=0 -- the observer is compiled out and costs nothing.

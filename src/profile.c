@@ -14,6 +14,15 @@
 #if MI_PPROF
 
 #define MI_PROF_CHUNK_SIZE (64*1024)
+/* #549: result buffer for a short environment value (a decimal size, a format name).
+   `_mi_getenv` (src/libc.c, upstream) refuses any buffer under 64 bytes with ENOENT, the
+   same code as "not set", so a smaller buffer silently ignores the variable. */
+#ifndef MI_PROF_ENV_VALUE_SIZE
+#define MI_PROF_ENV_VALUE_SIZE 64
+#endif
+#if MI_PROF_ENV_VALUE_SIZE < 64
+#error "MI_PROF_ENV_VALUE_SIZE must be at least 64: _mi_getenv (src/libc.c) treats a smaller buffer as an unset variable"
+#endif
 
 typedef struct mi_prof_chunk_s {
   struct mi_prof_chunk_s* next;
@@ -86,14 +95,16 @@ static inline size_t prof_max(size_t x, size_t y) { return (x > y ? x : y); }
 
 /* ---- small helpers shared by mi_prof_start_ex's env/struct precedence resolution -----------
    (see mi_prof_config_t's mode documentation in profile.h for the FALLBACK/OVERRIDE contract). */
+/* #549: a value that does not fit the buffer reads as absent, so the probe must hold the
+   longest value it checks -- the MIMALLOC_PROF_DUMP_AT_EXIT path. */
 static bool prof_env_present(const char* name) {
-  char buf[64];
+  char buf[sizeof(prof_dump_at_exit)];
   return (_mi_getenv(name, buf, sizeof(buf)) == 0);
 }
 /* Tiny local decimal parser (mirrors options.c's mi_option_init, minus the KiB-suffix and
    boolean-string handling those don't apply to a raw byte count like MIMALLOC_PROF_SAMPLE_INTERVAL). */
 static bool prof_env_get_size(const char* name, size_t* out) {
-  char buf[64];
+  char buf[MI_PROF_ENV_VALUE_SIZE];
   if (_mi_getenv(name, buf, sizeof(buf)) != 0) return false;
   if (buf[0] == 0) return false;
   char* end = buf;
@@ -354,7 +365,7 @@ bool mi_prof_start_ex(const mi_prof_config_t* config) mi_attr_noexcept {
       prof_dump_at_exit_format = config->dump_format;
     }
     else if (env_present) {
-      char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
+      char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
       if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
     }
   }
@@ -890,7 +901,7 @@ static void prof_auto_start(void) {
     if (mi_option_is_enabled(mi_option_prof)) { const bool started = mi_prof_start(0); MI_UNUSED(started); }
     (void)_mi_getenv("MIMALLOC_PROF_DUMP_AT_EXIT", prof_dump_at_exit, sizeof(prof_dump_at_exit));
     /* So pure-env users (no mi_prof_start_ex call at all) still get profile.proto exit dumps. */
-    char fmt_buf[32] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
+    char fmt_buf[MI_PROF_ENV_VALUE_SIZE] = {0};  /* zeroed: GCC cannot see that _mi_getenv fills it on success */
     if (_mi_getenv("MIMALLOC_PROF_DUMP_FORMAT", fmt_buf, sizeof(fmt_buf)) == 0) prof_dump_at_exit_format = prof_parse_dump_format(fmt_buf);
   }
 }
@@ -1124,6 +1135,45 @@ void _mi_prof_on_realloc_in_place(mi_page_t* page, void* p, size_t size) {
   mi_lock_acquire(&prof_lock); prof_realloc_in_place(page,p,size); mi_lock_release(&prof_lock);
 }
 
+// #550: `_mi_heap_force_destroy` (mi_heap_destroy, and mi_subproc_destroy for every heap of the
+// sub-process, its main heap included) releases a heap's pages without freeing their blocks one
+// by one, so the free hooks above never see those blocks go. This is the profiler's analogue of
+// `_mi_dhat_forget_heap`, called from the same spot: after the heap's theaps are detached (no new
+// record can appear for it) and while its pages are still valid. Before it existed the records
+// outlived their pages, the live counters stayed inflated, and `mi_prof_stop` wrote
+// `metadata`/`has_metadata` into pages already returned to the arena or the OS.
+//
+// The teardown counts as a free: live counters and the stacks' current counts drop, cumulative
+// (accum) ones do not move. Nothing is allocated (CLAUDE.md rule 4); records go back on
+// `prof_free`. The walk is O(live records), like the `prof_all` unlink of every sampled free.
+static void prof_forget_heap(mi_heap_t* heap) {
+  mi_prof_record_t** cur = &prof_all;
+  while (*cur != NULL) {
+    mi_prof_record_t* const rec = *cur;
+    mi_page_t* const page = rec->page;
+    if (mi_page_heap(page) != heap) { cur = &rec->all_next; continue; }
+    *cur = rec->all_next;
+    // A page belongs to one heap, so this walk takes every record on its chain.
+    page->metadata = NULL; page->has_metadata = false;
+    mi_atomic_decrement_relaxed(&prof_records); mi_atomic_sub_relaxed(&prof_bytes, rec->size);
+    _mi_prof_stack_free(rec->stack, rec->size);
+    _mi_prof_stack_release(rec->stack);
+    rec->next = prof_free; prof_free = rec;
+  }
+}
+// Always takes the lock, never an unlocked "no records" test first: a racing `mi_prof_stop`
+// writes into these same pages under `prof_lock`, and only acquiring it orders those writes
+// before the pages are freed. A heap teardown is not a hot path. `prof_lock` is innermost, so
+// taking it with `subproc->heaps_lock` held (mi_subproc_destroy) respects the lock order. A
+// destroy from inside a `mi_prof_visit` callback already owns the lock (see `_mi_prof_on_free`);
+// the visit pinned every stack entry, so `_mi_prof_stack_release` moves none of them.
+void _mi_prof_forget_heap(mi_heap_t* heap) {
+  if (heap == NULL) return;
+  mi_hooks_tld_t* const hooks = _mi_hooks_tld_peek();
+  if (hooks != NULL && hooks->prof_lock_owner) { prof_forget_heap(heap); return; }
+  mi_lock_acquire(&prof_lock); prof_forget_heap(heap); mi_lock_release(&prof_lock);
+}
+
 #else
 bool mi_prof_start(size_t sample_rate) mi_attr_noexcept { MI_UNUSED(sample_rate); return false; }
 bool mi_prof_start_seeded(size_t sample_rate, uint64_t seed) mi_attr_noexcept { MI_UNUSED(sample_rate); MI_UNUSED(seed); return false; }
@@ -1144,6 +1194,7 @@ bool mi_prof_snapshot_visit(const mi_prof_snapshot_t* snap, mi_prof_visit_fun* v
 void mi_prof_snapshot_free(mi_prof_snapshot_t* snap) mi_attr_noexcept { MI_UNUSED(snap); }
 void _mi_prof_process_init(void) { }
 void _mi_prof_process_done(void) { }
+void _mi_prof_forget_heap(mi_heap_t* heap) { MI_UNUSED(heap); }  // #550: no records to forget
 // #270: no `prof_lock` exists when MI_PPROF is off -- nothing to quiesce.
 void _mi_prof_fork_prepare(void) { }
 void _mi_prof_fork_parent(void)  { }

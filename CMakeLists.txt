@@ -90,6 +90,7 @@ set(mi_sources
     src/alloc-posix.c
     src/arena.c
     src/arena-reclaim.c
+    src/arena-layout.c
     src/bitmap.c
     src/heap.c
     src/heap-dump.c
@@ -103,6 +104,7 @@ set(mi_sources
     src/page.c
     src/page-map.c
     src/page-holes.c
+    src/large-span.c
     src/purge-all.c
     src/profile.c
     src/random.c
@@ -486,7 +488,8 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   set(mi_strict_fork_sources "")
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
-                      src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c)
+                      src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
+                      src/arena-layout.c src/large-span.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()
@@ -851,7 +854,10 @@ if(MI_USE_CXX)
   # target this), and keeps the CMake shape identical to Bun's should this tree's extern "C"
   # wrapping ever change.
   # test-arena-purge-rearm.c (#491): calls `_mi_release_bound_ms` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c PROPERTIES LANGUAGE CXX )
+  # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
+  # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
+  # test-large-span.c (#532): reads `_mi_ptr_page` / `mi_page_t` from internal.h, the same case.
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-large-span.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -1165,6 +1171,16 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-profile-accum PROPERTIES ENVIRONMENT "MIMALLOC_PROF_ACCUM=1")
     add_test(NAME test-profile-auto COMMAND mimalloc-test-profile)
     set_tests_properties(test-profile-auto PROPERTIES ENVIRONMENT "MIMALLOC_PROF=1")
+    # #549: MIMALLOC_PROF_DUMP_FORMAT and a long MIMALLOC_PROF_DUMP_AT_EXIT were silently ignored
+    # (_mi_getenv reads a value that does not fit its buffer as unset). Each case re-runs the
+    # binary as a child that sets the variables up and exits normally, then reads back the dump
+    # the child's exit wrote (see the modes above main in test-profile.c). That exit dump is
+    # exactly what MI_NO_PROCESS_DETACH skips, so the cases need it off.
+    if(NOT MI_NO_PROCESS_DETACH)
+      add_test(NAME test-profile-env-dump-format COMMAND mimalloc-test-profile --env-dump-format-check)
+      add_test(NAME test-profile-start-ex-dump-format COMMAND mimalloc-test-profile --start-ex-dump-format-check)
+      add_test(NAME test-profile-start-ex-long-env-path COMMAND mimalloc-test-profile --start-ex-long-env-path-check)
+    endif()
 
     # Adversarial concurrency coverage for the v3 engine (issue #43): thread
     # bootstrap race, cross-thread free, snapshot stability under mutation.
@@ -1196,6 +1212,28 @@ if (MI_BUILD_TESTS)
     add_test(NAME test-profile-race-scavenger COMMAND mimalloc-test-profile-race)
     set_tests_properties(test-profile-race-scavenger PROPERTIES TIMEOUT 300
                          ENVIRONMENT "MIMALLOC_PURGE_DELAY=1;MIMALLOC_SCAVENGER=1")
+
+    # Sampled blocks that die with their heap (mi_heap_destroy, mi_subproc_destroy) must take
+    # their records with them; mi_heap_delete must keep them. The accum variant covers
+    # `_mi_prof_stack_release`'s keep-until-reset branch. The TIMEOUT turns a regression of
+    # the lock-owner path (a destroy inside mi_prof_visit) from a hang into a prompt failure.
+    add_executable(mimalloc-test-profile-heap-destroy test/test-profile-heap-destroy.c)
+    target_compile_definitions(mimalloc-test-profile-heap-destroy PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-profile-heap-destroy PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-profile-heap-destroy PRIVATE include)
+    if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+      target_link_libraries(mimalloc-test-profile-heap-destroy PRIVATE mimalloc-static ${mi_libraries})
+    else()
+      target_link_libraries(mimalloc-test-profile-heap-destroy PRIVATE mimalloc ${mi_libraries})
+    endif()
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-profile-heap-destroy PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-profile-heap-destroy COMMAND mimalloc-test-profile-heap-destroy)
+    add_test(NAME test-profile-heap-destroy-accum COMMAND mimalloc-test-profile-heap-destroy)
+    set_tests_properties(test-profile-heap-destroy PROPERTIES TIMEOUT 120)
+    set_tests_properties(test-profile-heap-destroy-accum PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_PROF_ACCUM=1")
   endif()
 
   # Memory + counter regression gate (issue #63). Emits JSON for CI baseline
@@ -1752,7 +1790,43 @@ if (MI_BUILD_TESTS)
   else()
     target_link_libraries(mimalloc-test-dhat PRIVATE mimalloc ${mi_libraries})
   endif()
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)  # the #551 fork scenarios start threads
+    target_link_libraries(mimalloc-test-dhat PRIVATE Threads::Threads)
+  endif()
   add_test(NAME test-dhat COMMAND mimalloc-test-dhat)
+  # #549: MIMALLOC_DHAT=1 alone must start DHAT -- the mode never calls mi_dhat_start().
+  add_test(NAME test-dhat-env-enabled COMMAND mimalloc-test-dhat --env-enabled-check)
+  set_tests_properties(test-dhat-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_DHAT=1")
+  # The same test against a collector with ONE hash bucket (-DDHAT_BUCKETS=1), so every
+  # program point shares a chain. The frame-table dedup failed only for program points
+  # sharing a bucket, which the default 4096 buckets reach only by chance (#551). Its dump's
+  # PC map also starts at 2 slots (-DDHAT_FRAME_MAP_MIN_SLOTS=2), so every dump rehashes.
+  # Like mimalloc-static-no-detach, this needs its own static library from src/static.c;
+  # it also takes mimalloc-static's MI_MALLOC_OVERRIDE, so libc traffic is observed alike.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_library(mimalloc-static-dhat-one-bucket STATIC EXCLUDE_FROM_ALL src/static.c)
+    set_property(TARGET mimalloc-static-dhat-one-bucket PROPERTY POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(mimalloc-static-dhat-one-bucket PRIVATE ${mi_defines} MI_STATIC_LIB DHAT_BUCKETS=1 DHAT_FRAME_MAP_MIN_SLOTS=2)
+    if(MI_OVERRIDE)
+      target_compile_definitions(mimalloc-static-dhat-one-bucket PRIVATE MI_MALLOC_OVERRIDE)
+    endif()
+    target_compile_options(mimalloc-static-dhat-one-bucket PRIVATE ${mi_cflags} ${mi_cflags_static})
+    target_link_libraries(mimalloc-static-dhat-one-bucket PRIVATE ${mi_libraries})
+    target_include_directories(mimalloc-static-dhat-one-bucket PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    add_executable(mimalloc-test-dhat-one-bucket test/test-dhat.c)
+    # DHAT_TEST_ONE_BUCKET gives this variant its own dump file names.
+    target_compile_definitions(mimalloc-test-dhat-one-bucket PRIVATE ${mi_defines} DHAT_TEST_ONE_BUCKET=1)
+    target_compile_options(mimalloc-test-dhat-one-bucket PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-dhat-one-bucket PRIVATE include)
+    target_link_libraries(mimalloc-test-dhat-one-bucket PRIVATE mimalloc-static-dhat-one-bucket ${mi_libraries})
+    if(NOT WIN32)
+      target_link_libraries(mimalloc-test-dhat-one-bucket PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-dhat-one-bucket COMMAND mimalloc-test-dhat-one-bucket)
+  endif()
   endif()
 
   # mi_heap_dump_json / mi_heap_get_seq (issue #269, Bun parity P4): backs bun:jsc
@@ -2061,6 +2135,19 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-arena-retention PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
   endif()
 
+  # test-arena-retention-short (#506): small pages freed by another thread go back within the short
+  # retention window, while a large block freed with them keeps the long one. Scavenger off: only
+  # the test's collects purge.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-retention-short test/test-arena-retention-short.c)
+    target_compile_definitions(mimalloc-test-arena-retention-short PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-retention-short PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-retention-short PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-retention-short PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-retention-short COMMAND mimalloc-test-arena-retention-short)
+    set_tests_properties(test-arena-retention-short PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=100;MIMALLOC_SCAVENGER=0")
+  endif()
+
   # test-resident-first (#493, strategy 9): a new page claims free arena slices that are still
   # resident (queued for purge) before purged ones. Single-threaded; the scavenger is off so only
   # the test's collects purge.
@@ -2072,6 +2159,57 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-resident-first PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-resident-first COMMAND mimalloc-test-resident-first)
     set_tests_properties(test-resident-first PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_PURGE_DELAY=20;MIMALLOC_SCAVENGER=0")
+  endif()
+
+  # test-large-span (#532): a large page's span comes from its bin's demand on the theap -- compact
+  # for a lightly used bin, growing to the full 4 MiB for a busy one -- and an abandoned compact page
+  # is reclaimed and validated over its own span. Structural checks only (no RSS, no timing); the
+  # scavenger and the hole sweep are off so no background pass holds an abandoned page meanwhile.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-large-span test/test-large-span.c)
+    target_compile_definitions(mimalloc-test-large-span PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-large-span PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-large-span PRIVATE include)
+    target_link_libraries(mimalloc-test-large-span PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-large-span PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-large-span COMMAND mimalloc-test-large-span)
+    set_tests_properties(test-large-span PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
+  endif()
+
+  # test-resident-first-churn (#517): the memory gate's thread-churn scenario must not claim
+  # never-dirty (fresh) arena slices once warmed up; small/medium claims taking resident-first
+  # runs did (#514). Asserts on the MI_DIAGNOSTICS claim counters, so it needs that build.
+  # (MIMALLOC_PURGE_ZEROES=0: a purge that zeroes a range clears its dirty bits, which would
+  # make its next claim count as fresh.)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN AND MI_DIAGNOSTICS)
+    add_executable(mimalloc-test-resident-first-churn test/test-resident-first-churn.c)
+    target_compile_definitions(mimalloc-test-resident-first-churn PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-resident-first-churn PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-resident-first-churn PRIVATE include)
+    target_link_libraries(mimalloc-test-resident-first-churn PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-resident-first-churn PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-resident-first-churn COMMAND mimalloc-test-resident-first-churn)
+    set_tests_properties(test-resident-first-churn PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
+  endif()
+
+  # test-arena-layout (#519): the arena layout walk behind `mi_purge_holes_report`. Built in
+  # EVERY configuration: with MI_DIAGNOSTICS it checks the walk's exact counts on an exclusive
+  # arena; without it, that the stub zeroes the layout. (MIMALLOC_PURGE_ZEROES=0: a purge that
+  # zeroes a range clears its dirty bits, turning the purged run fresh instead of dirty.)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-arena-layout test/test-arena-layout.c)
+    target_compile_definitions(mimalloc-test-arena-layout PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-arena-layout PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-arena-layout PRIVATE include)
+    target_link_libraries(mimalloc-test-arena-layout PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-arena-layout COMMAND mimalloc-test-arena-layout)
+    set_tests_properties(test-arena-layout PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
   endif()
 
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of

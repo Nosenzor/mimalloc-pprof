@@ -391,6 +391,9 @@ void _mi_heap_force_destroy(mi_heap_t* heap, bool acquire_heaps_lock) {
   if (heap==NULL) return;
   mi_heap_detach_theaps(heap);
   _mi_dhat_forget_heap(heap);
+  #if MI_PPROF
+  _mi_prof_forget_heap(heap);  // #550: likewise the profiler's sample records, before the pages go
+  #endif
   _mi_heap_destroy_pages(heap);
   mi_heap_free_theaps(heap);
   // Free unless this is the PROCESS main heap (which is statically allocated and must

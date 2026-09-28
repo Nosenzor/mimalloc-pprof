@@ -52,6 +52,11 @@ When the budget is exhausted the application allocation still succeeds; the coll
 marks the report partial (`mi_dhat_incomplete`) and exposes the drop count through
 `mi_dhat_stats_t`.
 
+Builds without the [#549](https://github.com/zackees/mimalloc-pprof/issues/549) fix,
+which includes every release up to 1.0.0, ignore `MIMALLOC_DHAT`. With those, start DHAT
+from code (`mi_dhat_start()` / `dhat::start()`). `MIMALLOC_DHAT_DUMP_AT_EXIT` and
+`MIMALLOC_DHAT_MAX_BYTES` were never affected.
+
 ## Memory-events API
 
 [`include/mimalloc/memory-events.h`](../include/mimalloc/memory-events.h) exposes

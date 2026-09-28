@@ -3,10 +3,10 @@
    runs/tests, not production profiling. It is independent of MI_PPROF and of
    mi_memory_set_callbacks: both observers can run simultaneously.
 
-   Start explicitly with mi_dhat_start(). MIMALLOC_DHAT=1 before process initialization
-   is meant to start it too, but that is a KNOWN ISSUE today: dhat_resolve_env reads the
-   variable into an 8-byte buffer, below _mi_getenv's 64-byte minimum, so it is never seen
-   and DHAT stays off. Until that is fixed, call mi_dhat_start() (Rust: dhat::start()).
+   Start explicitly with mi_dhat_start(), or set MIMALLOC_DHAT=1 (any non-empty
+   value not starting with '0') before process initialization, where it is read
+   once. Builds that predate issue #549, including every release up to 1.0.0,
+   ignore MIMALLOC_DHAT: call mi_dhat_start() there.
    MIMALLOC_DHAT_DUMP_AT_EXIT=<path> writes a standard DHAT v2
    JSON report at process exit. MIMALLOC_DHAT_MAX_BYTES bounds raw-OS-backed
    collector state (default 64 MiB); exhaustion is fail-soft and is exposed via
@@ -49,7 +49,9 @@ mi_decl_nodiscard mi_decl_export bool mi_dhat_is_enabled(void) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept;
 
 /* Writes a DHAT file-version-2 heap JSON document. `tu` is monotonic milliseconds,
-   not Valgrind instruction counts; bkacc is always false. */
+   not Valgrind instruction counts; bkacc is always false. Returns false if the file
+   cannot be opened or closed, or if the frame table's temporary index cannot be
+   allocated (the file is then left empty). */
 mi_decl_nodiscard mi_decl_export bool mi_dhat_dump(const char* path) mi_attr_noexcept;
 
 #ifdef __cplusplus

@@ -10,8 +10,11 @@ use serde_json::json;
 use crate::config::AllocatorLock;
 use crate::latency::{
     choose_sample_denominator, latency_scenario_cells, minimum_transactions_per_worker,
-    run_latency_child, validate_latency_raw_run, LatencyChildRequest, LatencyRawRun,
-    LatencyRawSample, LATENCY_CHILD_PROTOCOL_VERSION, LATENCY_MIN_SAMPLES, LATENCY_SCHEMA_VERSION,
+    run_latency_child, validate_latency_diagnostic_run, validate_latency_raw_run,
+    LatencyChildRequest, LatencyDiagnosticHost, LatencyDiagnosticRun, LatencyDiagnosticSample,
+    LatencyRawRun, LatencyRawSample, LATENCY_CHILD_PROTOCOL_VERSION,
+    LATENCY_DIAGNOSTIC_ISOLATION_CLAIM, LATENCY_DIAGNOSTIC_SCOPE, LATENCY_MIN_SAMPLES,
+    LATENCY_SCHEMA_VERSION,
 };
 use crate::model::{
     BenchmarkChildRequest, CellCalibration, RunnerMetadata, CHILD_PROTOCOL_VERSION,
@@ -28,6 +31,7 @@ use crate::scenarios::{card, ScenarioCell, Topology};
 use crate::{CORE_SUITE_VERSION, RAW_SCHEMA_VERSION};
 
 const HARD_LIMIT_SECONDS: f64 = 60.0 * 60.0;
+const DIAGNOSTIC_MIN_BLOCKS: u32 = 7;
 
 #[derive(Debug)]
 struct Options {
@@ -40,6 +44,9 @@ struct Options {
     initial_transactions: u64,
     topology: Option<Topology>,
     reduced_smoke: bool,
+    diagnostic_large_object: bool,
+    diagnostic_old_fork_provenance: Option<PathBuf>,
+    diagnostic_stable_host_id: Option<String>,
 }
 
 pub fn benchmark_latency_run_main() -> Result<(), String> {
@@ -98,13 +105,7 @@ fn run(options: Options) -> Result<(), String> {
     }
     std::fs::create_dir_all(&options.output_dir)
         .map_err(|error| format!("create latency output: {error}"))?;
-    if options.reduced_smoke {
-        if options.blocks != 1 {
-            return Err("latency reduced smoke requires --blocks 1".into());
-        }
-    } else if options.blocks < 15 {
-        return Err("complete latency runs require --blocks at least 15".into());
-    }
+    validate_block_count(&options)?;
 
     let lock =
         AllocatorLock::parse_and_validate(include_str!("../allocators/allocator-lock.json"))?;
@@ -118,9 +119,61 @@ fn run(options: Options) -> Result<(), String> {
         options.output_dir.join("allocator-provenance.json"),
         &provenance_bytes,
     )?;
+    let old_fork_provenance = if options.diagnostic_large_object {
+        let path = options
+            .diagnostic_old_fork_provenance
+            .as_ref()
+            .ok_or("--diagnostic-large-object requires --diagnostic-old-fork-provenance")?;
+        let bytes =
+            std::fs::read(path).map_err(|error| format!("read old-fork provenance: {error}"))?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| format!("old-fork provenance is not UTF-8: {error}"))?;
+        let old = ProducerProvenance::parse_and_validate(text, &lock)?;
+        old.validate_artifact_hashes()?;
+        write_new_bytes(
+            options
+                .output_dir
+                .join("old-fork-allocator-provenance.json"),
+            &bytes,
+        )?;
+        Some(old)
+    } else {
+        if options.diagnostic_old_fork_provenance.is_some() {
+            return Err(
+                "--diagnostic-old-fork-provenance requires --diagnostic-large-object".into(),
+            );
+        }
+        None
+    };
 
     let topology = options.topology.map_or_else(detect_topology, Ok)?;
     let children = children_from_provenance(&provenance)?;
+    let current_fork = children
+        .iter()
+        .find(|child| child.allocator.allocator_id == "mimalloc-pprof")
+        .ok_or("provenance is missing mimalloc-pprof")?;
+    let old_fork_children = old_fork_provenance
+        .as_ref()
+        .map(children_from_provenance)
+        .transpose()?;
+    let old_fork = old_fork_children.as_ref().and_then(|values| {
+        values
+            .iter()
+            .find(|child| child.allocator.allocator_id == "mimalloc-pprof")
+    });
+    if options.diagnostic_large_object && old_fork.is_none() {
+        return Err("old-fork diagnostic provenance is missing mimalloc-pprof".into());
+    }
+    if let Some(old) = old_fork {
+        if old.allocator.source_sha == current_fork.allocator.source_sha
+            || old.allocator.child_binary_sha256 == current_fork.allocator.child_binary_sha256
+        {
+            return Err(
+                "old-fork diagnostic provenance must identify a distinct source and child binary"
+                    .into(),
+            );
+        }
+    }
     let upstream = children
         .iter()
         .find(|child| child.allocator.allocator_id == "upstream-mimalloc")
@@ -133,6 +186,34 @@ fn run(options: Options) -> Result<(), String> {
         physical_cores: publication_runner.physical_cores,
         logical_cores: publication_runner.logical_cores,
     };
+    if options.diagnostic_large_object {
+        let old_fork =
+            old_fork.ok_or("old-fork diagnostic provenance is missing mimalloc-pprof")?;
+        let diagnostic = run_large_object_diagnostic(
+            current_fork,
+            old_fork,
+            options.run_seed,
+            options.blocks,
+            options.initial_transactions,
+            options.timeout,
+            topology,
+            &runner,
+            &publication_runner,
+            options.diagnostic_stable_host_id.as_deref(),
+        )?;
+        validate_latency_diagnostic_run(&diagnostic, options.blocks)?;
+        write_new_json(
+            options
+                .output_dir
+                .join("latency-large-object-diagnostic.json"),
+            &diagnostic,
+        )?;
+        println!(
+            "PASS large-object latency diagnostic: {} paired blocks",
+            options.blocks
+        );
+        return Ok(());
+    }
     let run_kind = if options.reduced_smoke {
         "reduced-smoke"
     } else {
@@ -147,6 +228,8 @@ fn run(options: Options) -> Result<(), String> {
             "event": "latency-run-start", "metric_schema_version": LATENCY_SCHEMA_VERSION,
             "run_kind": run_kind, "blocks": options.blocks, "run_seed": options.run_seed,
             "minimum_samples_per_allocator_cell": LATENCY_MIN_SAMPLES,
+            "diagnostic_large_object": options.diagnostic_large_object,
+            "diagnostic_old_fork_source_sha": old_fork.map(|child| child.allocator.source_sha.as_str()),
         }),
     )?;
 
@@ -267,6 +350,7 @@ fn run(options: Options) -> Result<(), String> {
                     protocol_version: LATENCY_CHILD_PROTOCOL_VERSION.into(),
                     metric_schema_version: LATENCY_SCHEMA_VERSION.into(),
                     sample_denominator: denominator,
+                    expected_trace_checksum: None,
                     control: false,
                     runner_class: publication_runner.runner_class.clone(),
                     affinity_policy: publication_runner.affinity.policy.clone(),
@@ -361,6 +445,208 @@ fn run(options: Options) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_block_count(options: &Options) -> Result<(), String> {
+    if options.diagnostic_large_object {
+        if options.reduced_smoke {
+            return Err("large-object diagnostic cannot be combined with --reduced-smoke".into());
+        }
+        if options.blocks < DIAGNOSTIC_MIN_BLOCKS {
+            return Err(format!(
+                "large-object diagnostic requires --blocks at least {DIAGNOSTIC_MIN_BLOCKS}"
+            ));
+        }
+    } else if options.reduced_smoke {
+        if options.blocks != 1 {
+            return Err("latency reduced smoke requires --blocks 1".into());
+        }
+    } else if options.blocks < 15 {
+        return Err("complete latency runs require --blocks at least 15".into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_large_object_diagnostic(
+    candidate: &crate::orchestration::ChildProgram,
+    old_fork: &crate::orchestration::ChildProgram,
+    run_seed: u64,
+    blocks: u32,
+    _initial_transactions: u64,
+    timeout: Duration,
+    topology: Topology,
+    runner: &RunnerMetadata,
+    publication_runner: &crate::model::PublicationRunner,
+    stable_host_id_override: Option<&str>,
+) -> Result<LatencyDiagnosticRun, String> {
+    use crate::latency::LatencyDiagnosticSource;
+    let mut samples = Vec::<LatencyDiagnosticSample>::new();
+    let mut cells = Vec::new();
+    for (card, point, definition) in crate::latency::latency_diagnostic_scenario_cells(topology)? {
+        let thread_count = ScenarioCell::new(card, point, topology, 1, 1)
+            .map_err(|error| error.to_string())?
+            .threads;
+        let workload = crate::perf_ab_trace::workload(card, thread_count)
+            .ok_or("diagnostic scenario has no pinned perf-ab workload")?;
+        let trace_checksum = crate::perf_ab_trace::trace_checksum(workload, thread_count);
+        let template = BenchmarkChildRequest {
+            protocol_version: CHILD_PROTOCOL_VERSION.into(),
+            schema_version: RAW_SCHEMA_VERSION.into(),
+            suite_version: CORE_SUITE_VERSION.into(),
+            run_kind: "headline".into(),
+            execution_mode: "normal".into(),
+            run_seed,
+            block_id: 0,
+            ordinal: 0,
+            workload_seed: 1,
+            allocator: candidate.allocator.clone(),
+            scenario_id: card.as_str().into(),
+            scenario_version: CORE_SUITE_VERSION.into(),
+            thread_point: point.name().into(),
+            physical_cores: topology.physical_cores as u32,
+            logical_cores: topology.logical_cores as u32,
+            transactions_per_worker: workload.operations_per_worker,
+            // Pinned stateful traces cannot be replayed as a one-operation
+            // prefix. A fresh child per arm matches perf-ab's cold start.
+            warmup_transactions_per_worker: 0,
+            reproduction_command: format!(
+                "opt-in matched old-fork/candidate perf-ab trace {}",
+                workload.workload_id
+            ),
+            runner: runner.clone(),
+            toolchain: candidate.toolchain.clone(),
+        };
+        let denominator =
+            choose_sample_denominator(workload.operations_per_worker, thread_count, blocks)?;
+        for order in balanced_block_orders(blocks, run_seed)? {
+            let initial_arm = if order.block_id % 2 == 0 {
+                "old-fork"
+            } else {
+                "candidate"
+            };
+            for execution_order in 0..2_u8 {
+                let arm = if (execution_order == 0) == (initial_arm == "old-fork") {
+                    "old-fork"
+                } else {
+                    "candidate"
+                };
+                let child = if arm == "old-fork" {
+                    old_fork
+                } else {
+                    candidate
+                };
+                let mut benchmark = template.clone();
+                benchmark.block_id = order.block_id;
+                benchmark.ordinal = execution_order;
+                let trace_seed = crate::perf_ab_trace::PERF_AB_STREAM_SEED_BASE;
+                benchmark.workload_seed = trace_seed;
+                benchmark.allocator = child.allocator.clone();
+                benchmark.toolchain = child.toolchain.clone();
+                let measured_request = LatencyChildRequest {
+                    protocol_version: LATENCY_CHILD_PROTOCOL_VERSION.into(),
+                    metric_schema_version: LATENCY_SCHEMA_VERSION.into(),
+                    sample_denominator: denominator,
+                    expected_trace_checksum: Some(trace_checksum),
+                    control: false,
+                    runner_class: publication_runner.runner_class.clone(),
+                    affinity_policy: publication_runner.affinity.policy.clone(),
+                    benchmark,
+                };
+                let measured = run_latency_child(child, &measured_request, timeout)?;
+                let mut control_request = measured_request.clone();
+                control_request.control = true;
+                let control = run_latency_child(child, &control_request, timeout)?;
+                samples.push(LatencyDiagnosticSample {
+                    arm: arm.into(),
+                    execution_order,
+                    sample: LatencyRawSample {
+                        metric_schema_version: LATENCY_SCHEMA_VERSION.into(),
+                        block_id: order.block_id,
+                        ordinal: execution_order,
+                        workload_seed: trace_seed,
+                        allocator_id: "mimalloc-pprof".into(),
+                        allocator_source_sha: child.allocator.source_sha.clone(),
+                        child_binary_sha256: child.allocator.child_binary_sha256.clone(),
+                        scenario_id: card.as_str().into(),
+                        thread_point: point.name().into(),
+                        thread_count: thread_count as u32,
+                        sample_denominator: denominator,
+                        transaction_definition: definition.into(),
+                        measured,
+                        control,
+                    },
+                });
+            }
+        }
+        let cell_rows = samples
+            .iter()
+            .filter(|row| {
+                row.sample.thread_point == point.name() && row.sample.scenario_id == card.as_str()
+            })
+            .collect::<Vec<_>>();
+        let mut cell = crate::latency::build_latency_diagnostic_cell_summary(
+            run_seed,
+            point.name(),
+            &cell_rows,
+        )?;
+        cell.transactions_per_worker = template.transactions_per_worker;
+        cell.sample_denominator = denominator;
+        cells.push(cell);
+    }
+    Ok(LatencyDiagnosticRun {
+        metric_schema_version: LATENCY_SCHEMA_VERSION.into(),
+        status: "diagnostic".into(),
+        run_seed,
+        measurement_scope: LATENCY_DIAGNOSTIC_SCOPE.into(),
+        host: LatencyDiagnosticHost {
+            stable_host_id: stable_host_id_override
+                .unwrap_or(&publication_runner.stable_host_id)
+                .to_owned(),
+            stable_host_identity_status: if stable_host_id_override
+                .unwrap_or(&publication_runner.stable_host_id)
+                .is_empty()
+            {
+                "not-provided".into()
+            } else {
+                "reported".into()
+            },
+            stable_host_identity_source: if stable_host_id_override.is_some() {
+                "operator-override".into()
+            } else if publication_runner.stable_host_id.is_empty() {
+                "not-provided".into()
+            } else {
+                "runner-reported".into()
+            },
+            runner_fingerprint_sha256: publication_runner.fingerprint_sha256.clone(),
+            cpu_model: publication_runner.cpu_model.clone(),
+            physical_cores: publication_runner.physical_cores,
+            logical_cores: publication_runner.logical_cores,
+            target: publication_runner.target.clone(),
+            transparent_hugepage: std::fs::read_to_string(
+                "/sys/kernel/mm/transparent_hugepage/enabled",
+            )
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "not-observable".into()),
+            affinity_policy: publication_runner.affinity.policy.clone(),
+            affinity_logical_cpu_ids: publication_runner.affinity.logical_cpu_ids.clone(),
+            isolation_claim: LATENCY_DIAGNOSTIC_ISOLATION_CLAIM.into(),
+        },
+        old_fork: LatencyDiagnosticSource {
+            source_sha: old_fork.allocator.source_sha.clone(),
+            library_sha256: old_fork.allocator.library_sha256.clone(),
+            child_binary_sha256: old_fork.allocator.child_binary_sha256.clone(),
+        },
+        candidate: LatencyDiagnosticSource {
+            source_sha: candidate.allocator.source_sha.clone(),
+            library_sha256: candidate.allocator.library_sha256.clone(),
+            child_binary_sha256: candidate.allocator.child_binary_sha256.clone(),
+        },
+        cells,
+        samples,
+    })
+}
+
 fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, String> {
     let arguments = arguments
         .map(|value| {
@@ -375,16 +661,24 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
     let mut blocks = 15;
     let mut run_seed = 0x6c_61_74_65_6e_63_79;
     let mut timeout_secs = 30;
-    let mut warmup_transactions = 1;
+    let mut warmup_transactions = None;
     let mut initial_transactions = 1;
     let mut physical_cores = None;
     let mut logical_cores = None;
     let mut reduced_smoke = false;
+    let mut diagnostic_large_object = false;
+    let mut diagnostic_old_fork_provenance = None;
+    let mut diagnostic_stable_host_id = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = &arguments[index];
         if flag == "--reduced-smoke" {
             reduced_smoke = true;
+            index += 1;
+            continue;
+        }
+        if flag == "--diagnostic-large-object" {
+            diagnostic_large_object = true;
             index += 1;
             continue;
         }
@@ -394,11 +688,24 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
         match flag.as_str() {
             "--provenance" => provenance = Some(PathBuf::from(value)),
             "--build-root" => build_root = Some(PathBuf::from(value)),
+            "--diagnostic-old-fork-provenance" => {
+                diagnostic_old_fork_provenance = Some(PathBuf::from(value))
+            }
+            "--stable-host-id" => {
+                let stable_id = value.trim();
+                if stable_id.is_empty()
+                    || stable_id.len() > 256
+                    || stable_id.chars().any(char::is_control)
+                {
+                    return Err("--stable-host-id must be 1-256 non-control characters".into());
+                }
+                diagnostic_stable_host_id = Some(stable_id.to_owned());
+            }
             "--output-dir" => output_dir = Some(PathBuf::from(value)),
             "--blocks" => blocks = parse_number(flag, value)?,
             "--run-seed" => run_seed = parse_number(flag, value)?,
             "--timeout-secs" => timeout_secs = parse_number(flag, value)?,
-            "--warmup-transactions" => warmup_transactions = parse_number(flag, value)?,
+            "--warmup-transactions" => warmup_transactions = Some(parse_number(flag, value)?),
             "--initial-transactions" => initial_transactions = parse_number(flag, value)?,
             "--physical-cores" => physical_cores = Some(parse_number(flag, value)?),
             "--logical-cores" => logical_cores = Some(parse_number(flag, value)?),
@@ -412,6 +719,17 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
     if provenance.is_some() && build_root.is_some() {
         return Err("pass either --provenance or --build-root, not both".into());
     }
+    if diagnostic_stable_host_id.is_some() && !diagnostic_large_object {
+        return Err("--stable-host-id is only valid with --diagnostic-large-object".into());
+    }
+    let warmup_transactions = if diagnostic_large_object {
+        if warmup_transactions.is_some_and(|count| count != 0) {
+            return Err("large-object diagnostic does not support prefix warmup".into());
+        }
+        0
+    } else {
+        warmup_transactions.unwrap_or(1)
+    };
     let provenance = provenance
         .or_else(|| build_root.map(|root| root.join("allocator-provenance.json")))
         .ok_or("--provenance or --build-root is required")?;
@@ -433,6 +751,9 @@ fn parse_options(arguments: impl Iterator<Item = OsString>) -> Result<Options, S
         initial_transactions,
         topology,
         reduced_smoke,
+        diagnostic_large_object,
+        diagnostic_old_fork_provenance,
+        diagnostic_stable_host_id,
     })
 }
 
@@ -440,4 +761,130 @@ fn parse_number<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, Stri
     value
         .parse()
         .map_err(|_| format!("invalid numeric value for {flag}: {value}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_options, validate_block_count};
+    use std::ffi::OsString;
+
+    fn options(args: &[&str]) -> Result<super::Options, String> {
+        parse_options(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn stable_host_id_is_diagnostic_only_and_explicit() {
+        assert!(options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--stable-host-id",
+            "ryzen-host-1",
+        ])
+        .is_err());
+        let diagnostic = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--stable-host-id",
+            "ryzen-host-1",
+        ])
+        .unwrap();
+        assert_eq!(
+            diagnostic.diagnostic_stable_host_id.as_deref(),
+            Some("ryzen-host-1")
+        );
+        assert!(options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--stable-host-id",
+            "  ",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn diagnostic_seven_blocks_do_not_relax_publication_minimum() {
+        let diagnostic = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--blocks",
+            "7",
+        ])
+        .unwrap();
+        assert!(validate_block_count(&diagnostic).is_ok());
+        assert_eq!(diagnostic.warmup_transactions, 0);
+
+        let publication = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--blocks",
+            "7",
+        ])
+        .unwrap();
+        assert_eq!(
+            validate_block_count(&publication).unwrap_err(),
+            "complete latency runs require --blocks at least 15",
+        );
+        assert_eq!(publication.warmup_transactions, 1);
+
+        assert!(options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--warmup-transactions",
+            "1",
+        ])
+        .is_err());
+
+        let diagnostic_six = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--blocks",
+            "6",
+        ])
+        .unwrap();
+        assert!(validate_block_count(&diagnostic_six).is_err());
+
+        let smoke_diagnostic = options(&[
+            "--provenance",
+            "candidate.json",
+            "--output-dir",
+            "out",
+            "--diagnostic-large-object",
+            "--diagnostic-old-fork-provenance",
+            "old.json",
+            "--reduced-smoke",
+            "--blocks",
+            "1",
+        ])
+        .unwrap();
+        assert!(validate_block_count(&smoke_diagnostic).is_err());
+    }
 }

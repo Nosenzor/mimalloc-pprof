@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 040ba331 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 179880b7 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -701,6 +701,7 @@ typedef enum mi_option_e {
   mi_option_snapshot_on_exit,           // write a heap snapshot on process exit (=0). 1=on, 2=on with per-block freemaps. Path from MIMALLOC_SNAPSHOT_PATH or "mimalloc-snapshot.<pid>.bin". Bun parity (#338)
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
+  mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -1286,10 +1287,10 @@ template<class T1, class T2> bool operator!=(const mi_heap_destroy_stl_allocator
    runs/tests, not production profiling. It is independent of MI_PPROF and of
    mi_memory_set_callbacks: both observers can run simultaneously.
 
-   Start explicitly with mi_dhat_start(). MIMALLOC_DHAT=1 before process initialization
-   is meant to start it too, but that is a KNOWN ISSUE today: dhat_resolve_env reads the
-   variable into an 8-byte buffer, below _mi_getenv's 64-byte minimum, so it is never seen
-   and DHAT stays off. Until that is fixed, call mi_dhat_start() (Rust: dhat::start()).
+   Start explicitly with mi_dhat_start(), or set MIMALLOC_DHAT=1 (any non-empty
+   value not starting with '0') before process initialization, where it is read
+   once. Builds that predate issue #549, including every release up to 1.0.0,
+   ignore MIMALLOC_DHAT: call mi_dhat_start() there.
    MIMALLOC_DHAT_DUMP_AT_EXIT=<path> writes a standard DHAT v2
    JSON report at process exit. MIMALLOC_DHAT_MAX_BYTES bounds raw-OS-backed
    collector state (default 64 MiB); exhaustion is fail-soft and is exposed via
@@ -1331,7 +1332,9 @@ mi_decl_nodiscard mi_decl_export bool mi_dhat_is_enabled(void) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept;
 
 /* Writes a DHAT file-version-2 heap JSON document. `tu` is monotonic milliseconds,
-   not Valgrind instruction counts; bkacc is always false. */
+   not Valgrind instruction counts; bkacc is always false. Returns false if the file
+   cannot be opened or closed, or if the frame table's temporary index cannot be
+   allocated (the file is then left empty). */
 mi_decl_nodiscard mi_decl_export bool mi_dhat_dump(const char* path) mi_attr_noexcept;
 
 #ifdef __cplusplus
