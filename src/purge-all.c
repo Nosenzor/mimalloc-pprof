@@ -258,10 +258,13 @@ static void mi_purge_walk_subproc(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purge_w
 // (§8, §13): a concurrent `fork()` (`prepare` takes level 1 first), `mi_subproc_new/delete` or
 // `mi_prof_start`'s sync waits for this call, bounded by `wait_ms` plus the claimed sweeps.
 // Nothing an owner does INSIDE an allocator call takes `mi_subprocs_lock`, so an owner we are
-// waiting on is never waiting on us. A claim is taken under `sp->tlds_lock` (level 4) and
-// released before the sweep; the sweep itself takes only the swept tld's locks and the
-// arena/OS layers -- none of which nest `mi_subprocs_lock`. (`_mi_subproc_prof_sync_force_slow` nests `heaps_lock` and
-// `theaps_lock` under it the same way; `tlds_lock` is a sibling of `heaps_lock` there.)
+// waiting on is never waiting on us. (`mi_heap_snapshot` takes it BEFORE its own gate for that
+// reason; only a snapshot nested inside a gated allocator operation waits for it while RUNNING,
+// and it is reported pending at the deadline like any owner that stays inside.) A claim is
+// taken under `sp->tlds_lock` (level 4) and released before the sweep; the sweep itself takes
+// only the swept tld's locks and the arena/OS layers -- none of which nest `mi_subprocs_lock`.
+// (`_mi_subproc_prof_sync_force_slow` nests `heaps_lock` and `theaps_lock` under it the same
+// way; `tlds_lock` is a sibling of `heaps_lock` there.)
 static void mi_purge_all_walk(mi_tld_t* my_tld, mi_purge_walk_t* w, mi_msecs_t deadline) {
   mi_lock(_mi_subprocs_lock()) {
     for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {

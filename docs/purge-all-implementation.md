@@ -167,8 +167,9 @@ its existing `theap_meta_lock`, never the park protocol.
 
 There is no 64-owner limit or unclaimed fallback. Each arena page's owner claim
 lasts only for capture. In an owner-gated build, `mi_heap_dump_json_ex` discards
-an incomplete attempt and retries it until its dump-wide acquisition deadline.
-Every attempt releases the caller gate, registry/heap locks, page pins, owner
+an incomplete attempt and retries it until its dump-wide acquisition deadline,
+unless every miss was a fork orphan: like the purge walk, the capture never claims
+an orphan tld and never waits for one. Every attempt releases the caller gate, registry/heap locks, page pins, owner
 claims, and raw scratch before waiting; waiting inside `mi_diag_try_tld` would
 deadlock with an owner finishing page retirement, heap creation, or heap deletion.
 The deadline uses an overflow-free elapsed-time comparison, including for `SIZE_MAX`.

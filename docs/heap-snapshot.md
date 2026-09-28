@@ -7,9 +7,10 @@ every page to a file descriptor. With a flag it also writes a free map for each 
 calling thread owns, recording which blocks are free. The point is to answer "why is this
 process using so much memory?" offline, after the process has moved on or exited. Three
 things read the file: the standalone C viewer `tools/mi-heapview.c`, the Python reference
-reader `examples/heap-snapshot/mi_snapshot.py`, and an independent reader inside
-`test/test-snapshot-exit.c`. This page covers the writer (`src/heap-snapshot.c`), format
-version 1 field by field, the viewers, and the tests that keep all of them in agreement.
+reader `examples/heap-snapshot/mi_snapshot.py`, and an independent reader in
+`test/test-snapshot-reader.h`, which `test-snapshot-exit` and `test-snapshot-walk` use. This
+page covers the writer (`src/heap-snapshot.c`), format version 1 field by field, the
+viewers, and the tests that keep all of them in agreement.
 
 The live-heap JSON dump (`mi_heap_dump_json`) is behind the same build switch. It is a
 separate subsystem with its own ownership protocol, covered in
@@ -72,13 +73,12 @@ The C declarations are in `include/mimalloc.h`.
 | `int mi_heap_snapshot(int fd, unsigned flags)` | Writes the whole snapshot to `fd`, starting at the descriptor's current position, and does not close it. Returns `0` on success. Returns `-1` if `fd < 0`, or if any `write` returned `<= 0`, in which case a partial file is left behind. Only the `MI_SNAPSHOT_BLOCKS` bit of `flags` means anything, but the raw value is stored in the header. |
 | `int mi_heap_snapshot_to_file(const char* path, unsigned flags)` | Returns `-1` if `path` is NULL or the open fails. Otherwise creates or truncates the file with mode `0644` (`O_WRONLY\|O_CREAT\|O_TRUNC`, plus `_O_BINARY` on Windows), calls `mi_heap_snapshot`, closes the file and returns its result. |
 
-Both functions walk the main sub-process's arenas and heaps while other threads keep
-running. Call them from any thread that does not already hold `sp->heaps_lock` or a heap's
-`os_abandoned_pages_lock` (section 7). In an ungated build, do not call them between
-`mi_on_thread_idle_start` and `mi_on_thread_idle_end`. A caller with no initialised theap
-is not protected against a concurrent `MI_PURGE_RECLAIM` (section 8). Without
-`MI_SNAPSHOT_BLOCKS` they change no allocator state; with it they collect the free lists
-of the calling thread's own pages.
+Both functions walk the arenas and heaps of every sub-process while other threads keep
+running. Call them from any thread that does not already hold `mi_subprocs_lock`,
+`sp->heaps_lock` or a heap's `os_abandoned_pages_lock` (section 7). In an ungated build, do
+not call them between `mi_on_thread_idle_start` and `mi_on_thread_idle_end` (section 8).
+Without `MI_SNAPSHOT_BLOCKS` they change no allocator state; with it they collect the free
+lists of the calling thread's own pages.
 
 ```c
 #include <mimalloc.h>
@@ -132,11 +132,11 @@ that file and the writer's emit functions.
 graph TD
   H["header, 44 bytes"] --> A["ARNA record + 3 bitmaps"]
   A --> AP["PAGE list: pages starting in this arena"]
-  AP -->|"once per non-NULL arena slot"| A
+  AP -->|"once per non-NULL arena slot, every sub-process"| A
   AP --> OP["PAGE list: writer thread's non-arena pages"]
   OP --> HP["HEAP record"]
   HP --> HL["PAGE list: heap's OS-backed abandoned pages"]
-  HL -->|"once per heap"| HP
+  HL -->|"once per heap, every sub-process"| HP
   HL --> E["END footer, 12 bytes"]
 ```
 
@@ -152,14 +152,14 @@ graph TD
 | 20 | u32 | reserved | 0 |
 | 24 | u64 | clock_ms | `_mi_clock_now()`: a monotonic clock (`CLOCK_MONOTONIC` / `QueryPerformanceCounter`), not wall time |
 | 32 | u64 | writer_tid | `_mi_prim_thread_id()`: the thread pointer, not an OS thread id |
-| 40 | u32 | arena_count | sum of `mi_arenas_get_count(sp)` over the sub-processes walked |
+| 40 | u32 | arena_count | the ARNA records that follow: the non-NULL arena slots of every sub-process, counted before the arena pass (`mi_snap_count_arenas`) |
 
 **Arena record** (40 bytes, then 3 bitmaps, then its page list):
 
 | Off | Type | Field | Source |
 |---|---|---|---|
 | 0 | u32 | tag | `MI_SNAP_SEC_ARENA` = `0x414E5241` (`ARNA`) |
-| 4 | u32 | idx | slot index in its sub-process's `arenas[]` (not globally unique) |
+| 4 | u32 | idx | slot index in its sub-process's `arenas[]`. Not globally unique: every sub-process has a slot 0. |
 | 8 | u64 | base | the `mi_arena_t*` itself, i.e. the start of the arena |
 | 16 | u64 | size | `mi_size_of_slices(slice_count)` |
 | 24 | u32 | slice_count | `arena->slice_count` |
@@ -185,7 +185,7 @@ read with `mi_atomic_load_relaxed`. Bit *i* is slice *i*. Viewers count only the
 | 36 | u64 | committed | `mi_page_committed`, in bytes |
 | 44 | u64 | tid | `mi_page_thread_id`, flag bits masked. `0` is `MI_THREADID_ABANDONED`; `4` is `MI_THREADID_ABANDONED_MAPPED`. |
 | 52 | u64 | heap_seq | `page->heap->heap_seq`, or 0 |
-| 60 | u32 | arena_idx | arena slot for pages found by the arena walk. `0xFFFFFFFF` for pages from the other two lists. |
+| 60 | u32 | arena_idx | arena slot for pages found by the arena walk (the `idx` of the ARNA record the list follows). `0xFFFFFFFF` for pages from the other two lists. |
 | 64 | u32 ×2 | slice_index, slice_count | `memid.mem.arena.*` for `MI_MEM_ARENA`, else 0 |
 | 72 | u8 | memkind | raw `mi_memkind_t`: 0 NONE, 1 EXTERNAL, 2 STATIC, 3 OS, 4 OS_HUGE, 5 OS_REMAP, 6 ARENA, 7 MALLOC |
 | 73 | u8 | page_kind | `mi_snap_page_kind`: 0 small, 1 medium, 2 large, 3 singleton |
@@ -226,22 +226,28 @@ ARNA records, each followed by a PAGE list, then one more PAGE list, then HEAP r
 until END. It checks the footer count and raises `FormatError` on anything else, including
 truncation. The reader in `test/test-snapshot-exit.c` is just as strict. `hv_parse` in
 `tools/mi-heapview.c` accepts PAGE and HEAP sections in any order after the arenas, and
-ignores the footer count. All three reject every version but 1. The docstring of
-`ci/tests/test_heap_snapshot_example.py` records the rule: a change to the writer's format
-must bump the version.
+ignores the footer count. All three reject every version but 1. None of them keys arenas
+by `idx` or heaps by `heap_seq`, so all three accept the records of several sub-processes
+(section 8). The docstring of `ci/tests/test_heap_snapshot_example.py` records the rule: a
+change to the writer's format must bump the version.
 
 ## 5. How the writer walks the heap
 
-1. **`mi_heap_snapshot`** is an owner-gate site (#366). In a `MI_OWNER_GATE` build it
+1. **`mi_heap_snapshot`** returns `-1` for a negative `fd`, then takes `mi_subprocs_lock`
+   and holds it for the whole snapshot, *before* the owner gate (section 7 says why).
+   `mi_heap_snapshot_gated` is the owner-gate site (#366). In a `MI_OWNER_GATE` build it
    brackets the work with `MI_GATE_ENTER`/`MI_GATE_LEAVE`, unless the calling theap is
    uninitialised. The free-map path writes owner-private state in the caller's pages:
    without the gate a parked caller could be swept meanwhile, and the gated check in
    `_mi_page_free_collect_no_unpurge` would skip the collect
    ([purge-all-implementation.md](purge-all-implementation.md) §5).
-2. **`mi_heap_snapshot_inner`** returns `-1` for a negative `fd`. It starts from
-   `_mi_subproc_main()`, not `_mi_subproc()`, because at process exit TLS can already
-   point at an empty theap. It zeroes a stack `mi_snap_out_t` and writes the header.
-3. **Arena pass.** For each non-NULL slot (`mi_atomic_load_ptr_acquire`),
+2. **`mi_heap_snapshot_inner`** zeroes a stack `mi_snap_out_t` and writes the header up to
+   `arena_count`. Steps 3 to 5 walk the sub-process registry (`_mi_subprocs_head`, newest
+   first, so the main sub-process comes last). It never consults `_mi_subproc()`, which at
+   process exit can see an empty theap.
+3. **Arena pass.** `mi_snap_count_arenas` counts the non-NULL slots below each
+   sub-process's `arena_count`, and that count completes the header. Then, for each
+   non-NULL slot (`mi_atomic_load_ptr_acquire`), until that many records are written,
    `mi_snap_emit_arena_header` writes the record and bitmaps. `mi_snap_walk_arena_pages`
    then steps from `info_slices` to `slice_count`, finding each slice's page with
    `mi_arena_slice_start` and `_mi_safe_ptr_page` (a page-map lookup). It emits a page only
@@ -251,9 +257,9 @@ must bump the version.
    tld (`tld->theaps`, `tnext`) and every bin below `MI_BIN_COUNT`, emitting pages whose
    `memid.memkind` is not `MI_MEM_ARENA`. Per the source, this catches OS-direct pages
    created while preloading, before any arena existed (common with macOS dynamic override).
-5. **Heap pass.** Under `sp->heaps_lock`, each heap gets a HEAP record.
-   `mi_snap_walk_heap_os_pages` then walks `heap->os_abandoned_pages` under
-   `heap->os_abandoned_pages_lock`.
+5. **Heap pass.** For each sub-process, `mi_snap_walk_subproc_heaps` takes
+   `sp->heaps_lock` and writes a HEAP record per heap. `mi_snap_walk_heap_os_pages` then
+   walks `heap->os_abandoned_pages` under `heap->os_abandoned_pages_lock`.
 6. **Footer and flush.** The function returns `-1` if any write failed.
 
 **Output path.** `mi_snap_put` copies into the 16 KiB buffer and flushes when it is full.
@@ -276,11 +282,14 @@ released normally.
 Format version 1 is a parity contract with oven-sh/mimalloc @ `b20b60d9`: a snapshot from
 either allocator must open in either viewer. For that reason `src/heap-snapshot.c` carries
 no fork extensions *to the format*, and any change to the byte layout breaks the contract.
-The file's header comment lists two local deviations, both outside the format. First, the
-two `src/arena.c` functions it calls, `mi_arenas_get_count` and `mi_arena_slice_start`,
-are declared in the file because this tree's `internal.h` does not export them
-(`src/arena-reclaim.c` copies the pattern). Second, the exit message goes through
-`_mi_verbose_message`, because this tree has no ungated `_mi_message`.
+The file's header comment lists the local deviations, all outside the format. The two
+`src/arena.c` functions it calls, `mi_arenas_get_count` and `mi_arena_slice_start`, are
+declared in the file because this tree's `internal.h` does not export them
+(`src/arena-reclaim.c` copies the pattern). The exit message goes through
+`_mi_verbose_message`, because this tree has no ungated `_mi_message`. And two writer fixes
+change which records are written, never their layout: the walk covers every sub-process,
+and the header declares only the arenas the arena pass writes (section 5). With one
+sub-process and no NULL arena slot the output is what Bun's writer produces.
 
 Three more fork adaptations are not in that list, and none changes a byte of output: the #414 `#if MI_DIAGNOSTICS` guard and its stubs, the #366
 owner-gate wrapper around `mi_heap_snapshot`, and the `_mi_getenv` test in
@@ -298,11 +307,27 @@ hooked allocation paths. Keep it that way. The snapshot bytes go through `write`
 The exit hook's single status line uses mimalloc's normal message output: by default
 `_mi_prim_out_stderr` (`fputs` to stderr on POSIX), unless an output handler is registered.
 
-**Locks.** The writer takes `sp->heaps_lock`, and inside it `heap->os_abandoned_pages_lock`,
-which matches the `src/fork.c` order (step 2, then step 10, a leaf). No lock is held during
-the arena and own-theap passes, and `mi_subprocs_lock` is never taken. The locks are not
-recursive, so calling the writer from code that holds either one deadlocks. An example is
-a callback reached during heap teardown, which frees under `heaps_lock` (`src/fork.c`).
+**Locks.** The writer holds `mi_subprocs_lock` (`src/fork.c` step 1) for the whole
+snapshot. Inside it, per sub-process, it takes `sp->heaps_lock` (step 2) and then
+`heap->os_abandoned_pages_lock` (step 10, a leaf). The registry lock keeps each listed
+sub-process alive (`mi_subproc_destroy` unlinks under it before freeing anything) and
+excludes `MI_PURGE_RECLAIM`, which holds it for its whole pass. It is taken *before* the
+caller's owner gate. `mi_purge_all_ex` holds the registry while it waits for RUNNING owners
+to park, and relies on no owner taking the registry inside an allocator call
+(`src/purge-all.c`). A caller that entered its gate first would be an owner the purge waits
+for while it waits for the purge, until the purge's deadline. A probe with one thread
+snapshotting in a loop against 200 `mi_purge_all_ex(0, 3000, ..)` calls measured the
+difference: gate first, 115 owners reported pending and a worst call of 3.4 s; registry
+first, none pending and 60 ms. Registry-then-gate cannot deadlock, because nothing that can
+hold a SWEEPING claim on the caller's tld waits for the registry: the scavenger and the dump
+capture never take it, and the purge and the reclaim claim only while holding it. A
+snapshot nested inside a gated allocator operation (a callback) already holds its gate, so
+a concurrent purge reports it pending, as it would any owner that stays inside the
+allocator. The registry lock is held across the file writes, so a slow descriptor such as
+a full pipe also delays `mi_subproc_new`, `mi_subproc_destroy`, `fork()`, `mi_prof_start`'s
+theap sync and `mi_purge_all_ex`. The locks are not recursive, so calling the writer from
+code that holds any of them deadlocks. An example is a callback reached during heap
+teardown, which frees under `heaps_lock` (`src/fork.c`).
 
 **Reads.** Arena slots are loaded with acquire, bitmap words relaxed, and the page owner
 through the atomic `xthread_id` (`mi_page_thread_id`). For pages of *other* threads,
@@ -319,27 +344,32 @@ abandoned pages for anyone; the writer never passes one (the `tid` test). No unp
 
 ## 8. Edge cases and accepted limits
 
-- **Declared arena count against records written.** `arena_count` is computed before the
-  walk, but the walk skips NULL slots. A NULL slot inside `mi_arenas_get_count` therefore
-  produces fewer ARNA records than declared, and all three readers reject the file (each
-  loops `arena_count` times expecting an ARNA tag). This happens after `MI_PURGE_RECLAIM` releases an arena that was not the last slot
-  ([arena-reclaim.md](arena-reclaim.md)), and lasts until `mi_arenas_add` reuses the slot.
-  It also happens for a moment while `mi_arenas_add` has bumped `arena_count` but not yet
-  stored the pointer. An arena added between the count and the walk causes the opposite
-  mismatch.
-- **Possible defect, found by static trace (not reproduced): a concurrent
-  `MI_PURGE_RECLAIM`.** The arena pass takes no lock. The reclaim establishes quiescence by
-  claiming every registered tld of the sub-process (`src/arena-reclaim.c`), then clears
-  the slot and frees the arena with `_mi_os_free_ex`. Two callers do not block it: one with
-  no initialised theap (`mi_heap_snapshot` skips the gate for it, and it normally has no
-  tld in `sp->tlds`), and, in an ungated build, one parked by `mi_on_thread_idle_start`
-  (`MI_GATE_ENTER` does nothing there). Such a walk can read a just-unmapped arena. With
-  `MI_SNAPSHOT_BLOCKS`, a parked caller's collect also races the scavenger's sweep of its
-  own theaps.
-- **Sub-processes.** The code comment says the writer walks the main sub-process's
-  siblings, but `mi_subproc_init` pushes each new sub-process at the *head* of the registry
-  and main registers first, so `_mi_subproc_main()->next` is always NULL. Only the main
-  sub-process is written; memory of `mi_subproc_new` sub-processes is missing.
+- **NULL arena slots.** A slot can be NULL below a sub-process's `arena_count`: after
+  `MI_PURGE_RECLAIM` releases an arena that was not the last slot
+  ([arena-reclaim.md](arena-reclaim.md)), until `mi_arenas_add` reuses it, and for a moment
+  while `mi_arenas_add` has raised `arena_count` but not yet stored the pointer. The header
+  counts only non-NULL slots, so such a slot is simply skipped. (Before the fix the header
+  summed `mi_arenas_get_count`, the file declared more ARNA records than it held, and all
+  three readers rejected it; `test-snapshot-walk` row W1 pins this.)
+- **Arenas added during the walk.** With `mi_subprocs_lock` held a slot can go from NULL to
+  an arena (`mi_arenas_add` takes no registry lock) but not back, because the reclaim and
+  sub-process teardown both need that lock. An arena added after the count can therefore
+  take the place of a counted arena in a later slot, but the count always matches the
+  records. The one other path that clears a slot, `mi_arena_unload`, has no public
+  declaration and requires that no thread use the arena.
+- **Parked caller, ungated build.** A caller parked by `mi_on_thread_idle_start` is not
+  protected by `MI_GATE_ENTER`, which does nothing there. With `MI_SNAPSHOT_BLOCKS`, its
+  collect races the scavenger's sweep of its own theaps. A concurrent `MI_PURGE_RECLAIM`,
+  which this caveat used to include, is excluded by the registry lock in every build.
+- **Sub-processes.** Every sub-process is written, in registry order. (Before the fix the
+  walk started at `_mi_subproc_main()` and followed `next`, which is always NULL for it:
+  `mi_subproc_init` pushes each new sub-process at the head and main registers first. Row
+  W2 pins this.) Format version 1 has no sub-process field, so the records of all
+  sub-processes form one flat list and a reader cannot tell which sub-process a record
+  belongs to. `idx` and a page's `arena_idx` repeat across sub-processes, and every
+  sub-process's main heap has `heap_seq` 0. Attribute a page to its arena by position (the
+  PAGE list right after an ARNA record) or by address (`slice_start` within
+  `[base, base + size)`), and a heap's `exclusive_arena` by `base`.
 - **Not recorded:** non-arena pages of other live threads (the own-theap pass covers only
   the caller), and anything of another mimalloc instance in the same process.
 - **Free maps** exist only for the calling thread's pages (for the exit snapshot, the thread
@@ -354,12 +384,19 @@ abandoned pages for anyone; the writer never passes one (the `tid` test). No unp
   exit snapshot never runs if `_mi_auto_process_done` returns early (`MI_NO_PROCESS_DETACH`,
   or `mi_option_destroy_on_exit` at 2 or more) unless the embedder calls `mi_process_done`
   itself, and `mi_process_done` runs its body at most once.
+- **Locks at exit.** On Windows the exit snapshot runs inside `ExitProcess`, after every
+  other thread was terminated. If one of them died holding `mi_subprocs_lock` (in
+  `mi_purge_all_ex`, `mi_subproc_new`/`mi_subproc_destroy`, or its own snapshot) or a
+  `heaps_lock`, the exit snapshot waits forever. The registry is held longer than the
+  `heaps_lock` the imported writer needed, so the window is wider. A snapshot taken after
+  `mi_process_done` (from a later atexit handler or static destructor) locks the registry
+  after `_mi_subproc_main_done` destroyed it, as `mi_purge_all_ex` would.
 - **Exit ordering.** The exit snapshot runs after the scavenger has stopped, and before the
   theap cache reset, `_mi_prim_thread_done_auto_done` and the final collect, so the
   caller's pages and theaps are still live. `test-snapshot-exit` pins this ordering.
 - **Errors.** A `write` of `-1`, including `EINTR`, is not retried; the partial file stays.
-- **Fork.** Nothing in `src/fork.c` is snapshot-specific; the two locks the writer takes are
-  among those `_mi_process_fork_prepare` quiesces ([fork-safety.md](fork-safety.md)).
+- **Fork.** Nothing in `src/fork.c` is snapshot-specific; the three locks the writer takes
+  are among those `_mi_process_fork_prepare` quiesces ([fork-safety.md](fork-safety.md)).
 
 ## 9. mi-heapview and the Python reader
 
@@ -402,25 +439,28 @@ file. `demo.c` is a two-thread workload that writes a snapshot (usage in its `RE
 | Test | CTest name / target | When | What it asserts |
 |---|---|---|---|
 | `test/test-snapshot.c` | `test-snapshot` / `mimalloc-test-snapshot` | `MI_BUILD_TESTS` and `MI_DIAGNOSTICS` | Allocates 12 size classes × 200, keeps a third, adds one 8 MiB block. `mi_heap_snapshot(fd, MI_SNAPSHOT_BLOCKS)` must return 0, and the file is deleted afterwards. Optional arguments produce the fixtures by hand: a second snapshot after 5000 × 300-byte allocations stamped `0xC0DEFACE00112233`, `--pause` to wait for a core dump (POSIX), `--keep` to keep the files. |
-| `test/test-snapshot-exit.c` | `test-snapshot-exit` / `mimalloc-test-snapshot-exit` | same | Re-runs itself as a child (`fork`+`execl`, or `_spawnv`) with `MIMALLOC_SNAPSHOT_ON_EXIT=2` and `MIMALLOC_SNAPSHOT_PATH` set. The child allocates on two threads and exits normally. The parent's independent reader checks magic, version 1, `MI_SNAPSHOT_BLOCKS` in the flags, the ARNA/PAGE/HEAP/END structure, more than 0 pages, footer count equal to the records read, and at least one free map. The free map proves the exit ordering. |
+| `test/test-snapshot-exit.c` | `test-snapshot-exit` / `mimalloc-test-snapshot-exit` | same | Re-runs itself as a child (`fork`+`execl`, or `_spawnv`) with `MIMALLOC_SNAPSHOT_ON_EXIT=2` and `MIMALLOC_SNAPSHOT_PATH` set. The child allocates on two threads and exits normally. The parent parses the file with `test/test-snapshot-reader.h`, which checks magic, version 1, exactly `arena_count` ARNA records, the PAGE/HEAP/END structure, a footer count equal to the records read, and no bytes after the footer. The test adds `MI_SNAPSHOT_BLOCKS` in the flags, more than 0 pages, and at least one free map. The free map proves the exit ordering. |
+| `test/test-snapshot-walk.c` | `test-snapshot-walk` / `mimalloc-test-snapshot-walk` | same, plus `MI_BUILD_STATIC` and not `MI_DEBUG_TSAN`; `MIMALLOC_SCAVENGER=0` | White-box: it reads `subproc->arenas[]`. W2: a thread of a `mi_subproc_new` sub-process allocates and exits; the file must hold that sub-process's arenas, with pages, and both main heaps (`heap_seq` 0). W1: with `arena_reserve` at 32 MiB, three 32 MiB objects get an arena each; freeing the middle one and `MI_PURGE_RECLAIM` leave a NULL slot below `arena_count`. In both rows the strict reader must accept the file, the header's `arena_count` must equal the records, and the records must be exactly the live arenas of every sub-process. `--keep` leaves `<path>.W1`/`.W2` for the viewers. |
 | `ci/tests/test_heap_snapshot_example.py` | pytest | always | Parses `ci/tests/fixtures/heap-snapshot/test-snapshot.bin` (Linux x86_64): version 1, `ptr_size` 8, one arena, more than 50 pages, footer matches, some free map. Checks that `heapview.py` output equals the committed `mi-heapview-*.txt` output for seven commands, and that bad input exits 1 with `bad magic`. |
 | `rust/mimalloc-pprof/tests/t18_heap_snapshot.rs` | cargo `t18_heap_snapshot` | `required-features = ["diagnostics"]` | For both flag settings: magic and version, flags at offset 16, the END footer with a page count above 0. An unwritable path gives `Err`. |
 | `rust/mimalloc-pprof/tests/feature_contract.rs`; `lib.rs` test `heap_dump_and_snapshot_are_inert_when_compiled_out` | cargo | every configuration | A `diagnostics` build writes a non-empty file; without the feature the call returns `Err`. |
 | `ci/check_crate_package.py` | release packaging | publish | `pub fn heap_snapshot_to_file` is still in the published archive. |
 
-Neither CTest test has LABELS or `RUN_SERIAL`. The fixtures tie the C viewer to the Python
-reader; per the test's docstring, regenerate them when the *viewer* changes on purpose. A
-*writer* format change is caught by `test-snapshot-exit` and must bump the version.
+None of the three CTest tests has LABELS or `RUN_SERIAL`. The fixtures tie the C viewer to
+the Python reader; per the test's docstring, regenerate them when the *viewer* changes on
+purpose. A *writer* format change is caught by `test-snapshot-exit` and must bump the
+version.
 
 **Running locally.** `uv run ci/dev_linux.py c-test` runs the whole suite and configures
 with `-DMI_DIAGNOSTICS=ON`, among others, because otherwise these tests are not registered.
 For just these tests, configure with `-DMI_DIAGNOSTICS=ON`, build, and run
-`ctest --test-dir build -R test-snapshot`, which matches both. The Python side is
+`ctest --test-dir build -R test-snapshot`, which matches all three. The Python side is
 `python3 -m pytest ci/tests/test_heap_snapshot_example.py -q`; the Rust side is
 `cargo test -p mimalloc-pprof --features diagnostics --test t18_heap_snapshot`, run from
 `rust/`.
 
-**CI gates.** These rows pass `-DMI_DIAGNOSTICS=ON` and therefore run both CTest tests: in
+**CI gates.** These rows pass `-DMI_DIAGNOSTICS=ON` and therefore run the CTest tests
+(`test-snapshot-walk` only where the static library is built, outside TSAN): in
 `.github/workflows/c-unit.yml` the `release`, `debug-full`, `gated` and `musl` rows plus
 `build-windows-native` (the hard `ctest (windows-latest)` gate), and the bundles of
 `.github/workflows/windows-bundles.yml` (win-gnu and MSVC-ABI),
@@ -433,7 +473,8 @@ fork-source list ([ci-gates.md](ci-gates.md)).
 
 | File | Function / symbol | What it is |
 |---|---|---|
-| `src/heap-snapshot.c` | `mi_heap_snapshot`, `mi_heap_snapshot_inner` | owner-gate wrapper; header, arena, own-theap and heap passes, footer |
+| `src/heap-snapshot.c` | `mi_heap_snapshot`, `mi_heap_snapshot_gated`, `mi_heap_snapshot_inner` | registry lock, then the owner gate; header, arena, own-theap and heap passes, footer |
+| `src/heap-snapshot.c` | `mi_snap_count_arenas`, `mi_snap_walk_subproc_heaps` | the header's `arena_count`; one sub-process's heaps |
 | `src/heap-snapshot.c` | `mi_snap_emit_arena_header`, `mi_snap_emit_bitmap` | ARNA record and the three slice bitmaps |
 | `src/heap-snapshot.c` | `mi_snap_walk_arena_pages`, `mi_snap_emit_page` | page-map walk of an arena; the 80-byte page record |
 | `src/heap-snapshot.c` | `mi_snap_emit_page_freemap` | collect own page, then fast or windowed free-map build |
@@ -446,5 +487,6 @@ fork-source list ([ci-gates.md](ci-gates.md)).
 | `tools/mi-heapview.c` | `hv_parse`, `cmd_*`, `hv_core_open` | the C viewer; `peek`'s ELF/Mach-O segment map |
 | `examples/heap-snapshot/mi_snapshot.py` | `parse`, `load` | executable format spec |
 | `examples/heap-snapshot/heapview.py` | `main` | Python mirror of the viewer |
-| `test/test-snapshot-exit.c` | `parent_check` | third, independent v1 reader |
+| `test/test-snapshot-reader.h` | `snap_parse`, `snap_read_file` | third, independent v1 reader |
+| `test/test-snapshot-walk.c` | `run_subproc_row`, `run_hole_row` | several sub-processes; a NULL arena slot |
 | `rust/mimalloc-pprof/src/lib.rs` | `heap_snapshot_to_file` | safe Rust wrapper |

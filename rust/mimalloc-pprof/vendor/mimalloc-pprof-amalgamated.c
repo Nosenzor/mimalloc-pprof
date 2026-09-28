@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8765aad0 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8c1a4b05 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -497,8 +497,11 @@ mi_decl_export void   mi_debug_show_arenas(void) mi_attr_noexcept;
 mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
 
 // Write a binary heap snapshot to `fd` for offline analysis (see tools/mi-heapview.c and
-// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Bun parity (#338):
-// format version 1 is byte-identical to oven-sh/mimalloc's.
+// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Covers the arenas and
+// heaps of every sub-process, holding the sub-process registry lock for the whole write: a
+// call from inside a gated allocator operation (a callback) holds up a concurrent
+// mi_purge_all_ex until that purge's deadline. Bun parity (#338): format version 1 is
+// byte-identical to oven-sh/mimalloc's.
 // #414: compiled in only with MI_DIAGNOSTICS=1 (CMake -DMI_DIAGNOSTICS=ON, cargo feature
 // `diagnostics`; default OFF). Without it both entry points link and return -1, and
 // `mi_option_snapshot_on_exit` below still exists but has nothing to run.
@@ -14650,6 +14653,7 @@ bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block
 typedef struct mi_diag_coverage_s {
   size_t skipped_pages;
   size_t busy_theaps;
+  size_t orphaned;      // misses among the two above that no retry can fix: a fork orphan's, or a pre-fork page left owned
 } mi_diag_coverage_t;
 typedef void* (mi_diag_alloc_fun)(void* arg, size_t size);
 
@@ -14671,12 +14675,21 @@ typedef struct mi_diag_walk_s {
 
 // heap->theaps_lock pins the tld. Never wait while holding a page pin: the owner
 // or an in-flight sweeper might be retiring that page and waiting for our bit.
-static bool mi_diag_try_tld(mi_subproc_t* subproc, mi_tld_t* tld, bool* claimed) {
+// A fork orphan (src/fork.c: the pre-fork tld of a thread that did not survive) is RUNNING
+// forever. Like `mi_purge_walk_claim`, never claim one and never wait for it: the miss it
+// causes is counted in `coverage->orphaned` so the dump's retry loop stops. Tested before the
+// thread-id match: a thread started in the child can reuse a dead thread's TLS block, and so
+// its thread id; the caller's own tld is never an orphan.
+static bool mi_diag_try_tld(mi_subproc_t* subproc, mi_tld_t* tld, mi_diag_coverage_t* coverage, bool* claimed) {
   *claimed = false;
   if (tld == NULL) return false;
   if (tld->thread_id == MI_THREADID_DETACHED) {
     *claimed = mi_lock_try_acquire(&subproc->theap_meta_lock);
     return *claimed;
+  }
+  if ((mi_atomic_load_relaxed(&tld->gate_flags) & (size_t)MI_GATE_FLAG_ORPHAN) != 0) {
+    coverage->orphaned++;
+    return false;
   }
   if (tld->thread_id == _mi_thread_id()) return true; // caller already gated
   size_t expected = MI_PARK_PARKED;
@@ -14694,6 +14707,17 @@ static void mi_diag_release_tld(mi_subproc_t* subproc, mi_tld_t* tld, bool claim
   }
   mi_atomic_store_release(&tld->sweeper, (uintptr_t)0);
   mi_atomic_store_release(&tld->park_state, (size_t)MI_PARK_PARKED);
+}
+
+// In a forked child, a heap that existed at the fork (`prefork_theaps`, src/fork.c) can hold an
+// abandoned page that stays OWNED for good: a thread caught mid cross-thread free when fork() ran
+// held its ownership bit and does not exist in the child. `mi_heap_visit_page_claim` (arena.c)
+// seizes such a page; the capture never takes a page it cannot claim, so a failed claim there
+// is treated as permanent and counts in `coverage->orphaned` as well (a live thread that owns
+// the page only briefly is then not waited for either).
+static void mi_diag_claim_failed(const mi_heap_t* heap, mi_diag_coverage_t* coverage) {
+  coverage->skipped_pages++;
+  if (_mi_process_is_forked_child && heap->prefork_theaps) { coverage->orphaned++; }
 }
 
 static bool mi_diag_visit_page(mi_page_t* page, mi_diag_walk_t* walk) {
@@ -14719,7 +14743,9 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
   bool claimed = false;
   bool owned = false;
   bool ready = false;
+  bool abandoned = false;
   if (tid <= MI_THREADID_ABANDONED_MAPPED) {
+    abandoned = true;
     owned = mi_page_claim_ownership(page);
     ready = owned;
   }
@@ -14727,7 +14753,7 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
     for (mi_theap_t* theap = walk->heap->theaps; theap != NULL; theap = theap->hnext) {
       if (theap->tld != NULL && theap->tld->thread_id == tid) { tld = theap->tld; break; }
     }
-    if (mi_diag_try_tld(walk->heap->subproc, tld, &claimed)) {
+    if (mi_diag_try_tld(walk->heap->subproc, tld, walk->coverage, &claimed)) {
       // The page could have been abandoned/reclaimed between our atomic tid read
       // and the owner claim. Never use the earlier observation as ownership proof.
       ready = (mi_page_thread_id(page) == tid);
@@ -14735,6 +14761,7 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
   }
   bool ok = true;
   if (ready) { ok = mi_diag_visit_page(page, walk); }
+  else if (abandoned) { mi_diag_claim_failed(walk->heap, walk->coverage); }
   else { walk->coverage->skipped_pages++; }
   mi_bitmap_set(bitmap, index); // before unown, which may retire the page
   if (owned) { mi_abandoned_page_unown(page, NULL); }
@@ -14769,7 +14796,7 @@ static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
         batches = batch;
       }
       if (mi_page_claim_ownership(page)) { batches->pages[batches->used++] = page; }
-      else { walk->coverage->skipped_pages++; }
+      else { mi_diag_claim_failed(walk->heap, walk->coverage); }
     }
   }
   while (batches != NULL) {
@@ -14804,7 +14831,7 @@ bool _mi_heap_visit_capture(mi_heap_t* heap, bool blocks, mi_block_visit_fun* vi
     // Live OS pages are absent from the arena bitmap and abandoned OS list.
     for (mi_theap_t* theap = heap->theaps; theap != NULL && ok; theap = theap->hnext) {
       bool claimed;
-      if (!mi_diag_try_tld(heap->subproc, theap->tld, &claimed)) { coverage->busy_theaps++; continue; }
+      if (!mi_diag_try_tld(heap->subproc, theap->tld, coverage, &claimed)) { coverage->busy_theaps++; continue; }
       ok = _mi_theap_visit_pages(theap, &mi_diag_owned_os_page, true, &walk, NULL);
       mi_diag_release_tld(heap->subproc, theap->tld, claimed);
     }
@@ -18959,6 +18986,15 @@ static bool mi_dump_complete(const mi_dump_ctx_t* ctx) {
   return (ctx->coverage.skipped_pages == 0 && ctx->coverage.busy_theaps == 0);
 }
 
+// Did the attempt miss anything a retry could still capture? A miss whose owner is a fork
+// orphan cannot be: in a forked child that tld stays RUNNING for good (src/fork.c), and a
+// pre-fork page it left owned stays owned (`coverage.orphaned`, src/diagnostic-walk.c). So an
+// attempt that missed only those is final, and it stays `complete: false`, just as
+// `mi_purge_all_ex` reports orphans without waiting on them.
+static bool mi_dump_retry_can_help(const mi_dump_ctx_t* ctx) {
+  return (ctx->coverage.skipped_pages + ctx->coverage.busy_theaps > ctx->coverage.orphaned);
+}
+
 char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept {
   mi_theap_t* self = _mi_theap_default();
   if (!mi_theap_is_initialized(self)) { self = _mi_thread_init(); }
@@ -18979,7 +19015,7 @@ char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait
     MI_GATE_ENTER(self);
     captured = mi_subproc_visit_heaps(mi_subproc_current(), &mi_dump_capture_heap, &ctx);
     MI_GATE_LEAVE(self->tld);
-    if (!captured || mi_dump_complete(&ctx)) break;
+    if (!captured || mi_dump_complete(&ctx) || !mi_dump_retry_can_help(&ctx)) break;
     #if MI_OWNER_GATE
     const mi_msecs_t now = _mi_clock_now();
     const uintmax_t elapsed = (now > started ? (uintmax_t)now - (uintmax_t)started : 0);
@@ -19052,10 +19088,12 @@ terms of the MIT license. A copy of the license can be found in the file
 // mimalloc-pprof: imported verbatim from oven-sh/mimalloc @ b20b60d9 (MIT), issue #338
 // (Bun parity). Format version 1 is a parity contract -- a snapshot from either allocator
 // must open in either viewer -- so this file carries no fork extensions; the reference
-// reader in examples/heap-snapshot/mi_snapshot.py is the executable format spec. Two
-// local deviations, both outside the format: the two arena.c helpers below are declared
-// here because this tree's internal.h does not export them, and the exit message goes
-// through `_mi_verbose_message` (this tree has no ungated `_mi_message`).
+// reader in examples/heap-snapshot/mi_snapshot.py is the executable format spec. Local
+// deviations, all outside the format: the two arena.c helpers below are declared here
+// because this tree's internal.h does not export them; the exit message goes through
+// `_mi_verbose_message` (this tree has no ungated `_mi_message`); and the walk in
+// `mi_heap_snapshot_inner` covers every sub-process and declares only the arenas it writes
+// (both writer fixes, see the comments there).
 //
 // Allocation discipline (CLAUDE.md rule 4 spirit): the writer allocates nothing -- a
 // 16 KiB stack buffer and a 512-byte stack free-map -- so it is safe to run from
@@ -19331,6 +19369,9 @@ static void mi_snap_walk_arena_pages(mi_snap_ctx_t* ctx, mi_arena_t* arena, int3
   size_t slice = arena->info_slices;
   const size_t end = arena->slice_count;
   while (slice < end) {
+    // A free slice has no page to emit. Avoid looking up a page for memory that
+    // may have been decommitted after a reclaim pass.
+    if (mi_bbitmap_is_setN(arena->slices_free, slice, 1)) { slice++; continue; }
     void* start = mi_arena_slice_start(arena, slice);
     mi_page_t* page = _mi_safe_ptr_page(start);
     if (page != NULL && start == mi_page_slice_start(page)) {
@@ -19366,6 +19407,19 @@ static void mi_snap_walk_heap_os_pages(mi_snap_ctx_t* ctx, mi_heap_t* heap) {
   }
 }
 
+// Every heap of one sub-process, each followed by its OS-backed abandoned pages. The caller
+// holds `mi_subprocs_lock`, which keeps `sp` alive.
+static void mi_snap_walk_subproc_heaps(mi_snap_ctx_t* ctx, mi_subproc_t* sp) {
+  mi_lock(&sp->heaps_lock) {
+    for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+      mi_snap_emit_heap(ctx->out, h);
+      mi_snap_u32(ctx->out, MI_SNAP_SEC_PAGE);
+      mi_snap_walk_heap_os_pages(ctx, h);
+      mi_snap_u64(ctx->out, 0);  // sentinel
+    }
+  }
+}
+
 // Walk page queues of theaps owned by the calling thread and emit any
 // non-arena pages. (Arena pages are already covered by the arena walk.)
 // This catches OS-direct pages created during preloading when no arena
@@ -19397,7 +19451,7 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags);
 // in a gated build a caller between allocator calls is PARKED and could be swept under the
 // walk. Other threads' pages are read as they are (see `_mi_page_free_collect_no_unpurge`).
 // A thread with no theap (process exit on some platforms) has nothing of its own to protect.
-int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
+static int mi_heap_snapshot_gated(int fd, unsigned flags) {
   mi_theap_t* self = _mi_theap_default();
   #if MI_OWNER_GATE
   if (!mi_theap_is_initialized(self)) { return mi_heap_snapshot_inner(fd, flags); }
@@ -19411,14 +19465,40 @@ int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
   return rc;
 }
 
-static int mi_heap_snapshot_inner(int fd, unsigned flags) {
+// mimalloc-pprof (#338): the walk holds `mi_subprocs_lock` (see `mi_heap_snapshot_inner`), taken
+// here BEFORE the gate. `mi_purge_all_ex` holds the registry while it waits for RUNNING owners to
+// park (src/purge-all.c): a caller that entered its gate first would be an owner the purge waits
+// for, itself waiting for the purge, until the purge's deadline. Registry-then-gate cannot
+// deadlock: nothing that can hold a SWEEPING claim on this thread's tld waits for the registry
+// (the scavenger and the dump capture never take it; the purge and the reclaim claim only while
+// they hold it). A call nested inside a gated allocator operation already holds its gate, so a
+// concurrent purge reports it pending, like any owner that stays inside the allocator.
+int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
   if (fd < 0) return -1;
-  // Use the main subproc (and walk siblings) rather than `_mi_subproc()`: at
-  // process-exit time on some platforms TLS may already point at an empty theap,
-  // making `_mi_subproc()` return a subproc with no arenas.
-  mi_subproc_t* subproc = _mi_subproc_main();
-  if (subproc == NULL) return -1;
+  int rc = -1;
+  mi_lock(_mi_subprocs_lock()) {
+    rc = mi_heap_snapshot_gated(fd, flags);
+  }
+  return rc;
+}
 
+// mimalloc-pprof (#338): the arenas the arena pass writes -- the non-NULL slots below each
+// sub-process's `arena_count`. A slot can be NULL inside that count: `MI_PURGE_RECLAIM` clears a
+// released arena's slot and shrinks the count only when it was the last one, and `mi_arenas_add`
+// raises the count before it stores the pointer. The caller holds `mi_subprocs_lock`.
+static size_t mi_snap_count_arenas(void) {
+  size_t total = 0;
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
+    const size_t arena_count = mi_arenas_get_count(sp);
+    for (size_t i = 0; i < arena_count; i++) {
+      if (mi_atomic_load_ptr_acquire(mi_arena_t, &sp->arenas[i]) != NULL) { total++; }
+    }
+  }
+  return total;
+}
+
+// The caller holds `mi_subprocs_lock` (`mi_heap_snapshot`).
+static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_out_t out;
   _mi_memzero(&out, sizeof(out));
   out.fd = fd;
@@ -19439,23 +19519,38 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_u64(&out, (uint64_t)_mi_clock_now());
   mi_snap_u64(&out, (uint64_t)ctx.self_tid);
 
-  // --- arenas + their pages (across all subprocs) ---
-  size_t total_arenas = 0;
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
-    total_arenas += mi_arenas_get_count(sp);
-  }
+  // mimalloc-pprof (#338): every sub-process, in registry order, under the `mi_subprocs_lock` the
+  // caller holds for all three passes -- and across the file writes, so a slow descriptor delays
+  // `fork()`, `mi_subproc_new`/`_destroy` and `mi_purge_all_ex` as long. (The imported walk started
+  // at `_mi_subproc_main()` and followed `next`, which is always NULL for it: `mi_subproc_init`
+  // pushes at the head and main registers first.) The lock keeps each listed sub-process alive,
+  // since `mi_subproc_destroy` unlinks under it before freeing anything, and it excludes
+  // `MI_PURGE_RECLAIM`, which holds it for its whole pass (src/arena-reclaim.c). While it is held
+  // an arena slot can go from NULL to an arena (`mi_arenas_add`) but never back (`mi_arena_unload`
+  // is compiled out). So the header declares the non-NULL slots counted first, and the arena pass
+  // stops once it has written that many: an arena added in between may replace a counted one in
+  // the file, but the count always matches the records. Format v1 has no sub-process field: `idx`
+  // is a per-sub-process slot and every main heap has `heap_seq` 0, so both repeat across
+  // sub-processes. Lock order as in src/fork.c: the registry, `heaps_lock`,
+  // `os_abandoned_pages_lock`.
+
+  // --- arenas + their pages ---
+  const size_t total_arenas = mi_snap_count_arenas();
+  size_t arenas_written = 0;
   mi_snap_u32(&out, (uint32_t)total_arenas);
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL && arenas_written < total_arenas; sp = sp->next) {
     const size_t arena_count = mi_arenas_get_count(sp);
-    for (size_t i = 0; i < arena_count; i++) {
+    for (size_t i = 0; i < arena_count && arenas_written < total_arenas; i++) {
       mi_arena_t* arena = mi_atomic_load_ptr_acquire(mi_arena_t, &sp->arenas[i]);
       if (arena == NULL) continue;
       mi_snap_emit_arena_header(&out, arena, i);
       mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
       mi_snap_walk_arena_pages(&ctx, arena, (int32_t)i);
       mi_snap_u64(&out, 0);  // sentinel page_start == 0 ends this arena's page list
+      arenas_written++;
     }
   }
+  mi_assert_internal(arenas_written == total_arenas);
 
   // --- own-thread non-arena pages (covers preload-time OS-direct pages) ---
   mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
@@ -19463,15 +19558,8 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_u64(&out, 0);  // sentinel
 
   // --- heaps + os-backed abandoned pages ---
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
-    mi_lock(&sp->heaps_lock) {
-      for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-        mi_snap_emit_heap(&out, h);
-        mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
-        mi_snap_walk_heap_os_pages(&ctx, h);
-        mi_snap_u64(&out, 0);  // sentinel
-      }
-    }
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
+    mi_snap_walk_subproc_heaps(&ctx, sp);
   }
 
   // --- footer ---
@@ -28465,10 +28553,13 @@ static void mi_purge_walk_subproc(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purge_w
 // (§8, §13): a concurrent `fork()` (`prepare` takes level 1 first), `mi_subproc_new/delete` or
 // `mi_prof_start`'s sync waits for this call, bounded by `wait_ms` plus the claimed sweeps.
 // Nothing an owner does INSIDE an allocator call takes `mi_subprocs_lock`, so an owner we are
-// waiting on is never waiting on us. A claim is taken under `sp->tlds_lock` (level 4) and
-// released before the sweep; the sweep itself takes only the swept tld's locks and the
-// arena/OS layers -- none of which nest `mi_subprocs_lock`. (`_mi_subproc_prof_sync_force_slow` nests `heaps_lock` and
-// `theaps_lock` under it the same way; `tlds_lock` is a sibling of `heaps_lock` there.)
+// waiting on is never waiting on us. (`mi_heap_snapshot` takes it BEFORE its own gate for that
+// reason; only a snapshot nested inside a gated allocator operation waits for it while RUNNING,
+// and it is reported pending at the deadline like any owner that stays inside.) A claim is
+// taken under `sp->tlds_lock` (level 4) and released before the sweep; the sweep itself takes
+// only the swept tld's locks and the arena/OS layers -- none of which nest `mi_subprocs_lock`.
+// (`_mi_subproc_prof_sync_force_slow` nests `heaps_lock` and `theaps_lock` under it the same
+// way; `tlds_lock` is a sibling of `heaps_lock` there.)
 static void mi_purge_all_walk(mi_tld_t* my_tld, mi_purge_walk_t* w, mi_msecs_t deadline) {
   mi_lock(_mi_subprocs_lock()) {
     for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
@@ -29404,9 +29495,11 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // reads mutable state of an unclaimed owner. Top-level complete/skipped_pages/
 // busy_theaps describe observed coverage. In an MI_OWNER_GATE build, an incomplete
 // attempt is discarded and retried from a clean boundary for up to `wait_ms`;
-// otherwise busy owners are omitted immediately. The wait never retains page pins,
-// owner claims, or heap traversal locks. A call nested inside an existing owner-gated
-// allocator operation is one-shot because it cannot release its caller's outer gate.
+// otherwise busy owners are omitted immediately. In a forked child, owners that did
+// not survive the fork are counted as missed and never waited for. The wait never
+// retains page pins, owner claims, or heap traversal locks. A call nested inside an
+// existing owner-gated allocator operation is one-shot because it cannot release its
+// caller's outer gate.
 // A true complete result still does not make independently captured pages one global
 // instant. Ungated foreign owners must cooperatively park for coverage. Use mi_free
 // to free the result.

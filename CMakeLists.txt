@@ -838,7 +838,7 @@ endif()
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
-  set_source_files_properties(test/test-diagnostic-walks.c PROPERTIES LANGUAGE CXX)
+  set_source_files_properties(test/test-diagnostic-walks.c test/test-snapshot-walk.c PROPERTIES LANGUAGE CXX)
   # #272 (P7b): test-purge-holes.c and test-profile-race.c reach `mimalloc/internal.h`
   # (`_mi_ptr_page`, `mi_page_block_is_purged`, `_mi_os_page_size`, ...), which is NOT wrapped
   # in `extern "C"`. With MI_USE_CXX the library's symbols are C++-mangled, so a C test cannot
@@ -1875,6 +1875,22 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-snapshot-exit PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-snapshot-exit COMMAND mimalloc-test-snapshot-exit test-snapshot-exit.bin)
+  # The writer against the arena table and the sub-process registry: a released arena's NULL
+  # slot inside `arena_count`, and a second sub-process. White-box (it reads
+  # `subproc->arenas[]`), so static-only, and C++ under MI_USE_CXX, like test-diagnostic-walks.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-snapshot-walk test/test-snapshot-walk.c)
+    target_compile_definitions(mimalloc-test-snapshot-walk PRIVATE ${mi_defines} MI_STATIC_LIB)
+    target_compile_options(mimalloc-test-snapshot-walk PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-snapshot-walk PRIVATE include)
+    target_link_libraries(mimalloc-test-snapshot-walk PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-snapshot-walk PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-snapshot-walk COMMAND mimalloc-test-snapshot-walk test-snapshot-walk.bin)
+    set_tests_properties(test-snapshot-walk PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_SCAVENGER=0")
+  endif()
   endif()
 
   # #339: macOS malloc-zone introspection (what `leaks`/`heap`/`vmmap` call). Darwin-only:

@@ -11,10 +11,12 @@ terms of the MIT license. A copy of the license can be found in the file
 // mimalloc-pprof: imported verbatim from oven-sh/mimalloc @ b20b60d9 (MIT), issue #338
 // (Bun parity). Format version 1 is a parity contract -- a snapshot from either allocator
 // must open in either viewer -- so this file carries no fork extensions; the reference
-// reader in examples/heap-snapshot/mi_snapshot.py is the executable format spec. Two
-// local deviations, both outside the format: the two arena.c helpers below are declared
-// here because this tree's internal.h does not export them, and the exit message goes
-// through `_mi_verbose_message` (this tree has no ungated `_mi_message`).
+// reader in examples/heap-snapshot/mi_snapshot.py is the executable format spec. Local
+// deviations, all outside the format: the two arena.c helpers below are declared here
+// because this tree's internal.h does not export them; the exit message goes through
+// `_mi_verbose_message` (this tree has no ungated `_mi_message`); and the walk in
+// `mi_heap_snapshot_inner` covers every sub-process and declares only the arenas it writes
+// (both writer fixes, see the comments there).
 //
 // Allocation discipline (CLAUDE.md rule 4 spirit): the writer allocates nothing -- a
 // 16 KiB stack buffer and a 512-byte stack free-map -- so it is safe to run from
@@ -296,6 +298,9 @@ static void mi_snap_walk_arena_pages(mi_snap_ctx_t* ctx, mi_arena_t* arena, int3
   size_t slice = arena->info_slices;
   const size_t end = arena->slice_count;
   while (slice < end) {
+    // A free slice has no page to emit. Avoid looking up a page for memory that
+    // may have been decommitted after a reclaim pass.
+    if (mi_bbitmap_is_setN(arena->slices_free, slice, 1)) { slice++; continue; }
     void* start = mi_arena_slice_start(arena, slice);
     mi_page_t* page = _mi_safe_ptr_page(start);
     if (page != NULL && start == mi_page_slice_start(page)) {
@@ -331,6 +336,19 @@ static void mi_snap_walk_heap_os_pages(mi_snap_ctx_t* ctx, mi_heap_t* heap) {
   }
 }
 
+// Every heap of one sub-process, each followed by its OS-backed abandoned pages. The caller
+// holds `mi_subprocs_lock`, which keeps `sp` alive.
+static void mi_snap_walk_subproc_heaps(mi_snap_ctx_t* ctx, mi_subproc_t* sp) {
+  mi_lock(&sp->heaps_lock) {
+    for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+      mi_snap_emit_heap(ctx->out, h);
+      mi_snap_u32(ctx->out, MI_SNAP_SEC_PAGE);
+      mi_snap_walk_heap_os_pages(ctx, h);
+      mi_snap_u64(ctx->out, 0);  // sentinel
+    }
+  }
+}
+
 // Walk page queues of theaps owned by the calling thread and emit any
 // non-arena pages. (Arena pages are already covered by the arena walk.)
 // This catches OS-direct pages created during preloading when no arena
@@ -362,7 +380,7 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags);
 // in a gated build a caller between allocator calls is PARKED and could be swept under the
 // walk. Other threads' pages are read as they are (see `_mi_page_free_collect_no_unpurge`).
 // A thread with no theap (process exit on some platforms) has nothing of its own to protect.
-int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
+static int mi_heap_snapshot_gated(int fd, unsigned flags) {
   mi_theap_t* self = _mi_theap_default();
   #if MI_OWNER_GATE
   if (!mi_theap_is_initialized(self)) { return mi_heap_snapshot_inner(fd, flags); }
@@ -376,14 +394,40 @@ int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
   return rc;
 }
 
-static int mi_heap_snapshot_inner(int fd, unsigned flags) {
+// mimalloc-pprof (#338): the walk holds `mi_subprocs_lock` (see `mi_heap_snapshot_inner`), taken
+// here BEFORE the gate. `mi_purge_all_ex` holds the registry while it waits for RUNNING owners to
+// park (src/purge-all.c): a caller that entered its gate first would be an owner the purge waits
+// for, itself waiting for the purge, until the purge's deadline. Registry-then-gate cannot
+// deadlock: nothing that can hold a SWEEPING claim on this thread's tld waits for the registry
+// (the scavenger and the dump capture never take it; the purge and the reclaim claim only while
+// they hold it). A call nested inside a gated allocator operation already holds its gate, so a
+// concurrent purge reports it pending, like any owner that stays inside the allocator.
+int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
   if (fd < 0) return -1;
-  // Use the main subproc (and walk siblings) rather than `_mi_subproc()`: at
-  // process-exit time on some platforms TLS may already point at an empty theap,
-  // making `_mi_subproc()` return a subproc with no arenas.
-  mi_subproc_t* subproc = _mi_subproc_main();
-  if (subproc == NULL) return -1;
+  int rc = -1;
+  mi_lock(_mi_subprocs_lock()) {
+    rc = mi_heap_snapshot_gated(fd, flags);
+  }
+  return rc;
+}
 
+// mimalloc-pprof (#338): the arenas the arena pass writes -- the non-NULL slots below each
+// sub-process's `arena_count`. A slot can be NULL inside that count: `MI_PURGE_RECLAIM` clears a
+// released arena's slot and shrinks the count only when it was the last one, and `mi_arenas_add`
+// raises the count before it stores the pointer. The caller holds `mi_subprocs_lock`.
+static size_t mi_snap_count_arenas(void) {
+  size_t total = 0;
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
+    const size_t arena_count = mi_arenas_get_count(sp);
+    for (size_t i = 0; i < arena_count; i++) {
+      if (mi_atomic_load_ptr_acquire(mi_arena_t, &sp->arenas[i]) != NULL) { total++; }
+    }
+  }
+  return total;
+}
+
+// The caller holds `mi_subprocs_lock` (`mi_heap_snapshot`).
+static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_out_t out;
   _mi_memzero(&out, sizeof(out));
   out.fd = fd;
@@ -404,23 +448,38 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_u64(&out, (uint64_t)_mi_clock_now());
   mi_snap_u64(&out, (uint64_t)ctx.self_tid);
 
-  // --- arenas + their pages (across all subprocs) ---
-  size_t total_arenas = 0;
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
-    total_arenas += mi_arenas_get_count(sp);
-  }
+  // mimalloc-pprof (#338): every sub-process, in registry order, under the `mi_subprocs_lock` the
+  // caller holds for all three passes -- and across the file writes, so a slow descriptor delays
+  // `fork()`, `mi_subproc_new`/`_destroy` and `mi_purge_all_ex` as long. (The imported walk started
+  // at `_mi_subproc_main()` and followed `next`, which is always NULL for it: `mi_subproc_init`
+  // pushes at the head and main registers first.) The lock keeps each listed sub-process alive,
+  // since `mi_subproc_destroy` unlinks under it before freeing anything, and it excludes
+  // `MI_PURGE_RECLAIM`, which holds it for its whole pass (src/arena-reclaim.c). While it is held
+  // an arena slot can go from NULL to an arena (`mi_arenas_add`) but never back (`mi_arena_unload`
+  // is compiled out). So the header declares the non-NULL slots counted first, and the arena pass
+  // stops once it has written that many: an arena added in between may replace a counted one in
+  // the file, but the count always matches the records. Format v1 has no sub-process field: `idx`
+  // is a per-sub-process slot and every main heap has `heap_seq` 0, so both repeat across
+  // sub-processes. Lock order as in src/fork.c: the registry, `heaps_lock`,
+  // `os_abandoned_pages_lock`.
+
+  // --- arenas + their pages ---
+  const size_t total_arenas = mi_snap_count_arenas();
+  size_t arenas_written = 0;
   mi_snap_u32(&out, (uint32_t)total_arenas);
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL && arenas_written < total_arenas; sp = sp->next) {
     const size_t arena_count = mi_arenas_get_count(sp);
-    for (size_t i = 0; i < arena_count; i++) {
+    for (size_t i = 0; i < arena_count && arenas_written < total_arenas; i++) {
       mi_arena_t* arena = mi_atomic_load_ptr_acquire(mi_arena_t, &sp->arenas[i]);
       if (arena == NULL) continue;
       mi_snap_emit_arena_header(&out, arena, i);
       mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
       mi_snap_walk_arena_pages(&ctx, arena, (int32_t)i);
       mi_snap_u64(&out, 0);  // sentinel page_start == 0 ends this arena's page list
+      arenas_written++;
     }
   }
+  mi_assert_internal(arenas_written == total_arenas);
 
   // --- own-thread non-arena pages (covers preload-time OS-direct pages) ---
   mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
@@ -428,15 +487,8 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_u64(&out, 0);  // sentinel
 
   // --- heaps + os-backed abandoned pages ---
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
-    mi_lock(&sp->heaps_lock) {
-      for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-        mi_snap_emit_heap(&out, h);
-        mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
-        mi_snap_walk_heap_os_pages(&ctx, h);
-        mi_snap_u64(&out, 0);  // sentinel
-      }
-    }
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
+    mi_snap_walk_subproc_heaps(&ctx, sp);
   }
 
   // --- footer ---

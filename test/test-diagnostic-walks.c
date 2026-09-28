@@ -4,6 +4,7 @@
 #endif
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "mimalloc.h"
 #include "mimalloc-stats.h"
@@ -29,6 +30,9 @@ static void thread_join(thread_t t) {
 }
 #else
 #include <pthread.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 typedef pthread_t thread_t;
 #define THREAD_RET void*
 #define THREAD_OK NULL
@@ -161,6 +165,132 @@ static void test_dump_waits_from_clean_boundary(void) {
   mi_heap_destroy(wait_attach_heap);
   mi_heap_destroy(wait_heap);
   puts("dump-wait: incomplete attempt released all resources, then captured owner");
+}
+#endif
+
+#if MI_OWNER_GATE && !defined(_WIN32)
+static _Atomic(uintptr_t) orphan_phase;
+
+static THREAD_RET orphan_sibling(void* arg) {
+  MI_UNUSED(arg);
+  void* keep[16];
+  for (size_t i = 0; i < 16; i++) {
+    keep[i] = mi_malloc(256);
+    assert(keep[i] != NULL);
+  }
+  mi_atomic_store_release(&orphan_phase, (uintptr_t)1);
+  // Outside the allocator, so PARKED by its gate when the main thread forks.
+  while (mi_atomic_load_acquire(&orphan_phase) == 1) { _mi_prim_thread_yield(); }
+  for (size_t i = 0; i < 16; i++) { mi_free(keep[i]); }
+  return THREAD_OK;
+}
+
+// In the child of a fork, the sibling's tld is an ORPHAN (src/fork.c): reset to RUNNING, and
+// no thread will ever park it. The dump must report its pages as missed and return at once, as
+// `mi_purge_all_ex` counts orphans without waiting on them. RED before the fix: the SIZE_MAX
+// call retried forever (the child's alarm kills it) and a default call burned its whole 100 ms.
+static void test_dump_fork_orphan(void) {
+  mi_atomic_store_relaxed(&orphan_phase, (uintptr_t)0);
+  thread_t sibling;
+  thread_start(&sibling, &orphan_sibling, NULL);
+  while (mi_atomic_load_acquire(&orphan_phase) != 1) { _mi_prim_thread_yield(); }
+  fflush(stdout);
+  const pid_t pid = fork();
+  assert(pid >= 0);
+  if (pid == 0) {
+    alarm(20);   // a hang fails as SIGALRM, not as the ctest timeout
+    #if MI_DEBUG > 0
+    mi_atomic_store_relaxed(&mi_debug_dump_retrying, (uintptr_t)0);
+    #endif
+    char* json = mi_heap_dump_json_ex(false, false, SIZE_MAX);
+    if (json == NULL) _exit(10);
+    if (strstr(json, "\"complete\": false") == NULL) _exit(11);   // the orphan's pages were not read
+    const char* busy_field = strstr(json, "\"busy_theaps\": ");
+    size_t busy = 0;
+    if (busy_field == NULL || sscanf(busy_field, "\"busy_theaps\": %zu", &busy) != 1 || busy == 0) _exit(12);
+    // With arenas, the sibling's pages are arena pages: the arena pass skips them too.
+    const char* skipped_field = strstr(json, "\"skipped_pages\": ");
+    size_t skipped = 0;
+    if (skipped_field == NULL || sscanf(skipped_field, "\"skipped_pages\": %zu", &skipped) != 1) _exit(14);
+    if (getenv("MIMALLOC_DISALLOW_ARENA_ALLOC") == NULL && skipped == 0) _exit(15);
+    mi_free(json);
+    #if MI_DEBUG > 0
+    // Missing only an orphan is final: not one retry.
+    if (mi_atomic_load_relaxed(&mi_debug_dump_retrying) != 0) _exit(13);
+    #endif
+    _exit(0);
+  }
+  int status = 0;
+  assert(waitpid(pid, &status, 0) == pid);
+  mi_atomic_store_release(&orphan_phase, (uintptr_t)2);
+  thread_join(sibling);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fprintf(stderr, "dump-fork-orphan: child %s %d\n", (WIFSIGNALED(status) ? "killed by signal" : "exited with"),
+            (WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status)));
+  }
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  puts("dump-fork-orphan: a forked child's orphan owner is reported, never waited for");
+}
+
+static mi_heap_t* owned_heap;
+static void* owned_block;
+
+static THREAD_RET owned_page_abandoner(void* arg) {
+  MI_UNUSED(arg);
+  owned_block = mi_heap_malloc(owned_heap, 1024);
+  assert(owned_block != NULL);
+  return THREAD_OK;   // thread exit abandons the page, one live block in it
+}
+
+static THREAD_RET owned_page_holder(void* arg) {
+  MI_UNUSED(arg);
+  // Hold the abandoned page's ownership bit across the fork, as a thread caught in the middle
+  // of a cross-thread free does (src/fork.c): in the child nobody will ever release it.
+  mi_page_t* const page = _mi_ptr_page(owned_block);
+  assert(mi_page_is_abandoned(page));
+  assert(mi_page_claim_ownership(page));
+  mi_atomic_store_release(&orphan_phase, (uintptr_t)1);
+  while (mi_atomic_load_acquire(&orphan_phase) == 1) { _mi_prim_thread_yield(); }
+  mi_atomic_and_acq_rel(&page->xthread_free, ~(uintptr_t)1);   // nothing was freed into it meanwhile
+  return THREAD_OK;
+}
+
+// The same hang through a page instead of a theap: an abandoned page of a heap that existed at
+// the fork, left OWNED by a vanished thread, fails its claim on every attempt. RED before the
+// fix: that miss was retryable, so the SIZE_MAX call never returned (the alarm kills it).
+static void test_dump_fork_owned_page(void) {
+  owned_heap = mi_heap_new();
+  assert(owned_heap != NULL);
+  thread_t abandoner;
+  thread_start(&abandoner, &owned_page_abandoner, NULL);
+  thread_join(abandoner);
+  mi_atomic_store_relaxed(&orphan_phase, (uintptr_t)0);
+  thread_t holder;
+  thread_start(&holder, &owned_page_holder, NULL);
+  while (mi_atomic_load_acquire(&orphan_phase) != 1) { _mi_prim_thread_yield(); }
+  fflush(stdout);
+  const pid_t pid = fork();
+  assert(pid >= 0);
+  if (pid == 0) {
+    alarm(20);
+    char* json = mi_heap_dump_json_ex(false, false, SIZE_MAX);
+    if (json == NULL) _exit(10);
+    if (strstr(json, "\"complete\": false") == NULL) _exit(11);   // the owned page was not read
+    mi_free(json);
+    _exit(0);
+  }
+  int status = 0;
+  assert(waitpid(pid, &status, 0) == pid);
+  mi_atomic_store_release(&orphan_phase, (uintptr_t)2);
+  thread_join(holder);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fprintf(stderr, "dump-fork-owned-page: child %s %d\n", (WIFSIGNALED(status) ? "killed by signal" : "exited with"),
+            (WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status)));
+  }
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  mi_free(owned_block);
+  mi_heap_destroy(owned_heap);
+  puts("dump-fork-owned-page: a pre-fork page left owned is reported, never waited for");
 }
 #endif
 
@@ -418,6 +548,10 @@ int main(void) {
 #if MI_OWNER_GATE && MI_DEBUG > 0
   test_report_gate();
   test_dump_waits_from_clean_boundary();
+#endif
+#if MI_OWNER_GATE && !defined(_WIN32)
+  test_dump_fork_orphan();
+  test_dump_fork_owned_page();
 #endif
   test_dump_coverage();
   test_dump_growth();

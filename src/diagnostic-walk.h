@@ -5,6 +5,7 @@
 typedef struct mi_diag_coverage_s {
   size_t skipped_pages;
   size_t busy_theaps;
+  size_t orphaned;      // misses among the two above that no retry can fix: a fork orphan's, or a pre-fork page left owned
 } mi_diag_coverage_t;
 typedef void* (mi_diag_alloc_fun)(void* arg, size_t size);
 
