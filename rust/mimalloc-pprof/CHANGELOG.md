@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.1
+
 - **Free arenas can be given back**:
   `PurgeFlags::RECLAIM` / `PurgeFlags::FORCE_RECLAIM` (C: `MI_PURGE_RECLAIM`) makes
   `purge_all_ex` also release the arenas that are **completely free**, their metadata
@@ -23,6 +25,18 @@
     while recording 0 of 1000.
   - A process forked while another thread was inside a DHAT event can stop and restart
     DHAT in the child.
+
+- **Environment options honoured** ([#549](https://github.com/zackees/mimalloc-pprof/issues/549)):
+  `MIMALLOC_DHAT` and `MIMALLOC_PROF_DUMP_FORMAT` were ignored by 1.0.0 and earlier.
+- **Profiler forgets a destroyed heap's samples**
+  ([#550](https://github.com/zackees/mimalloc-pprof/issues/550)), so later dumps no
+  longer report records from a heap that no longer exists.
+- **Heap snapshot and dump fixes** ([#338](https://github.com/zackees/mimalloc-pprof/issues/338)):
+  the snapshot covers every sub-process with a consistent arena count, and skips free
+  slices when walking arena pages; the heap dump never waits for fork orphans.
+- Memory-retention and purge improvements to the allocator core (among them
+  [#497](https://github.com/zackees/mimalloc-pprof/issues/497) and
+  [#532](https://github.com/zackees/mimalloc-pprof/issues/532)).
 
 ## 1.0.0
 
