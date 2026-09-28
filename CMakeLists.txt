@@ -1271,6 +1271,22 @@ if (MI_BUILD_TESTS)
   add_test(NAME test-subproc-lifecycle COMMAND mimalloc-test-subproc-lifecycle)
   set_tests_properties(test-subproc-lifecycle PROPERTIES TIMEOUT 600)
 
+  # #554: mi_subproc_destroy released the CALLING thread's thread locals even when that
+  # thread belongs to another sub-process; a heap created afterwards then tripped
+  # mi_page_is_valid_init. The assertion only exists at MI_DEBUG>=3, so the debug-full
+  # rows are the RED check; every row checks heap ownership.
+  add_executable(mimalloc-test-subproc-destroy-tls test/test-subproc-destroy-tls.c)
+  target_compile_definitions(mimalloc-test-subproc-destroy-tls PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-subproc-destroy-tls PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-subproc-destroy-tls PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-subproc-destroy-tls PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-subproc-destroy-tls PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-subproc-destroy-tls COMMAND mimalloc-test-subproc-destroy-tls)
+  set_tests_properties(test-subproc-destroy-tls PROPERTIES TIMEOUT 120)
+
   # Commit-fail fault injection (issue #271, Bun parity P6): imported from
   # oven-sh/mimalloc @ 942b8342, MIT. Needs the MI_DEBUG-only mi_debug_fail_os_commit_after
   # hook (src/os.c), so it only builds in a debug configuration -- mirrors Bun's own
