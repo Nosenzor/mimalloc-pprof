@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 98028dfc of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8c1a4b05 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -19369,6 +19369,9 @@ static void mi_snap_walk_arena_pages(mi_snap_ctx_t* ctx, mi_arena_t* arena, int3
   size_t slice = arena->info_slices;
   const size_t end = arena->slice_count;
   while (slice < end) {
+    // A free slice has no page to emit. Avoid looking up a page for memory that
+    // may have been decommitted after a reclaim pass.
+    if (mi_bbitmap_is_setN(arena->slices_free, slice, 1)) { slice++; continue; }
     void* start = mi_arena_slice_start(arena, slice);
     mi_page_t* page = _mi_safe_ptr_page(start);
     if (page != NULL && start == mi_page_slice_start(page)) {
