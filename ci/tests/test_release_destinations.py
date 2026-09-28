@@ -138,6 +138,34 @@ class DestinationTests(unittest.TestCase):
         self.assertEqual(observed, "a" * 40)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
 
+    def test_release_read_sees_a_draft_through_the_list_endpoint(self) -> None:
+        # releases/tags/{tag} 404s for drafts; run 36468867757 lost its own draft.
+        draft = (
+            '{"tag_name":"v1.0.1","target_commitish":"' + "a" * 40 + '","draft":true,'
+            '"assets":[{"name":"x.zip","digest":"sha256:' + "b" * 64 + '"}]}'
+        )
+        ok = subprocess.CompletedProcess(["gh"], 0, stdout=draft + "\n", stderr="")
+        with patch.object(rd.subprocess, "run", return_value=ok) as run:
+            state = rd.ReadOnlyDestination().release("v1.0.1")
+        assert state is not None
+        self.assertEqual((state.target_sha, state.draft), ("a" * 40, True))
+        self.assertEqual(state.assets, {"x.zip": "b" * 64})
+        argv = run.call_args.args[0]
+        self.assertNotIn("releases/tags/v1.0.1", " ".join(argv))
+        self.assertIn("--paginate", argv)
+        self.assertIn('.[] | select(.tag_name == "v1.0.1") | @json', argv)
+
+        none = subprocess.CompletedProcess(["gh"], 0, stdout="", stderr="")
+        with patch.object(rd.subprocess, "run", return_value=none):
+            self.assertIsNone(rd.ReadOnlyDestination().release("v1.0.1"))
+
+        twice = subprocess.CompletedProcess(["gh"], 0, stdout=draft + "\n" + draft, stderr="")
+        with (
+            patch.object(rd.subprocess, "run", return_value=twice),
+            self.assertRaisesRegex(release.ReleaseError, "several releases"),
+        ):
+            rd.ReadOnlyDestination().release("v1.0.1")
+
     def test_live_read_classifies_http_status_before_message_text(self) -> None:
         permanent = subprocess.CompletedProcess(
             ["gh"], 1, stdout="", stderr="HTTP 403: connection timeout is forbidden"
