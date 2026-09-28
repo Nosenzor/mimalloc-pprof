@@ -546,7 +546,9 @@ def validate_candidate(
     if allow_release_outputs:
         status_rows = [row for row in status_rows if row not in ("?? dist/", "?? release-crate/")]
     if status_rows:
-        raise ReleaseError("release candidate checkout must be clean")
+        raise ReleaseError(
+            "release candidate checkout must be clean; dirty: " + ", ".join(status_rows[:10])
+        )
     existing_tag = command("git", "ls-remote", "--tags", "origin", f"refs/tags/{value['tag']}")
     if existing_tag:
         if frozen is None:

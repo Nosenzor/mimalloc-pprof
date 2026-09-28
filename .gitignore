@@ -6,6 +6,8 @@ ide/vs20??/.vs
 ide/vs20??/VTune*
 out/
 rust/target/
+# setup-soldr's cook cache restores its archives beside the target dir (#444).
+rust/target.soldr-*
 rust/benchmark-report.html
 docs/
 *.zip
