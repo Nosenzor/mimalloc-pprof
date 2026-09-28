@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8c1a4b05 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 49f65e0f of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -7433,7 +7433,10 @@ static inline mi_theap_t* _mi_heap_theap_peek(const mi_heap_t* heap) {
   // instead of asserting, so callers stop reclaiming into / abandoning through it.
   if (theap==NULL) return NULL;
   mi_assert_internal(!_mi_is_empty_theap(theap));
-  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL);
+  // #554: every sub-process's main heap shares the fast key, so while one sub-process's
+  // thread destroys another's main heap this slot holds its OWN main theap -- a foreign
+  // heap, not a bug. Any other key must name this heap's theap or a detached one.
+  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL || heap->theap==mi_thread_local_key_fast);
   if (_mi_theap_heap_peek(theap) != heap) return NULL;
   return theap;
 }
@@ -33412,7 +33415,11 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
     }
     mi_assert_internal(subproc->heap_main==NULL || subproc->heaps == subproc->heap_main);
     if (subproc->heap_main!=NULL) {
-      _mi_thread_locals_thread_done(); // release thread locals that may have been allocated (safe as the main heap uses the fast key)
+      // Release this thread's thread locals only when the thread belongs to the sub-process
+      // being destroyed (#554). They hold this thread's theap for every heap of ITS
+      // sub-process; clearing them from another sub-process's destroy leaves live heaps
+      // whose pages still point at the theap the slot no longer names.
+      if (_mi_subproc() == subproc) { _mi_thread_locals_thread_done(); }
       if (_mi_subproc_is_main(subproc)) {
         _mi_thread_locals_done();      
       }

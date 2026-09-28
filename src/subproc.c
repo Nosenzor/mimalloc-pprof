@@ -263,7 +263,11 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
     }
     mi_assert_internal(subproc->heap_main==NULL || subproc->heaps == subproc->heap_main);
     if (subproc->heap_main!=NULL) {
-      _mi_thread_locals_thread_done(); // release thread locals that may have been allocated (safe as the main heap uses the fast key)
+      // Release this thread's thread locals only when the thread belongs to the sub-process
+      // being destroyed (#554). They hold this thread's theap for every heap of ITS
+      // sub-process; clearing them from another sub-process's destroy leaves live heaps
+      // whose pages still point at the theap the slot no longer names.
+      if (_mi_subproc() == subproc) { _mi_thread_locals_thread_done(); }
       if (_mi_subproc_is_main(subproc)) {
         _mi_thread_locals_done();      
       }
