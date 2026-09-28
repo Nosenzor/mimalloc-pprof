@@ -12,6 +12,17 @@
   in the new `PurgeAllReport::subprocs_pending`; `PurgeAllReport::reclaimed` says whether
   the pass ran and `arenas_reclaimed` / `arena_reclaim_bytes` what it returned. Nothing
   changes without the flag. Full description: `docs/arena-reclaim.md` in the C tree.
+- **DHAT report fixes** ([#551](https://github.com/zackees/mimalloc-pprof/issues/551),
+  `dhat` feature).
+  - `dhat::dump_file` could write a frame table (`ftbl`) that was missing PCs. Stack
+    indices then pointed at the wrong frames, or past the end of the table, in Valgrind's
+    viewer. Frames are now numbered in one pass, which also cuts a 1024-stack dump from
+    seconds to milliseconds.
+  - `dhat::stats().dropped` now counts every allocation refused by a
+    `MIMALLOC_DHAT_MAX_BYTES` too small for the collector's tables. It used to report 1
+    while recording 0 of 1000.
+  - A process forked while another thread was inside a DHAT event can stop and restart
+    DHAT in the child.
 
 ## 1.0.0
 

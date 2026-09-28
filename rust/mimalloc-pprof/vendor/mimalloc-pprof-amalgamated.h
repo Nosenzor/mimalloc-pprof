@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit d13914d8 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8765aad0 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -1315,7 +1315,9 @@ mi_decl_nodiscard mi_decl_export bool mi_dhat_is_enabled(void) mi_attr_noexcept;
 mi_decl_nodiscard mi_decl_export bool mi_dhat_stats_get(mi_dhat_stats_t* out) mi_attr_noexcept;
 
 /* Writes a DHAT file-version-2 heap JSON document. `tu` is monotonic milliseconds,
-   not Valgrind instruction counts; bkacc is always false. */
+   not Valgrind instruction counts; bkacc is always false. Returns false if the file
+   cannot be opened or closed, or if the frame table's temporary index cannot be
+   allocated (the file is then left empty). */
 mi_decl_nodiscard mi_decl_export bool mi_dhat_dump(const char* path) mi_attr_noexcept;
 
 #ifdef __cplusplus

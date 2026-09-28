@@ -1783,10 +1783,43 @@ if (MI_BUILD_TESTS)
   else()
     target_link_libraries(mimalloc-test-dhat PRIVATE mimalloc ${mi_libraries})
   endif()
+  if(NOT WIN32)
+    find_package(Threads REQUIRED)  # the #551 fork scenarios start threads
+    target_link_libraries(mimalloc-test-dhat PRIVATE Threads::Threads)
+  endif()
   add_test(NAME test-dhat COMMAND mimalloc-test-dhat)
   # #549: MIMALLOC_DHAT=1 alone must start DHAT -- the mode never calls mi_dhat_start().
   add_test(NAME test-dhat-env-enabled COMMAND mimalloc-test-dhat --env-enabled-check)
   set_tests_properties(test-dhat-env-enabled PROPERTIES ENVIRONMENT "MIMALLOC_DHAT=1")
+  # The same test against a collector with ONE hash bucket (-DDHAT_BUCKETS=1), so every
+  # program point shares a chain. The frame-table dedup failed only for program points
+  # sharing a bucket, which the default 4096 buckets reach only by chance (#551). Its dump's
+  # PC map also starts at 2 slots (-DDHAT_FRAME_MAP_MIN_SLOTS=2), so every dump rehashes.
+  # Like mimalloc-static-no-detach, this needs its own static library from src/static.c;
+  # it also takes mimalloc-static's MI_MALLOC_OVERRIDE, so libc traffic is observed alike.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_library(mimalloc-static-dhat-one-bucket STATIC EXCLUDE_FROM_ALL src/static.c)
+    set_property(TARGET mimalloc-static-dhat-one-bucket PROPERTY POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(mimalloc-static-dhat-one-bucket PRIVATE ${mi_defines} MI_STATIC_LIB DHAT_BUCKETS=1 DHAT_FRAME_MAP_MIN_SLOTS=2)
+    if(MI_OVERRIDE)
+      target_compile_definitions(mimalloc-static-dhat-one-bucket PRIVATE MI_MALLOC_OVERRIDE)
+    endif()
+    target_compile_options(mimalloc-static-dhat-one-bucket PRIVATE ${mi_cflags} ${mi_cflags_static})
+    target_link_libraries(mimalloc-static-dhat-one-bucket PRIVATE ${mi_libraries})
+    target_include_directories(mimalloc-static-dhat-one-bucket PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+    add_executable(mimalloc-test-dhat-one-bucket test/test-dhat.c)
+    # DHAT_TEST_ONE_BUCKET gives this variant its own dump file names.
+    target_compile_definitions(mimalloc-test-dhat-one-bucket PRIVATE ${mi_defines} DHAT_TEST_ONE_BUCKET=1)
+    target_compile_options(mimalloc-test-dhat-one-bucket PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-dhat-one-bucket PRIVATE include)
+    target_link_libraries(mimalloc-test-dhat-one-bucket PRIVATE mimalloc-static-dhat-one-bucket ${mi_libraries})
+    if(NOT WIN32)
+      target_link_libraries(mimalloc-test-dhat-one-bucket PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-dhat-one-bucket COMMAND mimalloc-test-dhat-one-bucket)
+  endif()
   endif()
 
   # mi_heap_dump_json / mi_heap_get_seq (issue #269, Bun parity P4): backs bun:jsc
