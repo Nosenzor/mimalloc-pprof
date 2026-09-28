@@ -125,7 +125,11 @@ class ReadOnlyDestination:
     ) -> str | None:
         for attempt in range(10):
             result = subprocess.run(
-                ["gh", "api", endpoint], capture_output=True, text=True, check=False
+                ["gh", "api", endpoint],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=release.plain_cli_env(),
             )
             if result.returncode == 0:
                 try:
