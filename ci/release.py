@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import posixpath
 import re
 import stat
@@ -48,8 +49,23 @@ class ReleaseError(ValueError):
     """A candidate or release artifact is unsafe to proceed with."""
 
 
+# setup-soldr exports CLICOLOR_FORCE=1/FORCE_COLOR=1 for every later step, which
+# makes gh pretty-print ANSI-coloured JSON that no parser here accepts (run
+# 36390586755). Every CLI whose stdout is parsed runs with colour forcing removed.
+COLOR_FORCING_ENV = ("CLICOLOR_FORCE", "FORCE_COLOR", "GH_FORCE_TTY")
+
+
+def plain_cli_env() -> dict[str, str]:
+    """The current environment with terminal colour and TTY forcing removed."""
+    env = {key: value for key, value in os.environ.items() if key not in COLOR_FORCING_ENV}
+    env["NO_COLOR"] = "1"
+    return env
+
+
 def command(*args: str) -> str:
-    result = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        args, cwd=ROOT, capture_output=True, text=True, check=False, env=plain_cli_env()
+    )
     if result.returncode:
         raise ReleaseError(f"{' '.join(args[:3])} failed: {result.stderr.strip()}")
     return result.stdout.strip()

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import struct
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -21,6 +23,29 @@ PARENT = "c" * 40
 
 
 class ReleaseFrontdoorTests(unittest.TestCase):
+    def test_command_runs_without_color_forcing_from_setup_soldr(self) -> None:
+        # setup-soldr exports these to every later step; gh then emits ANSI JSON.
+        forced = {"CLICOLOR_FORCE": "1", "FORCE_COLOR": "1", "GH_FORCE_TTY": "1"}
+        probe = (
+            "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+            "('CLICOLOR_FORCE', 'FORCE_COLOR', 'GH_FORCE_TTY', 'NO_COLOR')}))"
+        )
+        with patch.dict(os.environ, forced):
+            seen = json.loads(release.command(sys.executable, "-c", probe))
+        self.assertEqual(
+            seen,
+            {"CLICOLOR_FORCE": None, "FORCE_COLOR": None, "GH_FORCE_TTY": None, "NO_COLOR": "1"},
+        )
+
+    def test_github_json_rejects_ansi_pretty_printed_output(self) -> None:
+        # Shape gh printed under CLICOLOR_FORCE=1 in run 36390586755.
+        colored = '\x1b[1;37m{\x1b[m\n  \x1b[1;34m"state"\x1b[m\x1b[1;37m:\x1b[m \x1b[32m"OPEN"\x1b[m\n\x1b[1;37m}\x1b[m'
+        self.assertIsNone(
+            release.validated_json_document(
+                colored, lambda result: release.json_object_with_string_fields(result, ("state",))
+            )
+        )
+
     def test_github_json_retries_empty_and_schema_invalid_success(self) -> None:
         sleeps: list[float] = []
         with patch.object(

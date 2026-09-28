@@ -40,7 +40,9 @@ class LiveDestination(destinations.ReadOnlyDestination):
 
     @staticmethod
     def _github(*args: str) -> str:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            args, capture_output=True, text=True, check=False, env=release.plain_cli_env()
+        )
         if result.returncode == 0:
             return result.stdout
         message = result.stderr.strip()
