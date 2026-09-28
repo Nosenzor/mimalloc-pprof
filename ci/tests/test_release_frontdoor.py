@@ -23,6 +23,49 @@ PARENT = "c" * 40
 
 
 class ReleaseFrontdoorTests(unittest.TestCase):
+    def test_resume_restores_only_the_artifact_matching_the_freeze(self) -> None:
+        # #564: rebuilt archives never match a freeze, so resume reuses frozen bytes.
+        value = release.directive(444, "1.0.1", SHA)
+        frozen_info: dict[str, object] = {"frozen": True}
+        frozen = {"info_sha256": release.canonical_info_sha256(frozen_info)}
+
+        def bundle(info: dict[str, object], extra: str | None = None) -> bytes:
+            data = BytesIO()
+            with zipfile.ZipFile(data, "w") as archive:
+                archive.writestr("info.json", json.dumps(info))
+                for name in value["assets"]:
+                    archive.writestr(name, f"{name}:{info}")
+                if extra:
+                    archive.writestr(extra, "x")
+            return data.getvalue()
+
+        artifacts = {
+            7: bundle({"frozen": True}, extra="../escape"),
+            8: bundle({"dry": True}),
+            9: bundle(frozen_info),
+        }
+
+        def download(artifact_id: int, path: Path) -> None:
+            path.write_bytes(artifacts[artifact_id])
+
+        with tempfile.TemporaryDirectory() as scratch:
+            dist = Path(scratch)
+            (dist / "rebuilt.zip").write_text("rebuilt")
+            with patch.object(release, "command", return_value="7\n8\n9\n"):
+                chosen = release.restore_frozen_artifacts(dist, value, frozen, download=download)
+            self.assertEqual(chosen, 9)
+            self.assertEqual(
+                sorted(path.name for path in dist.iterdir()),
+                sorted([*value["assets"], "info.json"]),
+            )
+            self.assertEqual(json.loads((dist / "info.json").read_text()), frozen_info)
+
+            with (
+                patch.object(release, "command", return_value="8\n"),
+                self.assertRaisesRegex(release.ReleaseError, "matches the frozen info.json"),
+            ):
+                release.restore_frozen_artifacts(dist, value, frozen, download=download)
+
     def test_command_runs_without_color_forcing_from_setup_soldr(self) -> None:
         # setup-soldr exports these to every later step; gh then emits ANSI JSON.
         forced = {"CLICOLOR_FORCE": "1", "FORCE_COLOR": "1", "GH_FORCE_TTY": "1"}
