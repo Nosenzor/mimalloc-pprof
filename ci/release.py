@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
@@ -352,12 +353,79 @@ def freeze_record(value: dict[str, Any], info: dict[str, Any], crate_sha256: str
     return {
         "schema": "fleet-release-freeze/v1",
         "directive": value,
-        "info_sha256": hashlib.sha256(
-            json.dumps(info, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        "info_sha256": canonical_info_sha256(info),
         "asset_sha256": hashes,
         "crate_sha256": crate_sha256,
     }
+
+
+def canonical_info_sha256(info: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(info, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def download_artifact_zip(artifact_id: int, destination: Path) -> None:
+    with destination.open("wb") as out:
+        result = subprocess.run(
+            ("gh", "api", f"repos/{REPO}/actions/artifacts/{artifact_id}/zip"),
+            cwd=ROOT,
+            stdout=out,
+            stderr=subprocess.PIPE,
+            text=False,
+            check=False,
+            env=plain_cli_env(),
+        )
+    if result.returncode:
+        raise ReleaseError(
+            f"artifact {artifact_id} download failed: {result.stderr.decode().strip()}"
+        )
+
+
+def restore_frozen_artifacts(
+    dist: Path,
+    value: dict[str, Any],
+    frozen: dict[str, Any],
+    *,
+    download: Callable[[int, Path], None] = download_artifact_zip,
+) -> int:
+    """Replace rebuilt archives with the exact bytes the freeze recorded (#564).
+
+    The five archives are not byte-reproducible, so a resume that rebuilds them
+    can never match the freeze. Every attempt uploads its archives and info.json
+    as release-preflight-<sha>; the freezing attempt's copy is the one whose
+    info.json hashes to the frozen info_sha256. Returns that artifact's ID.
+    """
+    name = f"release-preflight-{value['candidate_sha']}"
+    listing = command(
+        "gh",
+        "api",
+        "--paginate",
+        f"repos/{REPO}/actions/artifacts?name={name}&per_page=100",
+        "--jq",
+        ".artifacts[] | select(.expired | not) | .id",
+    )
+    allowed = {*value["assets"], "info.json"}
+    for artifact_id in (int(line) for line in listing.split()):
+        with tempfile.TemporaryDirectory() as scratch:
+            archive = Path(scratch) / "artifact.zip"
+            download(artifact_id, archive)
+            with zipfile.ZipFile(archive) as bundle:
+                members = bundle.namelist()
+                if set(members) != allowed or len(members) != len(allowed):
+                    continue
+                info: object = json.loads(bundle.read("info.json"))
+                if not isinstance(info, dict):
+                    continue
+                if canonical_info_sha256(cast(dict[str, Any], info)) != frozen["info_sha256"]:
+                    continue
+                for stale in dist.iterdir():
+                    if stale.is_file() or stale.is_symlink():
+                        stale.unlink()
+                for member in members:
+                    (dist / member).write_bytes(bundle.read(member))
+        return artifact_id
+    raise ReleaseError(f"no unexpired {name} artifact matches the frozen info.json")
 
 
 def require_frozen_info(
@@ -794,7 +862,7 @@ def main() -> int:
                 required=True,
             )
             entry.add_argument("--results", required=True)
-    for operation in ("preflight-artifacts", "verify-artifacts"):
+    for operation in ("preflight-artifacts", "verify-artifacts", "restore-frozen-artifacts"):
         artifact_command = commands.add_parser(operation)
         artifact_command.add_argument("--issue", type=int, default=444)
         artifact_command.add_argument("--candidate-sha", required=True)
@@ -808,12 +876,23 @@ def main() -> int:
             return 0
         candidate = args.candidate_sha or command("git", "rev-parse", "HEAD")
         value = directive(args.issue, source_version(), candidate)
-        if args.operation in ("preflight-artifacts", "verify-artifacts"):
+        if args.operation in (
+            "preflight-artifacts",
+            "verify-artifacts",
+            "restore-frozen-artifacts",
+        ):
             existing = issue_directives(args.issue)
             if not existing:
                 raise ReleaseError("issue has no release directive")
             frozen = frozen_identity(args.issue)
             require_history(existing, value, frozen)
+            if args.operation == "restore-frozen-artifacts":
+                if frozen is None:
+                    print("no release freeze: publishing this attempt's rebuilt archives")
+                    return 0
+                artifact_id = restore_frozen_artifacts(args.dist, value, frozen)
+                print(f"resume: restored frozen archives from artifact {artifact_id}")
+                return 0
             if args.operation == "preflight-artifacts":
                 info = inspect_artifacts(args.dist, value)
             else:
