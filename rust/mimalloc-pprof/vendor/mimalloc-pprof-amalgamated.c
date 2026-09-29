@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 6020d50c of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit bd1f37c4 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3116,7 +3116,7 @@ typedef struct mi_page_s {
 // re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
 // one it needs.
 #ifndef MI_LARGE_REPURPOSE_PER_TICK
-#define MI_LARGE_REPURPOSE_PER_TICK       (16)
+#define MI_LARGE_REPURPOSE_PER_TICK       (64)
 #endif
 #ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
 #define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
@@ -25533,6 +25533,9 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   mi_page_t* const page = best_pq->first;
   theap->large_repurpose_left--;
   _mi_page_unpublish_retired(page);   // (#483) ours again before we touch its blocks
+  mi_assert_internal(mi_page_all_free(page) && mi_page_is_owned(page) && !mi_page_is_abandoned(page));
+  mi_assert_internal(mi_tf_block(mi_atomic_load_relaxed(&page->xthread_free)) == NULL);
+  mi_assert_internal(mi_page_theap(page) == theap);
   mi_page_queue_remove(best_pq, page);
   mi_theap_stat_decrease(theap, page_bins[_mi_page_stats_bin(page)], 1);
   page->retire_expire = 0;
@@ -25542,10 +25545,18 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   page->capacity = 0;
   page->free_is_zero = false;
   page->memid.initially_zero = false;   // its blocks were handed out before
+  // The page map covers only `block_size * reserved` of a page (`mi_page_map_get_idx`), so the
+  // new geometry must be registered over its own extent: a block past the old extent otherwise
+  // maps to no page (a debug build asserts in `_mi_ptr_page`; a release build loses the free).
+  _mi_page_map_unregister(page);
   page->block_size = block_size;
   page->reserved = (uint16_t)(best_size / block_size);
   mi_page_set_has_interior_pointers(page, false);
-  mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);
+  mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);   // (before any free below: it debits this bin)
+  if mi_unlikely(!_mi_page_map_register(page)) {   // (cannot commit page-map memory)
+    _mi_arenas_page_free(page, theap);
+    return NULL;
+  }
   mi_page_queue_push(theap, pq, page);
   if (!_mi_page_init(theap, page)) {   // (cannot commit its first block: give it back)
     mi_page_queue_remove(pq, page);
