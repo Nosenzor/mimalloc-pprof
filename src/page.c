@@ -534,11 +534,6 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // take another's in turn: unbounded, that cascade was 548K page requests (and 79K arena round
   // trips as the misses aged retired pages out) instead of 292 on large-class/8, +16% CPU.
   if (theap->tld->large_repurpose_left == 0) return NULL;
-  // An abandoned page of the bin (another thread's, typically one that exited) comes first: it is
-  // resident and partly used, and the arena path reclaims it. Re-carving our own retired page
-  // instead left those stranded and the donor bins short: 4x the arena pages with short-lived
-  // threads (perf-ab short generations).
-  if (mi_atomic_load_relaxed(&_mi_theap_heap(theap)->abandoned_count[_mi_bin(block_size)]) != 0) return NULL;
   const size_t bin_lo = mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
   const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
   // at least the span the bin's own demand accounting (#532) would give a new page: a smaller one
@@ -546,7 +541,6 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   const size_t want = mi_size_of_slices(_mi_large_span_peek_slices(theap, block_size, 0));
   mi_page_queue_t* best_pq = NULL;
   size_t best_size = SIZE_MAX;
-  uint8_t best_expire = UINT8_MAX;
   for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
     mi_page_queue_t* const q = &theap->pages[bin];
     mi_page_t* const page = q->first;
@@ -558,11 +552,8 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
     if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
     #endif
     const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
-    if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS) continue;
-    // the one retired longest (the lowest countdown: its bin is the least likely to want it back
-    // soon, and taking it starts no cascade), then the smallest that is large enough
-    if (page->retire_expire > best_expire || (page->retire_expire == best_expire && size >= best_size)) continue;
-    best_pq = q; best_size = size; best_expire = page->retire_expire;
+    if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
+    best_pq = q; best_size = size;   // best fit: the smallest that is large enough
   }
   if (best_pq == NULL) return NULL;
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
