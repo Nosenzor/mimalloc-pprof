@@ -23,7 +23,9 @@
    (g) a bin's retired page serves another bin (#530): once a bin's only page empties it is kept
        (retired); after an aging tick without reuse, a different large bin that needs a page
        re-carves it instead of taking new arena slices (MI_LARGE_REPURPOSE), so a thread does not
-       hold one empty page per bin.
+       hold one empty page per bin. The page map covers `block_size * reserved` of a page only,
+       so a re-carve that reaches further (2 x 384 KiB, mapped to 768 KiB, -> 4 x 256 KiB whose last starts at 768 KiB) must map
+       its new tail: every block of the new geometry maps back to the page.
 
    Deterministic: structural checks on the pages the blocks land in (`page->memid`, `reserved`,
    `capacity`), no RSS and no timing. ctest turns the scavenger and the hole sweep off so no
@@ -390,10 +392,45 @@ static THREAD_RET repurpose_main(void* arg) {
   return THREAD_OK;
 }
 
+// the tail a 2-block geometry left unmapped is mapped once the page is re-carved
+static THREAD_RET repurpose_extent_main(void* arg) {
+  (void)arg;
+  void* const a = mi_malloc(384 * 1024);
+  assert(a != NULL);
+  uint8_t* const slices_a = mi_page_slice_start(_mi_ptr_page(a));
+  mi_free(a);
+  mi_collect(false);
+  void* blocks[8];
+  size_t n = 0;
+  const mi_page_t* page = NULL;
+  for (; n < 8; n++) {
+    blocks[n] = mi_malloc(256 * 1024);
+    assert(blocks[n] != NULL);
+    const mi_page_t* const pg = _mi_ptr_page(blocks[n]);
+    if (n == 0) { page = pg; }
+    if (pg != page) break;   // the page is full
+    memset(blocks[n], 0x55, 256 * 1024);
+    CHECK(mi_usable_size(blocks[n]) >= 256 * 1024, "(g) block %zu of the re-carved page has no usable size", n);
+  }
+  fprintf(stderr, "(g) extent: %zu blocks of 256 KiB in the page (%s slices as the freed 384 KiB block), all mapped\n",
+          n, mi_page_slice_start(page) == slices_a ? "same" : "other");
+  #if MI_LARGE_REPURPOSE
+  CHECK(mi_page_slice_start(page) == slices_a, "(g) extent: the retired page should have been repurposed");
+  CHECK(n == (size_t)page->reserved, "(g) extent: every block of the new geometry should map to the page (%zu of %u)", n, (unsigned)page->reserved);
+  #endif
+  for (size_t i = 0; i <= n && i < 8; i++) { mi_free(blocks[i]); }
+  return THREAD_OK;
+}
+
 static void case_repurpose(void) {
   if (bin_of_size_is_large(160 * 1024) && bin_of_size_is_large(300 * 1024)) {
     thread_t t;
     thread_start(&t, &repurpose_main, NULL);
+    thread_join(t);
+  }
+  if (bin_of_size_is_large(384 * 1024) && bin_of_size_is_large(256 * 1024)) {
+    thread_t t;
+    thread_start(&t, &repurpose_extent_main, NULL);
     thread_join(t);
   }
 }

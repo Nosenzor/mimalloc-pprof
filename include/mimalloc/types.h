@@ -710,7 +710,7 @@ typedef struct mi_page_s {
 // re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
 // one it needs.
 #ifndef MI_LARGE_REPURPOSE_PER_TICK
-#define MI_LARGE_REPURPOSE_PER_TICK       (16)
+#define MI_LARGE_REPURPOSE_PER_TICK       (64)
 #endif
 #ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
 #define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
