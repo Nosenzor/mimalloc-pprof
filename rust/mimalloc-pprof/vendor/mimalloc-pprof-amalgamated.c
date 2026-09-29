@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit bd1f37c4 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f7de2a63 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3111,7 +3111,7 @@ typedef struct mi_page_s {
 #ifndef MI_LARGE_REPURPOSE
 #define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
 #endif
-// #530: how many retired large pages a theap may repurpose per heartbeat (every 1000 generic
+// #530: how many retired large pages a thread may repurpose per heartbeat (every 1000 generic
 // mallocs). Each take can make the donor bin take another's in turn: a hot large-class workload
 // re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
 // one it needs.
@@ -3259,9 +3259,6 @@ struct mi_theap_s {
   mi_stats_t            stats;                               // thread-local statistics
   #if MI_LARGE_SPAN
   mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
-  #if MI_LARGE_REPURPOSE
-  uint16_t              large_repurpose_left;               // #530: retired pages this theap may still repurpose until the next heartbeat
-  #endif
   #endif
 };
 
@@ -3491,6 +3488,7 @@ struct mi_tld_s {
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
+  size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
@@ -19837,7 +19835,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
   0,                      // fork_gen (#293)
-  { 0 }                   // retired_pages (#483)
+  { 0 },                  // retired_pages (#483)
+  0                       // large_repurpose_left (#530)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -19870,9 +19869,6 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   MI_STATS_NULL,          // stats
   #if MI_LARGE_SPAN
   { 0 },                  // large_span (#532): every bin starts compact
-  #endif
-  #if MI_LARGE_REPURPOSE
-  MI_LARGE_REPURPOSE_PER_TICK,  // large_repurpose_left (#530): refilled at each heartbeat
   #endif
 };
 
@@ -19989,6 +19985,7 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
   mi_atomic_store_relaxed(&tld->sweeper, (uintptr_t)0);
   mi_atomic_store_relaxed(&tld->gate_flags, (size_t)0);
   tld->fork_gen = _mi_fork_generation;   // #293: every tld, detached included, starts current
+  tld->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530: a fresh thread starts with a full budget
   if (tld->thread_id == MI_THREADID_DETACHED) {
     tld->numa_node = -1;
   }
@@ -25506,7 +25503,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // Within this heartbeat's budget only. A repurposed page's own bin may need a page again soon and
   // take another's in turn: unbounded, that cascade was 548K page requests (and 79K arena round
   // trips as the misses aged retired pages out) instead of 292 on large-class/8, +16% CPU.
-  if (theap->large_repurpose_left == 0) return NULL;
+  if (theap->tld->large_repurpose_left == 0) return NULL;
   const size_t bin_lo = mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
   const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
   // at least the span the bin's own demand accounting (#532) would give a new page: a smaller one
@@ -25531,7 +25528,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   if (best_pq == NULL) return NULL;
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;
-  theap->large_repurpose_left--;
+  theap->tld->large_repurpose_left--;
   _mi_page_unpublish_retired(page);   // (#483) ours again before we touch its blocks
   mi_assert_internal(mi_page_all_free(page) && mi_page_is_owned(page) && !mi_page_is_abandoned(page));
   mi_assert_internal(mi_tf_block(mi_atomic_load_relaxed(&page->xthread_free)) == NULL);
@@ -26213,7 +26210,7 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
     #if MI_LARGE_REPURPOSE
-    theap->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530
+    theap->tld->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530
     #endif
     _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }
