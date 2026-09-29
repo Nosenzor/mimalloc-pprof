@@ -2436,6 +2436,55 @@ class BenchmarkReportTests(unittest.TestCase):
         with self.assertRaisesRegex(report.ReportError, "above"):
             report.validate_scaling_report(above["scaling"], "floor above a peak")
 
+    def test_rss_floor_within_the_measurement_slack_validates(self) -> None:
+        # #534: the floor comes from a separate live-telemetry replay and the peaks are
+        # polled, so an allocator close to it dips a little under it (jemalloc on
+        # large-class-ephemeral/1: 9.52 MiB against a 9.76 MiB floor failed every full run).
+        self.assertTrue(report.rss_floor_within_slack(100, 100))
+        self.assertTrue(
+            report.rss_floor_within_slack(100 + report.SCALING_RSS_FLOOR_SLACK_PERCENT, 100)
+        )
+        self.assertFalse(
+            report.rss_floor_within_slack(101 + report.SCALING_RSS_FLOOR_SLACK_PERCENT, 100)
+        )
+
+        def with_floor_at_percent_of_lowest(percent: int) -> dict[str, object]:
+            value = copy.deepcopy(self.with_thread_churn(self.load_latest()))
+            rss = cast(dict[str, object], cast(dict[str, object], value["scaling"])["rss"])
+            floor = cast(list[dict[str, object]], rss["floor_summaries"])[0]
+            lowered = cast(int, floor["floor_rss_bytes"]) * 100 // percent
+            cell = next(
+                cell
+                for cell in cast(list[dict[str, object]], rss["cell_summaries"])
+                if cell["pattern"] == floor["pattern"]
+                and cell["thread_count"] == floor["thread_count"]
+            )
+            # one allocator measured every block at `lowered`: raw samples and summary agree
+            for sample in cast(
+                list[dict[str, object]], cast(dict[str, object], value["scaling"])["raw_samples"]
+            ):
+                if (sample["pattern"], sample["thread_count"], sample["allocator_id"]) == (
+                    cell["pattern"],
+                    cell["thread_count"],
+                    cell["allocator_id"],
+                ):
+                    sample["peak_rss_bytes"] = lowered
+            for field in (
+                "median_peak_rss_bytes",
+                "p05_peak_rss_bytes",
+                "p95_peak_rss_bytes",
+                "min_peak_rss_bytes",
+                "max_peak_rss_bytes",
+            ):
+                cell[field] = lowered
+            return value
+
+        within = with_floor_at_percent_of_lowest(100 + report.SCALING_RSS_FLOOR_SLACK_PERCENT // 2)
+        report.validate_scaling_report(within["scaling"], "floor within the slack")
+        beyond = with_floor_at_percent_of_lowest(100 + report.SCALING_RSS_FLOOR_SLACK_PERCENT + 5)
+        with self.assertRaisesRegex(report.ReportError, "above"):
+            report.validate_scaling_report(beyond["scaling"], "floor beyond the slack")
+
     def test_v1_rss_side_car_without_floors_still_validates_and_renders(self) -> None:
         latest = self.with_complete_scaling(self.load_latest())
         rss = cast(dict[str, object], cast(dict[str, object], latest["scaling"])["rss"])
