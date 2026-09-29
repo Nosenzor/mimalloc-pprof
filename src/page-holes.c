@@ -786,7 +786,8 @@ void _mi_page_unpurge_all(mi_page_t* page) {
   page retires, the owner resets it to "nothing formed" (`capacity == 0`, `free == NULL`: the
   memory stays resident, so a reuse re-forms blocks without faulting, and the alloc fast path
   can never reach a block of it) and publishes it in a slot of its tld. The scavenger discards
-  the whole block area of a page that stays published for MI_RETIRED_RELEASE_MULT purge delays,
+  the whole block area of a page that stays published for MI_RETIRED_RELEASE_MULT purge delays
+  (counted from the scavenger's first sight of it, #544),
   as an unformed tail -- which `mi_page_extend_free` already hands back before forming a block.
 
   The slot is the lock: whoever takes the page out of the slot owns the page's memory until it
@@ -817,7 +818,7 @@ void _mi_page_publish_retired(mi_page_t* page) {
   page->local_free = NULL;
   page->capacity = 0;
   page->free_is_zero = false;
-  page->retired_at = _mi_clock_now();
+  page->retired_at = 0;         // unstamped: the scavenger stamps it when it first sees the page (#544)
   page->retired_slot = slot;
   mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
   _mi_pages_release_schedule(mi_page_subproc(page));
@@ -885,7 +886,13 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
         if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &page, MI_RETIRED_SLOT_BUSY)) continue;   // the owner took it back
         // the page's memory is ours until we put it back
         if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
-          if (now - page->retired_at < min_age) { pending = true; }
+          // #544: the owner publishes a page without reading the clock. A bin's only page empties
+          // and is taken back again on nearly every allocation cycle of a sparse large bin (1.04M
+          // publishes in 3.2M operations of perf-ab large-class/8, all but 0.3% of the process's
+          // clock reads), and the publish wakes us, so the age counts from our first sight: a
+          // release can come at most one scavenger wake-up later, never earlier.
+          if (page->retired_at == 0) { page->retired_at = (now != 0 ? now : 1); pending = true; }
+          else if (now - page->retired_at < min_age) { pending = true; }
           else { mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
         }
         mi_atomic_store_ptr_release(mi_page_t, slot, page);
