@@ -386,60 +386,9 @@ void _mi_page_free_or_reserve(mi_page_t* page, mi_page_queue_t* pq) {
 
 // allocate a fresh page from an arena
 #if MI_LARGE_REPURPOSE
-// #530: a new page of a large bin, from another large bin's retired page of this theap.
-//
-// Every large bin a thread uses keeps its only page when it empties (`_mi_page_retire`), and
-// with a few live large blocks spread over ~11 bins most of those pages are empty at any moment
-// yet resident: large-class/8 held ~16 MiB of such pages per worker for 1.3 MiB of live blocks.
-// Freeing them to the arena instead (so any bin or thread reuses their resident slices) halved
-// peak RSS in perf-ab, but the arena round trip (bitmaps, page map, purge scheduling) cost +76%
-// CPU. Re-carving the empty page for the bin that needs one keeps both: the slices, the page map
-// entries and the ownership stay as they are, only the block geometry changes.
-static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size) {
-  if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
-  const size_t bin_lo = mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
-  const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
-  mi_page_queue_t* best_pq = NULL;
-  size_t best_size = SIZE_MAX;
-  for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
-    mi_page_queue_t* const q = &theap->pages[bin];
-    mi_page_t* const page = q->first;
-    // only a retired page (the bin's only one, empty) whose meta lives outside its slices, so the
-    // block area starts at the slice start whatever the block size
-    if (q == pq || page == NULL || page != q->last || page->retire_expire == 0 || page->used != 0) continue;
-    if (page->memid.memkind != MI_MEM_ARENA || !mi_page_meta_is_separated(page)) continue;
-    #if MI_PPROF
-    if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
-    #endif
-    const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
-    if (size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
-    best_pq = q; best_size = size;   // best fit: the smallest that holds MI_LARGE_SPAN_MIN_BLOCKS
-  }
-  if (best_pq == NULL) return NULL;
-  mi_page_t* const page = best_pq->first;
-  _mi_page_unpublish_retired(page);   // (#483) ours again before we touch its blocks
-  mi_page_queue_remove(best_pq, page);
-  mi_theap_stat_decrease(theap, page_bins[_mi_page_stats_bin(page)], 1);
-  page->retire_expire = 0;
-  page->retired_at = 0;
-  page->free = NULL;
-  page->local_free = NULL;
-  page->capacity = 0;
-  page->free_is_zero = false;
-  page->memid.initially_zero = false;   // its blocks were handed out before
-  page->block_size = block_size;
-  page->reserved = (uint16_t)(best_size / block_size);
-  mi_page_set_has_interior_pointers(page, false);
-  mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);
-  mi_page_queue_push(theap, pq, page);
-  if (!_mi_page_init(theap, page)) {   // (cannot commit its first block: give it back)
-    mi_page_queue_remove(pq, page);
-    _mi_arenas_page_free(page, theap);
-    return NULL;
-  }
-  return page;
-}
+static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size);
 #endif
+
 
 static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size, size_t page_alignment) {
   #if !MI_HUGE_PAGE_ABANDON
@@ -569,6 +518,66 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
 
 #define MI_RETIRE_CYCLES      (16)
 
+#if MI_LARGE_REPURPOSE
+// #530: a new page of a large bin, from another large bin's retired page of this theap.
+//
+// Every large bin a thread uses keeps its only page when it empties (`_mi_page_retire`), and
+// with a few live large blocks spread over ~11 bins most of those pages are empty at any moment
+// yet resident: large-class/8 held ~16 MiB of such pages per worker for 1.3 MiB of live blocks.
+// Freeing them to the arena instead (so any bin or thread reuses their resident slices) halved
+// peak RSS in perf-ab, but the arena round trip (bitmaps, page map, purge scheduling) cost +76%
+// CPU. Re-carving the empty page for the bin that needs one keeps both: the slices, the page map
+// entries and the ownership stay as they are, only the block geometry changes.
+static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size) {
+  if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
+  const size_t bin_lo = mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
+  // at least the span the bin's own demand accounting (#532) would give a new page: a smaller one
+  // fills and is abandoned at once, and a busy bin then churns through pages
+  const size_t want = mi_size_of_slices(_mi_large_span_peek_slices(theap, block_size, 0));
+  mi_page_queue_t* best_pq = NULL;
+  size_t best_size = SIZE_MAX;
+  for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
+    mi_page_queue_t* const q = &theap->pages[bin];
+    mi_page_t* const page = q->first;
+    // only a retired page (the bin's only one, empty) whose meta lives outside its slices, so the
+    // block area starts at the slice start whatever the block size
+    if (q == pq || page == NULL || page != q->last || page->retire_expire == 0 || page->used != 0) continue;
+    if (page->memid.memkind != MI_MEM_ARENA || !mi_page_meta_is_separated(page)) continue;
+    #if MI_PPROF
+    if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
+    #endif
+    const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
+    if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
+    best_pq = q; best_size = size;   // best fit: the smallest that is large enough
+  }
+  if (best_pq == NULL) return NULL;
+  (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
+  mi_page_t* const page = best_pq->first;
+  _mi_page_unpublish_retired(page);   // (#483) ours again before we touch its blocks
+  mi_page_queue_remove(best_pq, page);
+  mi_theap_stat_decrease(theap, page_bins[_mi_page_stats_bin(page)], 1);
+  page->retire_expire = 0;
+  page->retired_at = 0;
+  page->free = NULL;
+  page->local_free = NULL;
+  page->capacity = 0;
+  page->free_is_zero = false;
+  page->memid.initially_zero = false;   // its blocks were handed out before
+  page->block_size = block_size;
+  page->reserved = (uint16_t)(best_size / block_size);
+  mi_page_set_has_interior_pointers(page, false);
+  mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);
+  mi_page_queue_push(theap, pq, page);
+  if (!_mi_page_init(theap, page)) {   // (cannot commit its first block: give it back)
+    mi_page_queue_remove(pq, page);
+    _mi_arenas_page_free(page, theap);
+    return NULL;
+  }
+  return page;
+}
+#endif
+
 // Retire a page with no more used blocks
 // Important to not retire too quickly though as new
 // allocations might coming.
@@ -647,6 +656,12 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
     mi_page_t*       page = pq->first;
     if (page != NULL && page->retire_expire != 0) {
       if (mi_page_all_free(page)) {
+        #if MI_LARGE_REPURPOSE
+        // #530: a retired large page stays until a bin repurposes it (it is published: the
+        // scavenger discards its memory once idle, #483). Letting it expire into the arena left
+        // repurposing without pages: 81K arena round trips on large-class/8.
+        if (!force && mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) { min = (bin < min ? bin : min); max = (bin > max ? bin : max); continue; }
+        #endif
         page->retire_expire--;
         if (page->retire_expire == 0 || force) {
           _mi_page_free(page, pq);
