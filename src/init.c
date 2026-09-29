@@ -127,6 +127,7 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
   0,                      // fork_gen (#293)
   { 0 },                  // retired_pages (#483)
+  0,                      // retired_used (#530)
   0                       // large_repurpose_left (#530)
 };
 
