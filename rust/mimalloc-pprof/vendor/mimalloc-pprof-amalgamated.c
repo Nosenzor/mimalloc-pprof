@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 98f64c16 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 59e8cba5 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3090,6 +3090,20 @@ typedef struct mi_page_s {
 #define MI_LARGE_MAX_OBJ_SIZE             MI_MEDIUM_MAX_OBJ_SIZE    // note: this must be a nice power of 2 or we get rounding issues with `_mi_bin`
 #endif
 #define MI_LARGE_MAX_OBJ_WSIZE            (MI_LARGE_MAX_OBJ_SIZE/MI_SIZE_SIZE)
+
+// The largest block size whose abandoned page a free may reclaim (src/free.c). Upstream stops at
+// medium pages. With demand-sized spans (#532) a compact large page can be exactly filled by a
+// bin's live set: filling it abandons it, and at 7 of 8 blocks used it is still "mostly used", so
+// neither the owner's free nor its next allocation found it again. The bin opened a second page
+// and grew, which cost +48% peak RSS and +72% faults for 8 live 128 KiB blocks (#544). Large pages
+// are reclaimed only by their originating theap (see `mi_abandoned_page_try_reclaim`).
+#ifndef MI_RECLAIM_ON_FREE_MAX_SIZE
+#if MI_LARGE_SPAN
+#define MI_RECLAIM_ON_FREE_MAX_SIZE       MI_LARGE_MAX_OBJ_SIZE
+#else
+#define MI_RECLAIM_ON_FREE_MAX_SIZE       MI_MEDIUM_MAX_OBJ_SIZE
+#endif
+#endif
 
 #if (MI_LARGE_MAX_OBJ_WSIZE >= 655360)
 #error "mimalloc internal: define more bins"
@@ -8284,7 +8298,7 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(!mi_page_all_free(page));
-  mi_assert_internal(page->block_size <= MI_MEDIUM_MAX_OBJ_SIZE);
+  mi_assert_internal(page->block_size <= MI_RECLAIM_ON_FREE_MAX_SIZE);
   mi_assert_internal(reclaim_on_free >= 0);
   
   // dont reclaim if we just have terminated this thread and we should
@@ -8301,6 +8315,9 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
   if mi_likely(theap == page->theap) {  // did this page originate from the current theap? (and thus allocated from this thread)
     // originating theap
     max_reclaim = _mi_option_get_fast(theap->tld->is_in_threadpool ? mi_option_page_cross_thread_max_reclaim : mi_option_page_max_reclaim);
+  }
+  else if (page->block_size > MI_MEDIUM_MAX_OBJ_SIZE) {
+    return false;   // #544: a large page is reclaimed on free only by the theap it came from
   }
   else if (reclaim_on_free == 1 &&               // if cross-thread is allowed
             !theap->tld->is_in_threadpool &&      // and we are not part of a threadpool
@@ -8353,7 +8370,7 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
 
   // try to: 1. free it, 2. reclaim it, or 3. reabandon it to be mapped
   if (mi_abandoned_page_try_free(page)) return;
-  if (page->block_size <= MI_MEDIUM_MAX_OBJ_SIZE && reclaim_on_free >= 0) {  // early test for better codegen
+  if (page->block_size <= MI_RECLAIM_ON_FREE_MAX_SIZE && reclaim_on_free >= 0) {  // early test for better codegen
     if (mi_abandoned_page_try_reclaim(page, reclaim_on_free)) return;
   }
   if (mi_abandoned_page_try_reabandon_to_mapped(page)) return;
