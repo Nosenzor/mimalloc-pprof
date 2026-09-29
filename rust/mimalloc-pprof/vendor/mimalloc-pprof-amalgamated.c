@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit f7de2a63 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3e82ff15 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3117,6 +3117,10 @@ typedef struct mi_page_s {
 // one it needs.
 #ifndef MI_LARGE_REPURPOSE_PER_TICK
 #define MI_LARGE_REPURPOSE_PER_TICK       (64)
+#endif
+// ... and the budget a new thread starts with, before its first heartbeat
+#ifndef MI_LARGE_REPURPOSE_FRESH
+#define MI_LARGE_REPURPOSE_FRESH          (MI_LARGE_REPURPOSE_PER_TICK)
 #endif
 #ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
 #define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
@@ -19985,7 +19989,7 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
   mi_atomic_store_relaxed(&tld->sweeper, (uintptr_t)0);
   mi_atomic_store_relaxed(&tld->gate_flags, (size_t)0);
   tld->fork_gen = _mi_fork_generation;   // #293: every tld, detached included, starts current
-  tld->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530: a fresh thread starts with a full budget
+  tld->large_repurpose_left = MI_LARGE_REPURPOSE_FRESH;   // #530: a new thread's budget until its first heartbeat
   if (tld->thread_id == MI_THREADID_DETACHED) {
     tld->numa_node = -1;
   }
