@@ -713,9 +713,11 @@ typedef struct mi_page_s {
 #define MI_LARGE_REPURPOSE_PER_TICK       (64)
 #endif
 // ... and the budget a new thread starts with, before its first heartbeat
-// ... and whether a bin with abandoned pages reclaims those first (the arena path) instead
+// ... and whether a bin with abandoned pages (typically an exited thread's) reclaims those first
+// (the arena path) instead. With short-lived threads, re-carving our own retired pages instead
+// left those stranded and cost the chart build's ephemeral row +3.4% CPU (1: -0.5%).
 #ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
-#define MI_LARGE_REPURPOSE_ABANDONED_FIRST (0)
+#define MI_LARGE_REPURPOSE_ABANDONED_FIRST (1)
 #endif
 #ifndef MI_LARGE_REPURPOSE_FRESH
 #define MI_LARGE_REPURPOSE_FRESH          (MI_LARGE_REPURPOSE_PER_TICK)
