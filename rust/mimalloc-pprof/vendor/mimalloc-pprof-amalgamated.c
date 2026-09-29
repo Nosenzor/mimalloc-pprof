@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3a04a72b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit baa6eed7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3105,6 +3105,12 @@ typedef struct mi_page_s {
 #endif
 // ... and only while the theap holds at most this many pages of the page's bin (0: none, so its
 // next allocation of the bin would open a new page)
+// #530: a large bin that needs a new page takes another large bin's retired (empty) page of the
+// same theap and re-carves it (src/page.c, `mi_page_repurpose_retired`) before asking the arena.
+// 0 turns it off.
+#ifndef MI_LARGE_REPURPOSE
+#define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
+#endif
 #ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
 #define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
 #endif
@@ -25338,11 +25344,73 @@ void _mi_page_free_or_reserve(mi_page_t* page, mi_page_queue_t* pq) {
 
 
 // allocate a fresh page from an arena
+#if MI_LARGE_REPURPOSE
+// #530: a new page of a large bin, from another large bin's retired page of this theap.
+//
+// Every large bin a thread uses keeps its only page when it empties (`_mi_page_retire`), and
+// with a few live large blocks spread over ~11 bins most of those pages are empty at any moment
+// yet resident: large-class/8 held ~16 MiB of such pages per worker for 1.3 MiB of live blocks.
+// Freeing them to the arena instead (so any bin or thread reuses their resident slices) halved
+// peak RSS in perf-ab, but the arena round trip (bitmaps, page map, purge scheduling) cost +76%
+// CPU. Re-carving the empty page for the bin that needs one keeps both: the slices, the page map
+// entries and the ownership stay as they are, only the block geometry changes.
+static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size) {
+  if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
+  const size_t bin_lo = mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
+  mi_page_queue_t* best_pq = NULL;
+  size_t best_size = SIZE_MAX;
+  for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
+    mi_page_queue_t* const q = &theap->pages[bin];
+    mi_page_t* const page = q->first;
+    // only a retired page (the bin's only one, empty) whose meta lives outside its slices, so the
+    // block area starts at the slice start whatever the block size
+    if (q == pq || page == NULL || page != q->last || page->retire_expire == 0 || page->used != 0) continue;
+    if (page->memid.memkind != MI_MEM_ARENA || !mi_page_meta_is_separated(page)) continue;
+    #if MI_PPROF
+    if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
+    #endif
+    const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
+    if (size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
+    best_pq = q; best_size = size;   // best fit: the smallest that holds MI_LARGE_SPAN_MIN_BLOCKS
+  }
+  if (best_pq == NULL) return NULL;
+  mi_page_t* const page = best_pq->first;
+  _mi_page_unpublish_retired(page);   // (#483) ours again before we touch its blocks
+  mi_page_queue_remove(best_pq, page);
+  mi_theap_stat_decrease(theap, page_bins[_mi_page_stats_bin(page)], 1);
+  page->retire_expire = 0;
+  page->retired_at = 0;
+  page->free = NULL;
+  page->local_free = NULL;
+  page->capacity = 0;
+  page->free_is_zero = false;
+  page->memid.initially_zero = false;   // its blocks were handed out before
+  page->block_size = block_size;
+  page->reserved = (uint16_t)(best_size / block_size);
+  mi_page_set_has_interior_pointers(page, false);
+  mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);
+  mi_page_queue_push(theap, pq, page);
+  if (!_mi_page_init(theap, page)) {   // (cannot commit its first block: give it back)
+    mi_page_queue_remove(pq, page);
+    _mi_arenas_page_free(page, theap);
+    return NULL;
+  }
+  return page;
+}
+#endif
+
 static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size, size_t page_alignment) {
   #if !MI_HUGE_PAGE_ABANDON
   mi_assert_internal(pq != NULL);
   mi_assert_internal(mi_theap_contains_queue(theap, pq));
   mi_assert_internal(page_alignment > 0 || block_size > MI_LARGE_MAX_OBJ_SIZE || block_size == pq->block_size);
+  #endif
+  #if MI_LARGE_REPURPOSE
+  if (page_alignment == 0 && pq != NULL) {
+    mi_page_t* const repurposed = mi_page_repurpose_retired(theap, pq, block_size);
+    if (repurposed != NULL) return repurposed;
+  }
   #endif
   mi_page_t* page = _mi_arenas_page_alloc(theap, block_size, page_alignment);
   if (page == NULL) {
