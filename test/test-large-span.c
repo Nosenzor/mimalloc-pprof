@@ -313,6 +313,11 @@ static THREAD_RET edge_main(void* arg) {
   const mi_page_t* const page = _mi_ptr_page(blocks[0]);
   const size_t span = span_of(blocks[0]);
   const size_t bsize = mi_page_block_size(page);   // (read now: on a RED build the page may be gone by the report)
+  if (bsize > MI_LARGE_MAX_OBJ_SIZE) {   // debug/guard padding pushed it into a singleton page: not a large bin
+    fprintf(stderr, "(f) %zu B: a singleton page, not a large bin -- skipped\n", bsize);
+    mi_free(blocks[0]);
+    return THREAD_OK;
+  }
   while (n < MAX_BLOCKS && page->used < page->reserved) { blocks[n] = mi_malloc(size); assert(blocks[n] != NULL); n++; }
   size_t moved = 0;
   size_t max_span = span;
@@ -327,7 +332,7 @@ static THREAD_RET edge_main(void* arg) {
   }
   fprintf(stderr, "(f) %zu B: %zu live blocks fill a page of span %zu; %zu of %d free/alloc cycles left it, largest span %zu\n",
           bsize, n, span, moved, EDGE_CYCLES, max_span);
-  CHECK(span_is_compact(blocks[0]) || moved > 0, "(f) setup: the bin's first page should be compact (span %zu)", span);
+  CHECK(span < full_slices(), "(f) setup: the bin's first page should be compact (span %zu)", span);
   CHECK(moved == 0, "(f) %zu of %d allocations after freeing a block of the exactly filled page went to another page", moved, EDGE_CYCLES);
   CHECK(max_span == span, "(f) the bin grew (%zu -> %zu slices) though its live set never exceeded one page", span, max_span);
   free_all(blocks, n);
