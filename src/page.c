@@ -580,12 +580,16 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // The page map covers only `block_size * reserved` of a page (`mi_page_map_get_idx`), so the
   // new geometry must be registered over its own extent: a block past the old extent otherwise
   // maps to no page (a debug build asserts in `_mi_ptr_page`; a release build loses the free).
-  _mi_page_map_unregister(page);
+  // (Only when the extent changes: it covers whole slices, and most re-carves keep them.)
+  const size_t old_extent = mi_slice_count_of_size(mi_page_size(page));
+  const size_t new_reserved = best_size / block_size;
+  const bool remap = (mi_slice_count_of_size(new_reserved * block_size) != old_extent);
+  if (remap) { _mi_page_map_unregister(page); }
   page->block_size = block_size;
-  page->reserved = (uint16_t)(best_size / block_size);
-  mi_page_set_has_interior_pointers(page, false);
+  page->reserved = (uint16_t)new_reserved;
+  mi_assert_internal(!mi_page_has_interior_pointers(page));   // (`_mi_page_retire` cleared it)
   mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);   // (before any free below: it debits this bin)
-  if mi_unlikely(!_mi_page_map_register(page)) {   // (cannot commit page-map memory)
+  if (remap && mi_unlikely(!_mi_page_map_register(page))) {   // (cannot commit page-map memory)
     _mi_arenas_page_free(page, theap);
     return NULL;
   }
