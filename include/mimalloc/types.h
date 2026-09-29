@@ -650,7 +650,8 @@ typedef struct mi_page_s {
   uint64_t                  swept_state;
 
   // #483: a retired large page published for the scavenger (`_mi_page_retire`): the owner's tld
-  // slot holding it (NULL when not published) and when it was retired. Whoever clears the slot
+  // slot holding it (NULL when not published) and when the scavenger first saw it published (0 until
+  // then, #544: the owner does not read the clock to publish). Whoever clears the slot
   // owns the page's memory until it puts it back.
   // #493: `retired_at` doubles as the reserve stamp. It is cleared when a page is unpublished,
   // so on an abandoned page (never published) a non-zero value means "reserved at that time"
