@@ -713,6 +713,10 @@ typedef struct mi_page_s {
 #define MI_LARGE_REPURPOSE_PER_TICK       (64)
 #endif
 // ... and the budget a new thread starts with, before its first heartbeat
+// ... and whether a bin with abandoned pages reclaims those first (the arena path) instead
+#ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
+#define MI_LARGE_REPURPOSE_ABANDONED_FIRST (0)
+#endif
 #ifndef MI_LARGE_REPURPOSE_FRESH
 #define MI_LARGE_REPURPOSE_FRESH          (MI_LARGE_REPURPOSE_PER_TICK)
 #endif
