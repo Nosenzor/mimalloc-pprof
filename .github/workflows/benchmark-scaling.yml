@@ -117,7 +117,7 @@ jobs:
             --cppdefs "$DIAGNOSTIC_CPPDEFS" \
             --patterns "$DIAGNOSTIC_PATTERNS" \
             --threads "$DIAGNOSTIC_THREADS"
-      - uses: zackees/setup-soldr@62d1596b70168e422156f12273a2ed476d3a16dc
+      - uses: zackees/setup-soldr@v0
         with:
           cache-preset: full
           toolchain-file: rust/rust-toolchain.toml
