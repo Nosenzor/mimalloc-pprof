@@ -533,7 +533,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // Within this heartbeat's budget only. A repurposed page's own bin may need a page again soon and
   // take another's in turn: unbounded, that cascade was 548K page requests (and 79K arena round
   // trips as the misses aged retired pages out) instead of 292 on large-class/8, +16% CPU.
-  if (theap->large_repurpose_left == 0) return NULL;
+  if (theap->tld->large_repurpose_left == 0) return NULL;
   const size_t bin_lo = mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
   const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
   // at least the span the bin's own demand accounting (#532) would give a new page: a smaller one
@@ -558,7 +558,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   if (best_pq == NULL) return NULL;
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;
-  theap->large_repurpose_left--;
+  theap->tld->large_repurpose_left--;
   _mi_page_unpublish_retired(page);   // (#483) ours again before we touch its blocks
   mi_assert_internal(mi_page_all_free(page) && mi_page_is_owned(page) && !mi_page_is_abandoned(page));
   mi_assert_internal(mi_tf_block(mi_atomic_load_relaxed(&page->xthread_free)) == NULL);
@@ -1240,7 +1240,7 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
     #if MI_LARGE_REPURPOSE
-    theap->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530
+    theap->tld->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530
     #endif
     _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }

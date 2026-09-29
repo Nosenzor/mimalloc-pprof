@@ -705,7 +705,7 @@ typedef struct mi_page_s {
 #ifndef MI_LARGE_REPURPOSE
 #define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
 #endif
-// #530: how many retired large pages a theap may repurpose per heartbeat (every 1000 generic
+// #530: how many retired large pages a thread may repurpose per heartbeat (every 1000 generic
 // mallocs). Each take can make the donor bin take another's in turn: a hot large-class workload
 // re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
 // one it needs.
@@ -853,9 +853,6 @@ struct mi_theap_s {
   mi_stats_t            stats;                               // thread-local statistics
   #if MI_LARGE_SPAN
   mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
-  #if MI_LARGE_REPURPOSE
-  uint16_t              large_repurpose_left;               // #530: retired pages this theap may still repurpose until the next heartbeat
-  #endif
   #endif
 };
 
@@ -1085,6 +1082,7 @@ struct mi_tld_s {
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
+  size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept

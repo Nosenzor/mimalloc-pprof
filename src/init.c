@@ -126,7 +126,8 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
   0,                      // fork_gen (#293)
-  { 0 }                   // retired_pages (#483)
+  { 0 },                  // retired_pages (#483)
+  0                       // large_repurpose_left (#530)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -159,9 +160,6 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   MI_STATS_NULL,          // stats
   #if MI_LARGE_SPAN
   { 0 },                  // large_span (#532): every bin starts compact
-  #endif
-  #if MI_LARGE_REPURPOSE
-  MI_LARGE_REPURPOSE_PER_TICK,  // large_repurpose_left (#530): refilled at each heartbeat
   #endif
 };
 
@@ -278,6 +276,7 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
   mi_atomic_store_relaxed(&tld->sweeper, (uintptr_t)0);
   mi_atomic_store_relaxed(&tld->gate_flags, (size_t)0);
   tld->fork_gen = _mi_fork_generation;   // #293: every tld, detached included, starts current
+  tld->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530: a fresh thread starts with a full budget
   if (tld->thread_id == MI_THREADID_DETACHED) {
     tld->numa_node = -1;
   }
