@@ -814,8 +814,17 @@ void _mi_page_publish_retired(mi_page_t* page) {
   // the same page back), so an owner-private mask knows which are free without reading the slots
   // -- cache lines the scavenger also touches: scanning them was ~60% of this function's samples
   // (#530, large-class-ephemeral/8 short generations).
-  const size_t free_mask = ~tld->retired_used & MI_RETIRED_SLOTS_MASK;
-  if (free_mask == 0) return;   // all slots full: leave it unpublished
+  size_t free_mask = ~tld->retired_used & MI_RETIRED_SLOTS_MASK;
+  if mi_unlikely(free_mask == 0) {
+    // the mask says full: rebuild it from the slots once (a bit a foreign unpublish could not clear)
+    size_t used = 0;
+    for (size_t k = 0; k < MI_RETIRED_PAGE_SLOTS; k++) {
+      if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) { used |= ((size_t)1 << k); }
+    }
+    tld->retired_used = used;
+    free_mask = ~used & MI_RETIRED_SLOTS_MASK;
+    if (free_mask == 0) return;   // all slots full: leave it unpublished
+  }
   const size_t i = mi_ctz(free_mask);
   _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
   mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, slot) == NULL);
@@ -853,12 +862,18 @@ void _mi_page_unpublish_retired(mi_page_t* page) {
   }
   page->retired_slot = NULL;
   page->retired_at = 0;   // #493: a non-zero stamp on an unpublished page marks a reserved one
-  mi_theap_t* const theap = page->theap;   // (raw: an abandoned page has none, and `mi_page_theap` asserts)
+  // Clear the slot's bit in the owner's mask. `_mi_page_free` clears `page->theap` before the page
+  // reaches `_mi_arenas_page_free`, where it is unpublished; unpublishing is owner-side, so the
+  // calling thread's tld is the owner's then. Missing that path leaked every bit: after 16
+  // publishes nothing was published again, and idle RSS rose +225% to +1989% (perf-ab).
+  mi_theap_t* theap = page->theap;   // (raw: `mi_page_theap` asserts on an abandoned page)
+  if (theap == NULL) { theap = _mi_theap_default(); }
   mi_tld_t* const tld = (theap != NULL ? theap->tld : NULL);
   if (tld != NULL && slot >= &tld->retired_pages[0] && slot < &tld->retired_pages[MI_RETIRED_PAGE_SLOTS]) {
     tld->retired_used &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
   }
-  // (else the slot stays marked used: one slot less, never a double use)
+  // (else -- a heap delete from another thread -- the bit stays set until the owner's next publish
+  // finds no free bit and rebuilds the mask from the slots)
 }
 
 // A theap detached from its tld by a heap delete/destroy (`_mi_heap_detach_theaps`) has its pages
