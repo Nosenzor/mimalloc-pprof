@@ -26,6 +26,9 @@
        hold one empty page per bin. The page map covers `block_size * reserved` of a page only,
        so a re-carve that reaches further (2 x 384 KiB, mapped to 768 KiB, -> 4 x 256 KiB whose last starts at 768 KiB) must map
        its new tail: every block of the new geometry maps back to the page.
+   (h) the owner's retired-slot mask (#530, `mi_tld_t.retired_used`) matches the slots after
+       retired large pages are published and then freed (`_mi_page_free` clears the page's theap
+       before unpublishing it: a mask that missed that path leaked every slot within 16 publishes).
 
    Deterministic: structural checks on the pages the blocks land in (`page->memid`, `reserved`,
    `capacity`), no RSS and no timing. ctest turns the scavenger and the hole sweep off so no
@@ -435,6 +438,45 @@ static void case_repurpose(void) {
   }
 }
 
+/* ---- (h) the retired-slot mask stays exact ------------------------------- */
+
+static size_t slots_in_use(const mi_tld_t* tld) {
+  size_t used = 0;
+  for (size_t k = 0; k < MI_RETIRED_PAGE_SLOTS; k++) {
+    if (mi_atomic_load_ptr_relaxed(mi_page_t, (_Atomic(mi_page_t*)*)&tld->retired_pages[k]) != NULL) { used |= ((size_t)1 << k); }
+  }
+  return used;
+}
+
+static THREAD_RET slots_main(void* arg) {
+  (void)arg;
+  static const size_t sizes[] = { 100 * 1024, 130 * 1024, 170 * 1024, 220 * 1024, 290 * 1024, 380 * 1024, 500 * 1024 };
+  const size_t nsizes = sizeof(sizes) / sizeof(sizes[0]);
+  void* const probe = mi_malloc(sizes[0]);   // this thread's tld, through its page's theap
+  assert(probe != NULL);
+  const mi_tld_t* const tld = _mi_ptr_page(probe)->theap->tld;
+  mi_free(probe);
+  size_t mismatches = 0;
+  for (size_t round = 0; round < 8 * MI_RETIRED_PAGE_SLOTS; round++) {
+    void* const p = mi_malloc(sizes[round % nsizes]);   // a bin's only page ...
+    assert(p != NULL);
+    mi_free(p);                                        // ... empties: retired and published
+    if (round % 3 == 2) { mi_collect(false); }         // expire some: freed via `_mi_page_free`
+    if (tld->retired_used != slots_in_use(tld)) { mismatches++; }
+  }
+  mi_collect(true);
+  fprintf(stderr, "(h) retired-slot mask vs slots after %d publish/free rounds: %zu mismatches (mask %zx, slots %zx)\n",
+          8 * MI_RETIRED_PAGE_SLOTS, mismatches, (size_t)tld->retired_used, slots_in_use(tld));
+  CHECK(mismatches == 0, "(h) the owner's retired-slot mask drifted from the slots (%zu times)", mismatches);
+  return THREAD_OK;
+}
+
+static void case_slots(void) {
+  thread_t t;
+  thread_start(&t, &slots_main, NULL);
+  thread_join(t);
+}
+
 /* ---- (d) the opt-out ----------------------------------------------------- */
 
 static void case_off(void) {
@@ -476,6 +518,7 @@ int main(void) {
   case_blip();
   case_edge();
   case_repurpose();
+  case_slots();
   #endif
   if (failures > 0) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
   fprintf(stderr, "ok\n");
