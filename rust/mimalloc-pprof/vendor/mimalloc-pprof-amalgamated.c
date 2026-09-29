@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3e82ff15 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2b960cd0 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3119,6 +3119,10 @@ typedef struct mi_page_s {
 #define MI_LARGE_REPURPOSE_PER_TICK       (64)
 #endif
 // ... and the budget a new thread starts with, before its first heartbeat
+// ... and whether a bin with abandoned pages reclaims those first (the arena path) instead
+#ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
+#define MI_LARGE_REPURPOSE_ABANDONED_FIRST (0)
+#endif
 #ifndef MI_LARGE_REPURPOSE_FRESH
 #define MI_LARGE_REPURPOSE_FRESH          (MI_LARGE_REPURPOSE_PER_TICK)
 #endif
@@ -25508,6 +25512,11 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // take another's in turn: unbounded, that cascade was 548K page requests (and 79K arena round
   // trips as the misses aged retired pages out) instead of 292 on large-class/8, +16% CPU.
   if (theap->tld->large_repurpose_left == 0) return NULL;
+  #if MI_LARGE_REPURPOSE_ABANDONED_FIRST
+  // an abandoned page of the bin (typically an exited thread's) comes first: the arena path
+  // reclaims it, and it is resident and partly used
+  if (mi_atomic_load_relaxed(&_mi_theap_heap(theap)->abandoned_count[_mi_bin(block_size)]) != 0) return NULL;
+  #endif
   const size_t bin_lo = mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
   const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
   // at least the span the bin's own demand accounting (#532) would give a new page: a smaller one
