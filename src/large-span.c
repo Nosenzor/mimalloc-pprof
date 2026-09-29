@@ -92,17 +92,11 @@ void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
   theap->large_span[idx] |= MI_LARGE_SPAN_FULL_BIT;
 }
 
-// A page request of a large bin on `theap`: account it, and return the span (in slices) of the
-// page to create for it if no abandoned page of the bin is reclaimed instead. `overhead` is what a
-// page of `block_size` spends besides its blocks in the worst case (meta in front, guard page).
-size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+// The span (in slices) a page request of `block_size` gets from the bin's state `b` (the state it
+// leaves is stored in `*next`). `overhead` is what a page of `block_size` spends besides its blocks
+// in the worst case (meta in front, guard page).
+static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, size_t overhead, mi_large_span_bin_t* next) {
   const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
-  if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
-  if (!mi_option_is_enabled(mi_option_large_span)) return full;
-  const size_t idx = mi_large_span_index(block_size);
-  if (idx >= MI_LARGE_SPAN_BINS) return full;
-
-  const mi_large_span_bin_t b = theap->large_span[idx];
   size_t level = mi_large_span_level(b);
   long pressure = mi_large_span_pressure(b);
   if ((b & MI_LARGE_SPAN_FULL_BIT) != 0) {
@@ -124,13 +118,36 @@ size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhe
   else if (pressure > 0) {
     pressure--;   // (at the compact span only a pending step up can fade)
   }
-  theap->large_span[idx] = mi_large_span_pack(level, pressure);
+  *next = mi_large_span_pack(level, pressure);
 
   size_t slices = mi_large_span_level_slices(level);
   const size_t min_slices = mi_slice_count_of_size(MI_LARGE_SPAN_MIN_BLOCKS * block_size + overhead);
   if (slices < min_slices) { slices = min_slices; }
   if (slices > full) { slices = full; }
   return slices;
+}
+
+// A page request of a large bin on `theap`: account it, and return the span (in slices) of the
+// page to create for it if no abandoned page of the bin is reclaimed instead.
+size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
+  if (!mi_option_is_enabled(mi_option_large_span)) return full;
+  const size_t idx = mi_large_span_index(block_size);
+  if (idx >= MI_LARGE_SPAN_BINS) return full;
+  return mi_large_span_request(theap->large_span[idx], block_size, overhead, &theap->large_span[idx]);
+}
+
+// #530: the span `_mi_large_span_slices` would return for this request, without accounting it
+// (a retired page of another bin is repurposed only if it is at least that large)
+size_t _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
+  if (!mi_option_is_enabled(mi_option_large_span)) return full;
+  const size_t idx = mi_large_span_index(block_size);
+  if (idx >= MI_LARGE_SPAN_BINS) return full;
+  mi_large_span_bin_t unused;
+  return mi_large_span_request(theap->large_span[idx], block_size, overhead, &unused);
 }
 
 #else // !MI_LARGE_SPAN: every large page gets MI_LARGE_PAGE_SIZE (and the hook sites compile out)
@@ -142,6 +159,11 @@ size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhe
 
 void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
   MI_UNUSED(theap); MI_UNUSED(page);
+}
+
+size_t _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  MI_UNUSED(theap); MI_UNUSED(block_size); MI_UNUSED(overhead);
+  return mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
 }
 
 #endif // MI_LARGE_SPAN

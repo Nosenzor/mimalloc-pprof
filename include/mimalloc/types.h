@@ -699,6 +699,29 @@ typedef struct mi_page_s {
 #endif
 // ... and only while the theap holds at most this many pages of the page's bin (0: none, so its
 // next allocation of the bin would open a new page)
+// #530: a large bin that needs a new page takes another large bin's retired (empty) page of the
+// same theap and re-carves it (src/page.c, `mi_page_repurpose_retired`) before asking the arena.
+// 0 turns it off.
+#ifndef MI_LARGE_REPURPOSE
+#define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
+#endif
+// #530: how many retired large pages a thread may repurpose per heartbeat (every 1000 generic
+// mallocs). Each take can make the donor bin take another's in turn: a hot large-class workload
+// re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
+// one it needs.
+#ifndef MI_LARGE_REPURPOSE_PER_TICK
+#define MI_LARGE_REPURPOSE_PER_TICK       (64)
+#endif
+// ... and the budget a new thread starts with, before its first heartbeat
+// ... and whether a bin with abandoned pages (typically an exited thread's) reclaims those first
+// (the arena path) instead. With short-lived threads, re-carving our own retired pages instead
+// left those stranded and cost the chart build's ephemeral row +3.4% CPU (1: -0.5%).
+#ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
+#define MI_LARGE_REPURPOSE_ABANDONED_FIRST (1)
+#endif
+#ifndef MI_LARGE_REPURPOSE_FRESH
+#define MI_LARGE_REPURPOSE_FRESH          (MI_LARGE_REPURPOSE_PER_TICK)
+#endif
 #ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
 #define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
 #endif
@@ -1069,6 +1092,8 @@ struct mi_tld_s {
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
+  size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
+  size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept

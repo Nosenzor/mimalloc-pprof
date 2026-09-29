@@ -798,6 +798,10 @@ void _mi_page_unpurge_all(mi_page_t* page) {
 ----------------------------------------------------------- */
 
 #define MI_RETIRED_SLOT_BUSY  ((mi_page_t*)1)   // the scavenger holds this slot's page for one discard
+#define MI_RETIRED_SLOTS_MASK ((MI_RETIRED_PAGE_SLOTS >= MI_SIZE_BITS) ? ~(size_t)0 : (((size_t)1 << MI_RETIRED_PAGE_SLOTS) - 1))
+#if MI_RETIRED_PAGE_SLOTS > MI_SIZE_BITS
+#error "MI_RETIRED_PAGE_SLOTS must fit in the owner's slot mask (mi_tld_t.retired_used)"
+#endif
 
 // Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
 // scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
@@ -806,12 +810,25 @@ void _mi_page_publish_retired(mi_page_t* page) {
   mi_assert_internal(page->retired_slot == NULL);
   if (page->retired_slot != NULL) return;
   mi_tld_t* const tld = mi_page_theap(page)->tld;
-  // only the owner ever fills an empty slot, so one it sees empty stays empty until it fills it
-  _Atomic(mi_page_t*)* slot = NULL;
-  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
-    if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL) { slot = &tld->retired_pages[i]; break; }
+  // Only the owner ever fills or empties a slot (the scavenger borrows one for a discard and puts
+  // the same page back), so an owner-private mask knows which are free without reading the slots
+  // -- cache lines the scavenger also touches: scanning them was ~60% of this function's samples
+  // (#530, large-class-ephemeral/8 short generations).
+  size_t free_mask = ~tld->retired_used & MI_RETIRED_SLOTS_MASK;
+  if mi_unlikely(free_mask == 0) {
+    // the mask says full: rebuild it from the slots once (a bit a foreign unpublish could not clear)
+    size_t used = 0;
+    for (size_t k = 0; k < MI_RETIRED_PAGE_SLOTS; k++) {
+      if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) { used |= ((size_t)1 << k); }
+    }
+    tld->retired_used = used;
+    free_mask = ~used & MI_RETIRED_SLOTS_MASK;
+    if (free_mask == 0) return;   // all slots full: leave it unpublished
   }
-  if (slot == NULL) return;   // all slots full: leave it unpublished
+  const size_t i = mi_ctz(free_mask);
+  _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
+  mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, slot) == NULL);
+  tld->retired_used |= ((size_t)1 << i);
 
   _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
   page->free = NULL;            // nothing formed: every block of the page is unformed tail now
@@ -845,6 +862,18 @@ void _mi_page_unpublish_retired(mi_page_t* page) {
   }
   page->retired_slot = NULL;
   page->retired_at = 0;   // #493: a non-zero stamp on an unpublished page marks a reserved one
+  // Clear the slot's bit in the owner's mask. `_mi_page_free` clears `page->theap` before the page
+  // reaches `_mi_arenas_page_free`, where it is unpublished; unpublishing is owner-side, so the
+  // calling thread's tld is the owner's then. Missing that path leaked every bit: after 16
+  // publishes nothing was published again, and idle RSS rose +225% to +1989% (perf-ab).
+  mi_theap_t* theap = page->theap;   // (raw: `mi_page_theap` asserts on an abandoned page)
+  if (theap == NULL) { theap = _mi_theap_default(); }
+  mi_tld_t* const tld = (theap != NULL ? theap->tld : NULL);
+  if (tld != NULL && slot >= &tld->retired_pages[0] && slot < &tld->retired_pages[MI_RETIRED_PAGE_SLOTS]) {
+    tld->retired_used &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
+  }
+  // (else -- a heap delete from another thread -- the bit stays set until the owner's next publish
+  // finds no free bit and rebuilds the mask from the slots)
 }
 
 // A theap detached from its tld by a heap delete/destroy (`_mi_heap_detach_theaps`) has its pages
