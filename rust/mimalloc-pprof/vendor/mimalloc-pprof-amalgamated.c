@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 84697f47 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3a04a72b of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3097,6 +3097,12 @@ typedef struct mi_page_s {
 // neither the owner's free nor its next allocation found it again. The bin opened a second page
 // and grew, which cost +48% peak RSS and +72% faults for 8 live 128 KiB blocks (#544). Large pages
 // are reclaimed only by their originating theap (see `mi_abandoned_page_try_reclaim`).
+// #544: the transparent-huge-page size the arena purge assumes (src/arena.c,
+// `mi_arena_purge_thp_neighbours`): purging a run also purges the never-used free slices of its
+// region, which a THP fault made resident. 0 turns that off.
+#ifndef MI_ARENA_PURGE_THP_REGION
+#define MI_ARENA_PURGE_THP_REGION         (2*MI_MiB)
+#endif
 // ... and only while the theap holds at most this many pages of the page's bin (0: none, so its
 // next allocation of the bin would open a new page)
 #ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
@@ -14146,12 +14152,60 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   return true; // continue
 }
 
+#if MI_ARENA_PURGE_THP_REGION > 0
+// #544: a slice we never used can still be resident. On the first touch of an aligned huge-page
+// region, THP faults in the whole region, including arena slices around the page being touched
+// that are free and were never allocated. Purging that page later splits the huge page and
+// releases only the page's own range. The free neighbours stay resident, and nothing ever queues
+// them: a slice is queued when a page on it is freed. So when a run is purged, also purge the
+// slices of its huge-page region(s) that are free, still committed (never used since the arena
+// was committed, or since their last purge) and in no purge queue. perf-ab left 1.2 to 3.8 MiB
+// of such slices resident after the release bound (random-large/1).
+static bool mi_arena_slice_is_untracked_free(mi_arena_t* arena, size_t i) {
+  return (mi_bbitmap_is_setN(arena->slices_free, i, 1) && mi_bitmap_is_set(arena->slices_committed, i) &&
+          !mi_bitmap_is_set(arena->slices_purge, i) && !mi_bitmap_is_set(arena->slices_purge_aged, i) &&
+          !mi_bitmap_is_set(arena->slices_purge_short, i) && !mi_bitmap_is_set(arena->slices_purge_short_aged, i));
+}
+
+static void mi_arena_purge_thp_neighbours(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  const uintptr_t base = (uintptr_t)mi_arena_slice_start(arena, 0);
+  const uintptr_t lo = _mi_align_down(base + mi_size_of_slices(slice_index), MI_ARENA_PURGE_THP_REGION);
+  const uintptr_t hi = _mi_align_up(base + mi_size_of_slices(slice_index + slice_count), MI_ARENA_PURGE_THP_REGION);   // (the end may be the arena's)
+  const size_t rlo = (lo <= base ? 0 : (lo - base) / MI_ARENA_SLICE_SIZE);
+  size_t rhi = (hi - base) / MI_ARENA_SLICE_SIZE;
+  if (rhi > arena->slice_count) { rhi = arena->slice_count; }
+  size_t i = rlo;
+  while (i < rhi) {
+    if (i >= slice_index && i < slice_index + slice_count) { i = slice_index + slice_count; continue; }   // (just purged)
+    if (!mi_arena_slice_is_untracked_free(arena, i)) { i++; continue; }
+    size_t n = 1;   // a run within the region, outside the purged range, and within one bitmap chunk
+    while (i + n < rhi && !(i + n >= slice_index && i + n < slice_index + slice_count) &&
+           (i + n) % MI_BCHUNK_BITS != 0 && mi_arena_slice_is_untracked_free(arena, i + n)) { n++; }
+    if (mi_bbitmap_try_clearNC(arena->slices_free, i, n)) {   // claim the run
+      // A slice never touched (dirty bit clear) was never credited to the `committed` stat: with
+      // overcommit, `mi_arena_try_alloc_at` credits an eagerly committed slice on first use. Drop
+      // its commit bit first so the purge does not debit it; the next allocation commits and
+      // credits it as usual.
+      for (size_t k = i; k < i + n; k++) {
+        if (!mi_bitmap_is_set(arena->slices_dirty, k)) { mi_bitmap_clearN(arena->slices_committed, k, 1); }
+      }
+      mi_arena_purge(arena, i, n);
+      mi_bbitmap_setN(arena->slices_free, i, n);
+    }
+    i += n;
+  }
+}
+#endif
+
 // Purge `[slice_index, slice_index + slice_count)` where its slices are free.
 static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo) {
   // try to purge: first claim the free blocks
   if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     vinfo->any_purged = true;
     vinfo->all_purged = true;
+    #if MI_ARENA_PURGE_THP_REGION > 0
+    if (mi_option_is_enabled(mi_option_allow_thp)) { mi_arena_purge_thp_neighbours(arena, slice_index, slice_count); }
+    #endif
   }
   else if (slice_count > 1)
   {
