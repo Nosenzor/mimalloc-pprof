@@ -20,6 +20,9 @@
        owner's free nor its next allocation found it again -- every free/alloc cycle at the
        edge opened another page and grew the bin (exact 128 KiB/1: +48% peak RSS with THP off).
        The owner's free now reclaims its own large page (MI_RECLAIM_ON_FREE_MAX_SIZE).
+   (g) a bin's retired page serves another bin (#530): once a bin's only page empties it is kept
+       (retired); a different large bin that needs a page re-carves it instead of taking new
+       arena slices (MI_LARGE_REPURPOSE), so a thread does not hold one empty page per bin.
 
    Deterministic: structural checks on the pages the blocks land in (`page->memid`, `reserved`,
    `capacity`), no RSS and no timing. ctest turns the scavenger and the hole sweep off so no
@@ -86,6 +89,8 @@ static void thread_join(thread_t t) { assert(pthread_join(t, NULL) == 0); }
 
 static int failures = 0;
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAILED: " __VA_ARGS__); fprintf(stderr, "\n"); failures++; } } while (0)
+
+static int bin_of_size_is_large(size_t size) { const size_t b = mi_good_size(size); return (b > MI_MEDIUM_MAX_OBJ_SIZE && b <= MI_LARGE_MAX_OBJ_SIZE); }
 
 static size_t full_slices(void) { return mi_slice_count_of_size(MI_LARGE_PAGE_SIZE); }
 
@@ -279,7 +284,17 @@ static void case_c(void) {
 
 /* ---- (e) one overflow does not grow the span -------------------------------- */
 
+// on a fresh theap: an earlier case's retired page of another bin could otherwise be repurposed
+// (#530) as this bin's first page, with that page's span
+static THREAD_RET blip_main(void* arg);
 static void case_blip(void) {
+  thread_t t;
+  thread_start(&t, &blip_main, NULL);
+  thread_join(t);
+}
+
+static THREAD_RET blip_main(void* arg) {
+  (void)arg;
   #if MI_LARGE_SPAN
   void* blocks[MAX_BLOCKS];
   size_t n = 0;
@@ -296,6 +311,7 @@ static void case_blip(void) {
   mi_free(extra);
   free_all(blocks, n);
   #endif
+  return THREAD_OK;
 }
 
 /* ---- (f) an exactly filled compact page is reused ------------------------- */
@@ -348,6 +364,38 @@ static void case_edge(void) {
   }
 }
 
+/* ---- (g) a retired page is repurposed for another bin --------------------- */
+
+static THREAD_RET repurpose_main(void* arg) {
+  (void)arg;
+  void* const a = mi_malloc(160 * 1024);
+  assert(a != NULL);
+  const mi_page_t* const page_a = _mi_ptr_page(a);
+  uint8_t* const slices_a = mi_page_slice_start(page_a);
+  const size_t bsize_a = mi_page_block_size(page_a);
+  mi_free(a);   // the bin's only page empties: it is retired, not freed
+  void* const b = mi_malloc(300 * 1024);
+  assert(b != NULL);
+  memset(b, 0x44, 300 * 1024);   // the whole block is usable
+  const mi_page_t* const page_b = _mi_ptr_page(b);
+  fprintf(stderr, "(g) %zu B block freed; a %zu B block then lands in %s slices (span %zu)\n",
+          bsize_a, mi_page_block_size(page_b), mi_page_slice_start(page_b) == slices_a ? "the same" : "other", span_of(b));
+  #if MI_LARGE_REPURPOSE
+  CHECK(mi_page_slice_start(page_b) == slices_a, "(g) another bin's retired page should have been repurposed");
+  CHECK(mi_page_block_size(page_b) != bsize_a && page_b->reserved >= 2, "(g) the repurposed page should have the new geometry");
+  #endif
+  mi_free(b);
+  return THREAD_OK;
+}
+
+static void case_repurpose(void) {
+  if (bin_of_size_is_large(160 * 1024) && bin_of_size_is_large(300 * 1024)) {
+    thread_t t;
+    thread_start(&t, &repurpose_main, NULL);
+    thread_join(t);
+  }
+}
+
 /* ---- (d) the opt-out ----------------------------------------------------- */
 
 static void case_off(void) {
@@ -388,6 +436,7 @@ int main(void) {
   case_off();
   case_blip();
   case_edge();
+  case_repurpose();
   #endif
   if (failures > 0) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
   fprintf(stderr, "ok\n");
