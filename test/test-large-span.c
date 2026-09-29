@@ -21,8 +21,9 @@
        edge opened another page and grew the bin (exact 128 KiB/1: +48% peak RSS with THP off).
        The owner's free now reclaims its own large page (MI_RECLAIM_ON_FREE_MAX_SIZE).
    (g) a bin's retired page serves another bin (#530): once a bin's only page empties it is kept
-       (retired); a different large bin that needs a page re-carves it instead of taking new
-       arena slices (MI_LARGE_REPURPOSE), so a thread does not hold one empty page per bin.
+       (retired); after an aging tick without reuse, a different large bin that needs a page
+       re-carves it instead of taking new arena slices (MI_LARGE_REPURPOSE), so a thread does not
+       hold one empty page per bin.
 
    Deterministic: structural checks on the pages the blocks land in (`page->memid`, `reserved`,
    `capacity`), no RSS and no timing. ctest turns the scavenger and the hole sweep off so no
@@ -374,6 +375,7 @@ static THREAD_RET repurpose_main(void* arg) {
   uint8_t* const slices_a = mi_page_slice_start(page_a);
   const size_t bsize_a = mi_page_block_size(page_a);
   mi_free(a);   // the bin's only page empties: it is retired, not freed
+  mi_collect(false);   // one aging tick without reuse: the retired page is idle, so any bin may take it
   void* const b = mi_malloc(300 * 1024);
   assert(b != NULL);
   memset(b, 0x44, 300 * 1024);   // the whole block is usable

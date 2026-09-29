@@ -543,6 +543,11 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
     // only a retired page (the bin's only one, empty) whose meta lives outside its slices, so the
     // block area starts at the slice start whatever the block size
     if (q == pq || page == NULL || page != q->last || page->retire_expire == 0 || page->used != 0) continue;
+    // ... idle (its bin has not reused it since a heartbeat aged it: `_mi_page_retire` starts a
+    // large page at MI_RETIRE_CYCLES/4), or warm within this heartbeat's budget. Taking a page its
+    // own bin is about to reuse makes that bin take another's in turn: unbounded, that cascade was
+    // 548K page requests instead of 292 on large-class/8.
+    if (page->retire_expire >= MI_RETIRE_CYCLES/4 && theap->large_repurpose_left == 0) continue;
     if (page->memid.memkind != MI_MEM_ARENA || !mi_page_meta_is_separated(page)) continue;
     #if MI_PPROF
     if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
@@ -554,6 +559,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   if (best_pq == NULL) return NULL;
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;
+  if (page->retire_expire >= MI_RETIRE_CYCLES/4) { theap->large_repurpose_left--; }   // (a warm one)
   _mi_page_unpublish_retired(page);   // (#483) ours again before we touch its blocks
   mi_page_queue_remove(best_pq, page);
   mi_theap_stat_decrease(theap, page_bins[_mi_page_stats_bin(page)], 1);
@@ -648,7 +654,8 @@ static void mi_theap_collect_full_pages(mi_theap_t* theap) {
 
 // free retired pages: we don't need to look at the entire queues
 // since we only retire pages that are at the head position in a queue.
-void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
+static void mi_theap_collect_retired_ex(mi_theap_t* theap, bool force, bool heartbeat) {
+  MI_UNUSED(heartbeat);
   size_t min = MI_BIN_FULL;
   size_t max = 0;
   for(size_t bin = theap->page_retired_min; bin <= theap->page_retired_max; bin++) {
@@ -657,10 +664,11 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
     if (page != NULL && page->retire_expire != 0) {
       if (mi_page_all_free(page)) {
         #if MI_LARGE_REPURPOSE
-        // #530: a retired large page stays until a bin repurposes it (it is published: the
-        // scavenger discards its memory once idle, #483). Letting it expire into the arena left
-        // repurposing without pages: 81K arena round trips on large-class/8.
-        if (!force && mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) { min = (bin < min ? bin : min); max = (bin > max ? bin : max); continue; }
+        // #530: only the heartbeat (every 1000 generic mallocs) ages a retired large page, not
+        // every page miss: its countdown then says how long its bin has not reused it, which
+        // `mi_page_repurpose_retired` needs (a miss-driven countdown expired pages into 79K
+        // arena round trips on large-class/8, and made every page look idle).
+        if (!force && !heartbeat && mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE) { min = (bin < min ? bin : min); max = (bin > max ? bin : max); continue; }
         #endif
         page->retire_expire--;
         if (page->retire_expire == 0 || force) {
@@ -682,6 +690,10 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
   if (!theap->allow_page_abandon) {
     mi_theap_collect_full_pages(theap);
   }
+}
+
+void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
+  mi_theap_collect_retired_ex(theap, force, true);
 }
 
 
@@ -1026,7 +1038,7 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   }
 
   if (page == NULL) {
-    _mi_theap_collect_retired(theap, false); // perhaps make a page available
+    mi_theap_collect_retired_ex(theap, false, false); // perhaps make a page available (#530: not an aging tick for large pages)
     page = mi_page_fresh(theap, pq);         
     mi_assert_internal(page == NULL || mi_page_immediate_available(page));
     if (page == NULL && first_try) {
@@ -1229,6 +1241,9 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_deferred_free(theap, false);         // call potential deferred free routines      
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
+    #if MI_LARGE_REPURPOSE
+    theap->large_repurpose_left = MI_LARGE_REPURPOSE_WARM_PER_TICK;   // #530
+    #endif
     _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }
   return theap;
