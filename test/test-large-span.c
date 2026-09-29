@@ -15,6 +15,11 @@
    (e) one overflow is not demand: a bin that once holds one block more than its compact page
        gets a second compact page, not a larger one (the growth hysteresis,
        MI_LARGE_SPAN_GROW_REQUESTS).
+   (f) a live set that exactly fills a compact page stays in it (#544): filling the page abandons
+       it, and at one block short of full it is still "mostly used", so before #544 neither the
+       owner's free nor its next allocation found it again -- every free/alloc cycle at the
+       edge opened another page and grew the bin (exact 128 KiB/1: +48% peak RSS with THP off).
+       The owner's free now reclaims its own large page (MI_RECLAIM_ON_FREE_MAX_SIZE).
 
    Deterministic: structural checks on the pages the blocks land in (`page->memid`, `reserved`,
    `capacity`), no RSS and no timing. ctest turns the scavenger and the hole sweep off so no
@@ -293,6 +298,51 @@ static void case_blip(void) {
   #endif
 }
 
+/* ---- (f) an exactly filled compact page is reused ------------------------- */
+
+#define EDGE_CYCLES  (64)
+
+// on a fresh theap (so the bin has seen nothing): fill the bin's first page exactly, then cycle
+// free-one / allocate-one; every allocation must land in that page, and the bin must not grow
+static THREAD_RET edge_main(void* arg) {
+  const size_t size = *(const size_t*)arg;
+  void* blocks[MAX_BLOCKS];
+  size_t n = 0;
+  blocks[n++] = mi_malloc(size);
+  assert(blocks[0] != NULL);
+  const mi_page_t* const page = _mi_ptr_page(blocks[0]);
+  const size_t span = span_of(blocks[0]);
+  const size_t bsize = mi_page_block_size(page);   // (read now: on a RED build the page may be gone by the report)
+  while (n < MAX_BLOCKS && page->used < page->reserved) { blocks[n] = mi_malloc(size); assert(blocks[n] != NULL); n++; }
+  size_t moved = 0;
+  size_t max_span = span;
+  for (size_t i = 0; i < EDGE_CYCLES; i++) {
+    const size_t k = i % n;
+    mi_free(blocks[k]);
+    blocks[k] = mi_malloc(size);
+    assert(blocks[k] != NULL);
+    memset(blocks[k], 0x33, 64);
+    if (_mi_ptr_page(blocks[k]) != page) { moved++; }
+    if (span_of(blocks[k]) > max_span) { max_span = span_of(blocks[k]); }
+  }
+  fprintf(stderr, "(f) %zu B: %zu live blocks fill a page of span %zu; %zu of %d free/alloc cycles left it, largest span %zu\n",
+          bsize, n, span, moved, EDGE_CYCLES, max_span);
+  CHECK(span_is_compact(blocks[0]) || moved > 0, "(f) setup: the bin's first page should be compact (span %zu)", span);
+  CHECK(moved == 0, "(f) %zu of %d allocations after freeing a block of the exactly filled page went to another page", moved, EDGE_CYCLES);
+  CHECK(max_span == span, "(f) the bin grew (%zu -> %zu slices) though its live set never exceeded one page", span, max_span);
+  free_all(blocks, n);
+  return THREAD_OK;
+}
+
+static void case_edge(void) {
+  static const size_t sizes[] = { 128 * 1024, 256 * 1024, 512 * 1024 };   // 8, 4 and 2 blocks per compact page
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+    thread_t t;
+    thread_start(&t, &edge_main, (void*)&sizes[i]);
+    thread_join(t);
+  }
+}
+
 /* ---- (d) the opt-out ----------------------------------------------------- */
 
 static void case_off(void) {
@@ -332,6 +382,7 @@ int main(void) {
   case_c();
   case_off();
   case_blip();
+  case_edge();
   #endif
   if (failures > 0) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
   fprintf(stderr, "ok\n");
