@@ -685,6 +685,31 @@ typedef struct mi_page_s {
 #endif
 #define MI_LARGE_MAX_OBJ_WSIZE            (MI_LARGE_MAX_OBJ_SIZE/MI_SIZE_SIZE)
 
+// The largest block size whose abandoned page a free may reclaim (src/free.c). Upstream stops at
+// medium pages. With demand-sized spans (#532) a compact large page can be exactly filled by a
+// bin's live set: filling it abandons it, and at 7 of 8 blocks used it is still "mostly used", so
+// neither the owner's free nor its next allocation found it again. The bin opened a second page
+// and grew, which cost +48% peak RSS and +72% faults for 8 live 128 KiB blocks (#544). Large pages
+// are reclaimed only by their originating theap (see `mi_abandoned_page_try_reclaim`).
+// #544: the transparent-huge-page size the arena purge assumes (src/arena.c,
+// `mi_arena_purge_thp_neighbours`): purging a run also purges the never-used free slices of its
+// region, which a THP fault made resident. 0 turns that off.
+#ifndef MI_ARENA_PURGE_THP_REGION
+#define MI_ARENA_PURGE_THP_REGION         (2*MI_MiB)
+#endif
+// ... and only while the theap holds at most this many pages of the page's bin (0: none, so its
+// next allocation of the bin would open a new page)
+#ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
+#define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
+#endif
+#ifndef MI_RECLAIM_ON_FREE_MAX_SIZE
+#if MI_LARGE_SPAN
+#define MI_RECLAIM_ON_FREE_MAX_SIZE       MI_LARGE_MAX_OBJ_SIZE
+#else
+#define MI_RECLAIM_ON_FREE_MAX_SIZE       MI_MEDIUM_MAX_OBJ_SIZE
+#endif
+#endif
+
 #if (MI_LARGE_MAX_OBJ_WSIZE >= 655360)
 #error "mimalloc internal: define more bins"
 #endif
