@@ -83,6 +83,9 @@ FORBIDDEN_COMMAND_PATTERNS = (
     re.compile(r"gh\s+pr\s+(create|merge)", re.IGNORECASE),
 )
 
+# setup-soldr floats at its major tag fleet-wide (zackees/ci.yml#31); v0 must be
+# v0.9.82 or later so Dylint saves its caches (setup-soldr#539, #541).
+FLOATING_SETUP_SOLDR = ("zackees/setup-soldr", "v0")
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TAG_REF_RE = re.compile(r"^v?\d+")
 VERSION_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
@@ -183,6 +186,8 @@ def check_action_ref(ref: str, label: str) -> None:
     if not version:
         fail(f"{label}: missing @version in action ref {ref!r}")
     candidate = version.strip()
+    if owner_repo == FLOATING_SETUP_SOLDR[0] and candidate == FLOATING_SETUP_SOLDR[1]:
+        return  # fleet policy (zackees/ci.yml#31): setup-soldr floats at v0 (v0.9.82+)
     if FULL_SHA_RE.match(candidate):
         return  # full SHA is always acceptable
     if VERSION_TAG_RE.match(candidate):
