@@ -426,6 +426,10 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
   if mi_likely(theap == page->theap) {  // did this page originate from the current theap? (and thus allocated from this thread)
     // originating theap
     max_reclaim = _mi_option_get_fast(theap->tld->is_in_threadpool ? mi_option_page_cross_thread_max_reclaim : mi_option_page_max_reclaim);
+    // #544: a large page only when the bin has no page left on the theap -- the case where the
+    // next allocation would open a new page. Reclaiming more (a drain freeing every block) keeps
+    // pages owned that would otherwise go back to the arena (+9% peak RSS, random-large-bursty/8).
+    if (page->block_size > MI_MEDIUM_MAX_OBJ_SIZE && (max_reclaim < 0 || max_reclaim > MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES)) { max_reclaim = MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES; }   // (< 0 is "no limit")
   }
   else if (page->block_size > MI_MEDIUM_MAX_OBJ_SIZE) {
     return false;   // #544: a large page is reclaimed on free only by the theap it came from

@@ -691,6 +691,11 @@ typedef struct mi_page_s {
 // neither the owner's free nor its next allocation found it again. The bin opened a second page
 // and grew, which cost +48% peak RSS and +72% faults for 8 live 128 KiB blocks (#544). Large pages
 // are reclaimed only by their originating theap (see `mi_abandoned_page_try_reclaim`).
+// ... and only while the theap holds at most this many pages of the page's bin (0: none, so its
+// next allocation of the bin would open a new page)
+#ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
+#define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
+#endif
 #ifndef MI_RECLAIM_ON_FREE_MAX_SIZE
 #if MI_LARGE_SPAN
 #define MI_RECLAIM_ON_FREE_MAX_SIZE       MI_LARGE_MAX_OBJ_SIZE
