@@ -169,6 +169,18 @@ SCALING_RSS_FLOOR_FIELDS = {
 }
 # The legend of the floor line on every memory chart, and nowhere else.
 RSS_FLOOR_LABEL = "live data (theoretical minimum)"
+# #534: how far (percent) a theoretical-minimum floor may sit above the lowest RSS measured in
+# its cell: the floor comes from a separate live-telemetry replay and the peaks are polled, so an
+# allocator running close to it dips under it by noise (jemalloc, large-class-ephemeral/1: 9.52 MiB
+# against 9.76). Keep in sync with rust/benchmark-suite/src/scaling.rs.
+SCALING_RSS_FLOOR_SLACK_PERCENT = 10
+
+
+def rss_floor_within_slack(floor: int, lowest: int) -> bool:
+    """Whether `floor` is consistent with the `lowest` measured RSS of its cell."""
+    return floor * 100 <= lowest * (100 + SCALING_RSS_FLOOR_SLACK_PERCENT)
+
+
 LEGACY_SCALING_RIGOR_LABEL = "coverage mode - reduced statistical rigor (3 blocks)"
 SCALING_RIGOR_LABEL = "mixed rigor - 3-block legacy coverage plus 40-repetition distribution bands"
 SCALING_BLOCKS = 3
@@ -4100,8 +4112,10 @@ def validate_rss_floors(
         seen.add((pattern, threads))
         if (live == 0) != churn or total != baseline + live:
             fail(f"{item_label}: floor is not its baseline plus its live bytes")
-        if not churn and total > lowest_peaks[(pattern, threads)]:
-            fail(f"{item_label}: floor is above a measured peak RSS")
+        if not churn and not rss_floor_within_slack(total, lowest_peaks[(pattern, threads)]):
+            fail(
+                f"{item_label}: floor is above a measured peak RSS by more than {SCALING_RSS_FLOOR_SLACK_PERCENT}%"
+            )
     if not expected <= seen:
         fail(f"{label}.floor_summaries: missing floor cells {sorted(expected - seen)}")
 
@@ -4687,8 +4701,11 @@ def validate_scaling_report(
                     for floor in cast(list[Mapping[str, object]], floors)
                     if floor["pattern"] == THREAD_CHURN_PATTERN
                 )
-                if churn_floor > lowest:
-                    fail(f"{label}.rss.floor_summaries: thread-churn floor is above a measured RSS")
+                if not rss_floor_within_slack(churn_floor, lowest):
+                    fail(
+                        f"{label}.rss.floor_summaries: thread-churn floor is above a measured RSS"
+                        f" by more than {SCALING_RSS_FLOOR_SLACK_PERCENT}%"
+                    )
     return report
 
 
