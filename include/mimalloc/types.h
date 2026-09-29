@@ -705,12 +705,12 @@ typedef struct mi_page_s {
 #ifndef MI_LARGE_REPURPOSE
 #define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
 #endif
-// #530: how many WARM retired large pages (its bin reused it since the last heartbeat) a theap may
-// repurpose per heartbeat (every 1000 generic mallocs). Idle ones are always taken. Each warm take
-// can make the donor bin take another's in turn: a hot large-class workload re-carved 469K pages
-// (+16% CPU) unbounded; a workload with rare large-page events takes every one it needs.
-#ifndef MI_LARGE_REPURPOSE_WARM_PER_TICK
-#define MI_LARGE_REPURPOSE_WARM_PER_TICK  (16)
+// #530: how many retired large pages a theap may repurpose per heartbeat (every 1000 generic
+// mallocs). Each take can make the donor bin take another's in turn: a hot large-class workload
+// re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
+// one it needs.
+#ifndef MI_LARGE_REPURPOSE_PER_TICK
+#define MI_LARGE_REPURPOSE_PER_TICK       (16)
 #endif
 #ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
 #define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
@@ -854,7 +854,7 @@ struct mi_theap_s {
   #if MI_LARGE_SPAN
   mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
   #if MI_LARGE_REPURPOSE
-  uint16_t              large_repurpose_left;               // #530: warm retired pages this theap may still repurpose until the next heartbeat
+  uint16_t              large_repurpose_left;               // #530: retired pages this theap may still repurpose until the next heartbeat
   #endif
   #endif
 };

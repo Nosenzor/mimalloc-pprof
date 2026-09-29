@@ -161,7 +161,7 @@ mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
   { 0 },                  // large_span (#532): every bin starts compact
   #endif
   #if MI_LARGE_REPURPOSE
-  0,                      // large_repurpose_left (#530): refilled at each heartbeat
+  MI_LARGE_REPURPOSE_PER_TICK,  // large_repurpose_left (#530): refilled at each heartbeat
   #endif
 };
 
