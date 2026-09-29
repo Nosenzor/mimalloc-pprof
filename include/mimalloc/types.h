@@ -712,6 +712,10 @@ typedef struct mi_page_s {
 #ifndef MI_LARGE_REPURPOSE_PER_TICK
 #define MI_LARGE_REPURPOSE_PER_TICK       (64)
 #endif
+// ... and the budget a new thread starts with, before its first heartbeat
+#ifndef MI_LARGE_REPURPOSE_FRESH
+#define MI_LARGE_REPURPOSE_FRESH          (MI_LARGE_REPURPOSE_PER_TICK)
+#endif
 #ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
 #define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
 #endif
