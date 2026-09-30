@@ -731,8 +731,14 @@ typedef struct mi_page_s {
 // ... and whether a bin with abandoned pages (typically an exited thread's) reclaims those first
 // (the arena path) instead. With short-lived threads, re-carving our own retired pages instead
 // left those stranded and cost the chart build's ephemeral row +3.4% CPU (1: -0.5%).
-#ifndef MI_LARGE_AGE_ON_HEARTBEAT
-#define MI_LARGE_AGE_ON_HEARTBEAT         (1)
+// #575: a page miss of a large bin ages this thread's retired pages (`_mi_theap_collect_retired`: a page idle for
+// MI_RETIRE_CYCLES/4 = 4 agings is freed) at most once per this many generic mallocs. Every miss aged them before: on
+// large-class/8 a bin needs a page every ~5 operations, so a retired page died after ~20 of them and 66K pages went
+// back to the arena, each one re-requested at once (1100 instructions per round trip, the largest part of the
+// #575 CPU cost); never ageing them on a miss (the heartbeat only) kept 12% more resident on random-large/8, where a
+// bin is used every ~100 operations and its retired page is idle stock. 0 = every miss ages, as upstream.
+#ifndef MI_LARGE_AGE_STEP
+#define MI_LARGE_AGE_STEP                 (8)
 #endif
 #ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
 #define MI_LARGE_REPURPOSE_ABANDONED_FIRST (1)
@@ -1124,6 +1130,7 @@ struct mi_tld_s {
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
   size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
+  long                  large_age_mark;       // #575: `generic_count` when a large bin's page miss last aged the retired pages
   size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 

@@ -1101,11 +1101,16 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   }
 
   if (page == NULL) {
-    #if MI_LARGE_REPURPOSE && MI_LARGE_AGE_ON_HEARTBEAT
-    // #575: a large bin's miss does not age the retired pages: they are the stock the repurpose below draws on, and
-    // ageing them per miss (4 misses = expired) freed 66K pages to the arena, each re-requested at once (persistent/8).
-    // The heartbeat still ages them.
-    if (pq->block_size <= MI_MEDIUM_MAX_OBJ_SIZE || pq->block_size > MI_LARGE_MAX_OBJ_SIZE || !mi_option_is_enabled(mi_option_large_span))
+    #if MI_LARGE_REPURPOSE && MI_LARGE_AGE_STEP > 0
+    // #575: a large bin's miss ages the retired pages at most once per MI_LARGE_AGE_STEP generic mallocs (see there)
+    if (pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE && pq->block_size <= MI_LARGE_MAX_OBJ_SIZE) {
+      mi_tld_t* const tld = theap->tld;
+      if ((size_t)(theap->generic_count - tld->large_age_mark) >= (size_t)MI_LARGE_AGE_STEP) {   // (a heartbeat reset of the count wraps: ages once)
+        tld->large_age_mark = theap->generic_count;
+        _mi_theap_collect_retired(theap, false);
+      }
+    }
+    else
     #endif
     { _mi_theap_collect_retired(theap, false); } // perhaps make a page available
     page = mi_page_fresh(theap, pq);         
