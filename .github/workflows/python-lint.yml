@@ -93,6 +93,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends systemtap-sdt-dev binutils
           python3 ci/check_usdt_probes.py --selftest
           python3 ci/check_usdt_probes.py --require
+      # #573 B9: the scheduled-failure alert opens or updates one issue.
+      - name: Scaling failure alert
+        run: python3 ci/scaling_failure_alert.py --selftest
       # Macros are UPPER_CASE; ci/macro_case_baseline.txt grandfathers the inherited ones.
       - name: Macro names are upper case
         run: |

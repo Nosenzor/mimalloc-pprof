@@ -2436,6 +2436,22 @@ class BenchmarkReportTests(unittest.TestCase):
         with self.assertRaisesRegex(report.ReportError, "above"):
             report.validate_scaling_report(above["scaling"], "floor above a peak")
 
+    def test_rss_floor_rule_agrees_with_the_shared_vector_table(self) -> None:
+        # #573 B9: rust/benchmark-suite/tests/scaling_rss_floor_contract.rs loads the same table
+        # and checks the producer's rule against it; this checks the validator's. They disagreed
+        # once and every full run failed from 2026-09-28 until #574.
+        table = json.loads(
+            (
+                Path(__file__).resolve().parents[2]
+                / "rust/benchmark-suite/tests/fixtures/rss_floor_vectors.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(table["slack_percent"], report.SCALING_RSS_FLOOR_SLACK_PERCENT)
+        self.assertGreaterEqual(len(table["vectors"]), 10)
+        for floor, lowest, expected in table["vectors"]:
+            with self.subTest(floor=floor, lowest=lowest):
+                self.assertEqual(report.rss_floor_within_slack(floor, lowest), expected)
+
     def test_rss_floor_within_the_measurement_slack_validates(self) -> None:
         # #534: the floor comes from a separate live-telemetry replay and the peaks are
         # polled, so an allocator close to it dips a little under it (jemalloc on
