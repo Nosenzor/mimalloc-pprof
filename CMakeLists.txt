@@ -871,7 +871,7 @@ if(MI_USE_CXX)
   # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
   # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
   # test-large-span.c (#532): reads `_mi_ptr_page` / `mi_page_t` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-event-counters.c test/test-large-span.c PROPERTIES LANGUAGE CXX )
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-event-counters.c test/test-large-span.c test/test-large-fungible.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2214,6 +2214,23 @@ if (MI_BUILD_TESTS)
     endif()
     add_test(NAME test-large-span COMMAND mimalloc-test-large-span)
     set_tests_properties(test-large-span PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
+  endif()
+
+  # test-large-fungible (#575): large-bin pages are fungible -- a busy bin stops growing at the span
+  # cap (1 MiB), and a thread rotating through the bins repurposes one page instead of keeping one
+  # per bin. Structural checks only; a fresh thread per case.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-large-fungible test/test-large-fungible.c)
+    target_compile_definitions(mimalloc-test-large-fungible PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-large-fungible PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-large-fungible PRIVATE include)
+    target_link_libraries(mimalloc-test-large-fungible PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-large-fungible PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-large-fungible COMMAND mimalloc-test-large-fungible)
+    set_tests_properties(test-large-fungible PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
   endif()
 
   # test-resident-first-churn (#517): the memory gate's thread-churn scenario must not claim

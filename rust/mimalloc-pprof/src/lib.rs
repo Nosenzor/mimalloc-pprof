@@ -1300,6 +1300,9 @@ pub mod options {
         /// **Fork addition (#532).** Size a new large page (blocks of ~84-512 KiB) from its size
         /// class's demand on the thread: compact first, growing to 4 MiB; 0 = always 4 MiB.
         pub const LARGE_SPAN: Self = Self(sys::mi_option_large_span);
+        /// **Fork addition (#575).** The largest span in KiB a demand-grown large page reaches
+        /// (=1024); 0 = 4 MiB, the #532 policy.
+        pub const LARGE_SPAN_MAX: Self = Self(sys::mi_option_large_span_max);
 
         /// Upstream: milliseconds to delay purging, which the scavenger also honours.
         pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);

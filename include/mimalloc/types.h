@@ -377,6 +377,16 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_LARGE_SPAN_COMPACT_SLICES
 #define MI_LARGE_SPAN_COMPACT_SLICES      (16)
 #endif
+// #575: the largest span a bin's page grows to (KiB; `mi_option_large_span_max`, MIMALLOC_LARGE_SPAN_MAX).
+// Every thread keeps one page per large bin it uses and each is resident in full once it has held its
+// blocks (a page carved over resident slices keeps the old tenant's bytes), so 4 MiB spans made a
+// thread that cycles 96-512 KiB blocks hold ~19 MiB for 1.3 MiB live (large-class/8: 154 MiB against
+// jemalloc's 61). 1 MiB keeps two blocks of every large bin; a bin that needs more blocks uses more
+// pages, and repurposing (MI_LARGE_REPURPOSE_PER_TICK) moves them between bins. 0 = MI_LARGE_PAGE_SIZE
+// (the #532 behaviour); `-DMI_LARGE_SPAN_MAX_KIB=0` builds that in.
+#ifndef MI_LARGE_SPAN_MAX_KIB
+#define MI_LARGE_SPAN_MAX_KIB             (1024)
+#endif
 // each demand step multiplies the span by 2^MI_LARGE_SPAN_GROW_SHIFT (1: 1 -> 2 -> 4 MiB)
 #ifndef MI_LARGE_SPAN_GROW_SHIFT
 #define MI_LARGE_SPAN_GROW_SHIFT          (1)
@@ -707,16 +717,29 @@ typedef struct mi_page_s {
 #define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
 #endif
 // #530: how many retired large pages a thread may repurpose per heartbeat (every 1000 generic
-// mallocs). Each take can make the donor bin take another's in turn: a hot large-class workload
-// re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
-// one it needs.
+// mallocs). Each take can make the donor bin take another's in turn (a cascade of re-carves: a page
+// re-init, no fault and no purge, so it costs no resident byte). #530 bounded it at 64 after a hot
+// large-class workload re-carved 469K pages (+16% CPU); #575 measured what the bound costs in
+// memory: a bin without a page then opens a fresh 1-4 MiB one while every other bin's retired page
+// stays resident, so large-class/8 kept ~10 pages per worker for ~8 live blocks. Raised to 1024, at
+// which large-class/8 and sparse-large-buffers/8 lose 18% and 29% of their peak (untimed probe).
+// `-DMI_LARGE_REPURPOSE_PER_TICK=64` restores the #530 bound.
 #ifndef MI_LARGE_REPURPOSE_PER_TICK
-#define MI_LARGE_REPURPOSE_PER_TICK       (64)
+#define MI_LARGE_REPURPOSE_PER_TICK       (1024)
 #endif
 // ... and the budget a new thread starts with, before its first heartbeat
 // ... and whether a bin with abandoned pages (typically an exited thread's) reclaims those first
 // (the arena path) instead. With short-lived threads, re-carving our own retired pages instead
 // left those stranded and cost the chart build's ephemeral row +3.4% CPU (1: -0.5%).
+// #575: a page miss of a large bin ages this thread's retired pages (`_mi_theap_collect_retired`: a page idle for
+// MI_RETIRE_CYCLES/4 = 4 agings is freed) at most once per this many generic mallocs. Every miss aged them before: on
+// large-class/8 a bin needs a page every ~5 operations, so a retired page died after ~20 of them and 66K pages went
+// back to the arena, each one re-requested at once (1100 instructions per round trip, the largest part of the
+// #575 CPU cost); never ageing them on a miss (the heartbeat only) kept 12% more resident on random-large/8, where a
+// bin is used every ~100 operations and its retired page is idle stock. 0 = every miss ages, as upstream.
+#ifndef MI_LARGE_AGE_STEP
+#define MI_LARGE_AGE_STEP                 (4)
+#endif
 #ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
 #define MI_LARGE_REPURPOSE_ABANDONED_FIRST (1)
 #endif
@@ -1107,7 +1130,8 @@ struct mi_tld_s {
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
   size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
-  size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
+  uint32_t              large_age_mark;       // #575: `generic_count` (mod 2^32) when a large bin's page miss last aged the retired pages (two 32-bit fields: `mi_tld_t` sits at its 512-byte size class, ci/check_struct_sizes.py)
+  uint32_t              large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept

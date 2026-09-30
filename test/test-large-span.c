@@ -559,6 +559,9 @@ int main(void) {
   mi_free(p);
   #else
   mi_option_set(mi_option_page_reserve, 0);   // an exiting thread frees its empty pages (see the header)
+  #ifdef MI_LARGE_SPAN_MAX_KIB
+  mi_option_set(mi_option_large_span_max, 0);   // #575 caps the span at 1 MiB; these cases test the growth to the full span (test-large-fungible.c tests the cap)
+  #endif
   case_a();
   case_b();
   case_decay();

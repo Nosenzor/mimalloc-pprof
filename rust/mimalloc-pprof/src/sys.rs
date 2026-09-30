@@ -622,8 +622,11 @@ mi_options! {
     /// **Fork addition (#532).** Size a new large page (blocks of ~84-512 KiB) from its size
     /// class's demand on the thread: compact first, growing to 4 MiB (=1); 0 = always 4 MiB.
     mi_option_large_span = 63;
+    /// **Fork addition (#575).** The largest span in KiB a demand-grown large page reaches (=1024:
+    /// 1 MiB, two blocks of every large bin); 0 = 4 MiB, the #532 policy.
+    mi_option_large_span_max = 64;
     /// Sentinel: one past the last real option.
-    _mi_option_last = 64;
+    _mi_option_last = 65;
 }
 
 /// `MI_SNAPSHOT_BLOCKS` (include/mimalloc.h, #338): include per-block free bitmaps for the

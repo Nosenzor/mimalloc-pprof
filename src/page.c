@@ -588,7 +588,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
     if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
     best_pq = q; best_size = size;   // best fit: the smallest that is large enough
   }
-  if (best_pq == NULL) return NULL;
+  if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;
   theap->tld->large_repurpose_left--;
@@ -661,6 +661,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
     }
   }
   #endif
+  MI_EVENT_IF(mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && mi_page_block_size(page) <= MI_LARGE_MAX_OBJ_SIZE, MI_EVENT_LARGE_EMPTY_FREED);   // (#575)
   _mi_page_free(page, pq);
 }
 
@@ -698,6 +699,7 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
       if (mi_page_all_free(page)) {
         page->retire_expire--;
         if (page->retire_expire == 0 || force) {
+          MI_EVENT_IF(mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE, MI_EVENT_LARGE_RETIRE_EXPIRED);   // (#575)
           _mi_page_free(page, pq);
         }
         else {
@@ -1099,7 +1101,18 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   }
 
   if (page == NULL) {
-    _mi_theap_collect_retired(theap, false); // perhaps make a page available
+    #if MI_LARGE_REPURPOSE && MI_LARGE_AGE_STEP > 0
+    // #575: a large bin's miss ages the retired pages at most once per MI_LARGE_AGE_STEP generic mallocs (see there)
+    if (pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE && pq->block_size <= MI_LARGE_MAX_OBJ_SIZE) {
+      mi_tld_t* const tld = theap->tld;
+      if ((uint32_t)((uint32_t)theap->generic_count - tld->large_age_mark) >= (uint32_t)MI_LARGE_AGE_STEP) {   // (a heartbeat reset of the count wraps: ages once)
+        tld->large_age_mark = (uint32_t)theap->generic_count;
+        _mi_theap_collect_retired(theap, false);
+      }
+    }
+    else
+    #endif
+    { _mi_theap_collect_retired(theap, false); } // perhaps make a page available
     page = mi_page_fresh(theap, pq);         
     mi_assert_internal(page == NULL || mi_page_immediate_available(page));
     if (page == NULL && first_try) {
@@ -1303,7 +1316,7 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
     #if MI_LARGE_REPURPOSE
-    theap->tld->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530
+    theap->tld->large_repurpose_left = (uint32_t)MI_LARGE_REPURPOSE_PER_TICK;   // #530
     #endif
     _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }

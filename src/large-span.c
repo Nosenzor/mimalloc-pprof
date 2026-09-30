@@ -80,6 +80,18 @@ static mi_large_span_bin_t mi_large_span_pack(size_t level, long pressure) {
   return (mi_large_span_bin_t)((((unsigned long)pressure & 0x0F) << MI_LARGE_SPAN_PRESSURE_SHIFT) | level);   // (the full bit clear)
 }
 
+// #575: the largest span a demand-grown page gets, in slices: `mi_option_large_span_max` (KiB, default
+// MI_LARGE_SPAN_MAX_KIB), never below the compact span, and 0 = MI_LARGE_PAGE_SIZE (the #532 policy).
+// The block-count minimum (MI_LARGE_SPAN_MIN_BLOCKS) still wins over it: a page always holds its blocks.
+static size_t mi_large_span_cap_slices(void) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  const long kib = mi_option_get(mi_option_large_span_max);
+  if (kib <= 0) return full;
+  size_t cap = mi_slice_count_of_size((size_t)kib * MI_KiB);
+  if (cap < MI_LARGE_SPAN_COMPACT_SLICES) { cap = MI_LARGE_SPAN_COMPACT_SLICES; }
+  return (cap < full ? cap : full);
+}
+
 // the span of `level`, uncapped (the shift is bounded: a level only grows while below the full span)
 static size_t mi_large_span_level_slices(size_t level) {
   return ((size_t)MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT));
@@ -97,13 +109,14 @@ void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
 // in the worst case (meta in front, guard page).
 static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, size_t overhead, mi_large_span_bin_t* next) {
   const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  const size_t cap = mi_large_span_cap_slices();   // (#575)
   size_t level = mi_large_span_level(b);
   long pressure = mi_large_span_pressure(b);
   if ((b & MI_LARGE_SPAN_FULL_BIT) != 0) {
     // a page of the bin filled up since its last request: demand beyond what the theap holds
     pressure++;
     if (pressure >= MI_LARGE_SPAN_GROW_REQUESTS) {
-      if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; MI_EVENT(MI_EVENT_LARGE_SPAN_GROW); }   // (#573)
+      if (mi_large_span_level_slices(level) < cap && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; MI_EVENT(MI_EVENT_LARGE_SPAN_GROW); }   // (#573)
       pressure = 0;
     }
   }
@@ -122,6 +135,7 @@ static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, si
   *next = mi_large_span_pack(level, pressure);
 
   size_t slices = mi_large_span_level_slices(level);
+  if (slices > cap) { slices = cap; }
   const size_t min_slices = mi_slice_count_of_size(MI_LARGE_SPAN_MIN_BLOCKS * block_size + overhead);
   if (slices < min_slices) { slices = min_slices; }
   if (slices > full) { slices = full; }
