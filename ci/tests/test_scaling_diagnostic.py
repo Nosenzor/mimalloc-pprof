@@ -82,11 +82,11 @@ def test_diagnostic_inputs_are_refused_outside_diagnostic_mode(mode: str, field:
 
 def test_diagnostic_mode_validates_every_input() -> None:
     diagnostic.validate_inputs(
-        "diagnostic", "MIMALLOC_PURGE_DELAY=10", "", "sparse-large-buffers", "1,4", 1
+        "diagnostic", "MIMALLOC_PURGE_DELAY=10", "", "sparse-large-buffers", "1,4", 15
     )
     diagnostic.validate_inputs("full", "", "", "", "", 3)
     with pytest.raises(diagnostic.DiagnosticInputError):
-        diagnostic.validate_inputs("diagnostic", "X=$(id)", "", "", "", 1)
+        diagnostic.validate_inputs("diagnostic", "X=$(id)", "", "", "", 15)
     with pytest.raises(diagnostic.DiagnosticInputError):
         diagnostic.validate_inputs("diagnostic", "", "", "", "", 0)
     with pytest.raises(diagnostic.DiagnosticInputError):
@@ -138,3 +138,15 @@ def test_summary_refuses_a_default_run() -> None:
     raw["status"] = "complete"
     with pytest.raises(diagnostic.DiagnosticInputError):
         diagnostic.summarize(raw)
+
+
+@pytest.mark.parametrize("blocks", [1, 5, 14, 41])
+def test_a_diagnostic_dispatch_needs_at_least_fifteen_blocks(blocks: int) -> None:
+    # #573 B7: 5 blocks gave a false +6-12% RSS regression; 15 resolved single cells
+    with pytest.raises(diagnostic.DiagnosticInputError, match=r"15\.\.40"):
+        diagnostic.validate_inputs("diagnostic", "", "", "", "", blocks)
+
+
+@pytest.mark.parametrize("blocks", [15, 16, 40])
+def test_fifteen_to_forty_blocks_are_accepted(blocks: int) -> None:
+    diagnostic.validate_inputs("diagnostic", "", "", "", "", blocks)

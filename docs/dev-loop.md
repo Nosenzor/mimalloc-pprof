@@ -203,6 +203,27 @@ label-gated release-build perf-ab job ran. The inherited TSAN row of `test.yaml`
 **Diagnosis order: events before timing.** Explain a change with event counts and residency
 first; use perf-ab to confirm, not to explore.
 
+### Benchmark scaling: diagnostics, caches and alerts (#573 B7, B9)
+
+- **Diagnostic sweeps take 15 to 40 blocks per cell** (`MIN_DISPATCH_BLOCKS` in
+  `ci/scaling_diagnostic.py`, checked before anything is built). A 5-block sweep left a 30-45 MiB
+  spread per cell and produced a false +6-12% RSS regression; 15 resolved single cells.
+- **Two allocator caches.** `benchmark-scaling.yml` restores the four reference allocators (TCMalloc,
+  jemalloc, upstream and Bun mimalloc) keyed on their pins, patches and the builder only, and the
+  fork's tree keyed on its own sources and the diagnostic defines, so a C change no longer rebuilds
+  TCMalloc. `ci/check_benchmark_scaling_workflow.py` pins both keys.
+- **A failing scheduled run opens an issue.** The `alert` job (schedule only) runs
+  `ci/scaling_failure_alert.py`: one open issue, "benchmark-scaling: the scheduled run is
+  failing", collects the run links and failed jobs of a streak; close it when a run succeeds. The
+  RSS-floor validation break of 2026-09-28 failed every daily run for over a day unseen.
+- **The RSS-floor rule cannot drift.** The producer (`scaling.rs`) and the validator
+  (`benchmark_report.py`) decide floor consistency with `floor * 100 <= lowest * (100 + slack)`.
+  `ci/check_benchmark_scaling_workflow.py` compares the constant and the formula on every `ci/` PR,
+  and both test suites load `rust/benchmark-suite/tests/fixtures/rss_floor_vectors.json`.
+- **Multi-threaded stress on PRs.** The `stress` job of `asan.yml` (labels `ci-test` / `ci-full`)
+  runs `ci/verify_local.py --only stress,tsan`: the perf_ab large-size, generation and idle-drain
+  rows under `MI_DEBUG_FULL` and under clang TSAN.
+
 ## Memory gate: fast local loop (#517)
 
 Memory measurements are fine to take locally: a peak RSS on this box is stable to about

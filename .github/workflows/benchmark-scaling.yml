@@ -29,7 +29,7 @@ name: benchmark-scaling
 # the raw run carries the diagnostic record and status `diagnostic`, which
 # benchmark-scaling-validate refuses, and nothing below validation, rendering or publication
 # runs outside `mode: full`. Example:
-#   gh workflow run benchmark-scaling.yml -f mode=diagnostic -f blocks=1 \
+#   gh workflow run benchmark-scaling.yml -f mode=diagnostic -f blocks=15 \
 #     -f diagnostic_env=MIMALLOC_PURGE_DELAY=10 -f diagnostic_patterns=sparse-large-buffers \
 #     -f diagnostic_threads=1,4
 on:
@@ -45,7 +45,7 @@ on:
         required: false
         type: string
       blocks:
-        description: "Legacy blocks per cell (full 3; smoke 1; distribution full is fixed at 40); diagnostic: every selected cell's blocks, 1-40"
+        description: "Legacy blocks per cell (full 3; smoke 1; distribution full is fixed at 40); diagnostic: every selected cell's blocks, 15-40 (#573: 5 blocks gave a false +6-12% RSS regression)"
         type: number
         default: 3
         required: false
@@ -123,16 +123,30 @@ jobs:
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
-      - name: cache native allocator trees
+      # #573 B7: two caches, so a change to the fork's C sources no longer rebuilds the four
+      # reference allocators (TCMalloc alone is a Bazel build of many minutes). The references
+      # depend only on their pins, patches and the builder; the fork tree on its own sources too.
+      - name: cache reference allocator trees
         uses: actions/cache@v4.2.4
         with:
           path: |
             rust/target/release/archives
-            rust/target/release/build
-            rust/target/release/sources
+            rust/target/release/build/tcmalloc
+            rust/target/release/build/jemalloc
+            rust/target/release/build/upstream-mimalloc
+            rust/target/release/build/bun-mimalloc
+            rust/target/release/sources/tcmalloc
+            rust/target/release/sources/jemalloc
+            rust/target/release/sources/upstream-mimalloc
+            rust/target/release/sources/bun-mimalloc
+          key: benchmark-references-${{ runner.os }}-${{ hashFiles('rust/benchmark-suite/allocators/allocator-lock.json', 'rust/benchmark-suite/allocators/patches/**', 'ci/build_benchmark_allocators.py') }}
+      - name: cache fork allocator tree
+        uses: actions/cache@v4.2.4
+        with:
+          path: rust/target/release/build/mimalloc-pprof
           # #528: a diagnostic build with extra defines never shares a tree with a default
           # build (a restored CMake cache would keep MI_EXTRA_CPPDEFS).
-          key: benchmark-allocators-${{ runner.os }}-cppdefs[${{ inputs.diagnostic_cppdefs }}]-${{ hashFiles('rust/benchmark-suite/allocators/allocator-lock.json', 'rust/benchmark-suite/allocators/patches/**', 'include/**', 'src/**', 'CMakeLists.txt', 'ci/build_benchmark_allocators.py') }}
+          key: benchmark-fork-${{ runner.os }}-cppdefs[${{ inputs.diagnostic_cppdefs }}]-${{ hashFiles('rust/benchmark-suite/allocators/allocator-lock.json', 'rust/benchmark-suite/allocators/patches/**', 'include/**', 'src/**', 'CMakeLists.txt', 'ci/build_benchmark_allocators.py') }}
       - name: build native allocator libraries
         env:
           DIAGNOSTIC_CPPDEFS: ${{ inputs.diagnostic_cppdefs }}
@@ -502,3 +516,26 @@ jobs:
         run: |
           set -euo pipefail
           python ci/check_scaling_parity.py --latest audit/site/latest.json
+
+  # #573 B9: a failing SCHEDULED run means the published charts go stale, and the RSS-floor
+  # validation break of 2026-09-28 sat unnoticed for over a day (every daily run failed in
+  # `assemble` after ~70 minutes of measuring). This opens the alert issue, or comments on the one
+  # that is open, with the failed jobs and the run link. Never on a dispatch: a developer running
+  # a diagnostic is already looking at it.
+  alert:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [build, measure, assemble, artifact-audit, publish-branch, package-pages, deploy-pages, publication-audit]
+    if: ${{ always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure') }}
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4.4.0
+        with:
+          persist-credentials: false
+      - name: open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/scaling_failure_alert.py --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"

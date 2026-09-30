@@ -910,6 +910,7 @@ def run_lint(ctx: RunCtx) -> bool:
         # #573 A5: needs <sys/sdt.h>; without it the check says so and passes (CI requires it).
         ["uv", "run", "ci/check_usdt_probes.py", "--selftest"],
         ["uv", "run", "ci/check_usdt_probes.py"],
+        ["uv", "run", "ci/scaling_failure_alert.py", "--selftest"],
         ["uv", "run", "ci/check_macro_case.py", "--selftest"],
         ["uv", "run", "ci/check_macro_case.py"],
         ["uv", "run", "ci/check_release_ratchet.py", "--selftest"],
