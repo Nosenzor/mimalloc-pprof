@@ -1071,6 +1071,7 @@ static inline mi_subproc_t* _mi_theap_subproc(const mi_theap_t* theap) {
 }
 
 #include "mimalloc/owner-gate.h"   // #366: MI_GATE_ENTER/LEAVE/ASSERT_HELD (expands to nothing unless MI_OWNER_GATE)
+#include "mimalloc/usdt.h"         // #573: MI_PROBE* static tracepoints (nothing unless MI_USDT)
 
 static inline mi_page_t* _mi_theap_get_free_small_page(mi_theap_t* theap, size_t size) {
   MI_GATE_ASSERT_HELD(theap);   // #366 leaf assert (docs/purge-all-implementation.md §5.2)
@@ -1361,7 +1362,7 @@ size_t        _mi_page_purged_count(const mi_page_t* page);
 void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
 void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner resets a retired large page and publishes it for the scavenger
-void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
+void          _mi_page_unpublish_retired(mi_page_t* page, mi_tld_t* owner_tld);   // #483: take it back before forming a block in it or freeing it; the owner's tld when the caller has it (#573: `_mi_page_free` clears `page->theap` first), else NULL
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
 long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
 
@@ -1378,6 +1379,42 @@ typedef struct mi_arena_claim_counters_s {
 } mi_arena_claim_counters_t;
 bool          _mi_arena_claim_counters(mi_arena_claim_counters_t* out);   // false (and *out zeroed) when not compiled in (MI_DIAGNOSTICS=0)
 void          _mi_arena_claim_counters_reset(void);
+
+// #573 A2: event counters -- how often each slow-path mechanism ran, process-wide, so a cost is
+// explained by counts before it is timed (the "retire cascade" of #572 was 548K page requests
+// against 292, invisible to timing). Compiled in with MI_DIAGNOSTICS=1, slow paths only, no
+// allocation; everywhere else `MI_EVENT` is nothing and the query functions are stubs. Printed by
+// `mi_stats_print` and by `mi_purge_holes_report`. Internal API only: no Rust surface, no layout.
+typedef enum mi_event_e {
+  MI_EVENT_LARGE_PAGE_REQUEST,      // a large bin asked for a page (before repurposing or the arena)
+  MI_EVENT_LARGE_REPURPOSE,         // ... and got another bin's retired page, re-carved in place
+  MI_EVENT_LARGE_REPURPOSE_DENIED,  // ... could not, for lack of this heartbeat's budget
+  MI_EVENT_RETIRED_PUBLISH,         // a retired large page was published for the scavenger
+  MI_EVENT_RETIRED_UNPUBLISH,       // ... and taken back
+  MI_EVENT_PAGE_MAP_REGISTER,       // a page was registered in the page map
+  MI_EVENT_PAGE_MAP_REEXTEND,       // a re-carve changed a page's mapped extent
+  MI_EVENT_LARGE_SPAN_GROW,         // a large bin's demand-sized span stepped up (#532)
+  MI_EVENT_LARGE_SPAN_SHRINK,       // ... stepped down
+  MI_EVENT_ARENA_PAGE_ALLOC,        // a page was allocated from the arenas
+  MI_EVENT_ARENA_PAGE_FREE,         // a page went back to the arenas
+  MI_EVENT_COUNT
+} mi_event_t;
+uint64_t      _mi_event_get(mi_event_t event);           // 0 when not compiled in
+const char*   _mi_event_name(mi_event_t event);
+void          _mi_event_reset(void);
+void          _mi_event_print(void);                      // the nonzero counters, one line; nothing when not compiled in
+#if MI_DIAGNOSTICS
+void          _mi_event_count(mi_event_t event);
+#define MI_EVENT(event)             _mi_event_count(event)
+#define MI_EVENT_IF(cond, event)    do { if (cond) { _mi_event_count(event); } } while (0)
+#else
+#define MI_EVENT(event)             ((void)0)
+#define MI_EVENT_IF(cond, event)    ((void)0)
+#endif
+
+#if MI_DEBUG>=1
+void          _mi_page_debug_print(const mi_page_t* page);   // #573 A4: one line of a page's state, malloc-free
+#endif
 
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
@@ -1434,14 +1471,22 @@ typedef struct mi_arena_layout_class_s {
   size_t runs[MI_ARENA_LAYOUT_KIND_COUNT];                // maximal runs of each kind inside a chunk
   size_t max_run[MI_ARENA_LAYOUT_KIND_COUNT];             // the longest such run, in slices
   size_t run_hist[MI_ARENA_LAYOUT_KIND_COUNT][MI_ARENA_LAYOUT_RUN_BUCKETS];   // runs by floor(log2(length))
+  size_t resident_bytes[MI_ARENA_LAYOUT_KIND_COUNT];      // #573 A3: of those, resident in RAM now (`mincore`); 0 unless `resident_known`
 } mi_arena_layout_class_t;
 
 typedef struct mi_arena_layout_s {
   size_t arenas;                                  // arenas walked
   size_t chunks;                                  // chunks walked (all classes)
   size_t meta_slices;                             // the arenas' own info slices: not classified
+  bool   resident_known;                          // #573 A3: `resident_bytes` were measured (`mincore`: not on Windows)
   mi_arena_layout_class_t cls[MI_CBIN_COUNT];     // by the chunk's size class, `mi_chunkbin_t` order
 } mi_arena_layout_t;
+
+// #573 A3: the bytes of [start, start+size) resident in RAM now, or SIZE_MAX when the platform
+// cannot say. Diagnostics only (a syscall per call): the layout walk and the holes report.
+size_t        _mi_diag_resident_bytes(const void* start, size_t size);
+uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);   // src/arena.c: the slice must exist
+uint8_t*      mi_arena_slice_end(mi_arena_t* arena, size_t slice_end);       // src/arena.c: one past a range; may be the arena's end (#573)
 
 // Walk every arena of `subproc` (or only `arena`, when not NULL) into `*out` (zeroed first).
 // Returns false when not compiled in (MI_DIAGNOSTICS=0). The caller must keep the arenas alive:
@@ -1456,6 +1501,9 @@ void          _mi_arena_layout_print(const mi_arena_layout_t* layout);
 typedef struct mi_holes_bin_s {
   size_t block_size;           // the largest block size seen in this bin
   size_t pages;
+  size_t empty_pages;          // #573 A3: pages with no live block (`used == 0`)
+  size_t retired_pages;        // ... of which retired (#483): kept for reuse, empty
+  size_t retired_resident_bytes;   // resident RAM of those retired pages (`mincore`; 0 when unknown)
   size_t ineligible_pages;     // pages `mi_page_can_purge_holes` rejects (nothing in them is discardable)
   size_t live_bytes;           // bytes of allocated blocks
   size_t free_bytes;           // bytes of free blocks (free-listed *and* already discarded)

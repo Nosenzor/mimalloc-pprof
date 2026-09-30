@@ -154,6 +154,13 @@ uint8_t* mi_arena_slice_start(mi_arena_t* arena, size_t slice_index) {
   return (mi_arena_start(arena) + mi_size_of_slices(slice_index));
 }
 
+// #573: one PAST a slice range: `slice_end` may be `slice_count`, which `mi_arena_slice_start`
+// (rightly) refuses. #569 computed an end with the start helper and asserted on the last run.
+uint8_t* mi_arena_slice_end(mi_arena_t* arena, size_t slice_end) {
+  mi_assert_internal(slice_end <= arena->slice_count);
+  return (mi_arena_start(arena) + mi_size_of_slices(slice_end));
+}
+
 mi_page_t* mi_arena_page_at_slice(mi_arena_t* arena, size_t slice_index) {
   mi_assert_internal(slice_index < arena->slice_count);
   if (arena->pages_meta != NULL) {
@@ -1131,8 +1138,8 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   page->page_ma_offset = (uint32_t)(offset / MI_MAX_ALIGN_SIZE);
 
   // initialize page meta-data
-  page->reserved = (uint16_t)reserved;  
-  page->block_size = block_size;
+  page->reserved = (uint16_t)reserved;   // page-geometry: a new page, registered right after
+  page->block_size = block_size;         // page-geometry
   page->memid = memid;
   page->free_is_zero = memid.initially_zero;
 
@@ -1261,6 +1268,8 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   if mi_unlikely(page == NULL) {
     return NULL;
   }
+  MI_EVENT(MI_EVENT_ARENA_PAGE_ALLOC);   // (#573)
+  MI_PROBE2(arena_page_alloc, block_size, mi_page_block_size(page));
   // mi_assert_internal(page == NULL || _mi_page_segment(page)->subproc == tld->subproc);
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
@@ -1344,7 +1353,7 @@ static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_
       mi_assert_internal(mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
     }
   }
-  if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // for assertion checking
+  if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // page-geometry: for assertion checking (the page is being freed)
   mi_arenas_free_ex( subproc, mi_page_slice_start(page), mi_page_full_size(page), page->memid, retain_short);
 }
 
@@ -1385,6 +1394,8 @@ void _mi_realloc_free_old(const mi_page_t* page, void* p, bool grown) {
 }
 
 static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, bool unabandon) {
+  MI_EVENT(MI_EVENT_ARENA_PAGE_FREE);   // (#573)
+  MI_PROBE1(arena_page_free, page->block_size);
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
@@ -1410,7 +1421,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
   // until it is MADV_FREE_REUSE'd. This function is the single choke point for a page going
   // back to the arena (`_mi_page_free` and the abandoned-page free in `free.c` both land here).
-  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: first, so the scavenger cannot discard it meanwhile
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page, (current_theapx != NULL ? current_theapx->tld : NULL)); }   // #483: first, so the scavenger cannot discard it meanwhile; the calling thread is the owner
   _mi_page_unpurge_all(page);
 
   // all we need from the heap, before the page is unpublished from it (see
@@ -1562,7 +1573,7 @@ bool _mi_arenas_page_reserve(mi_page_t* page, mi_theap_t* current_theap) {
 
   // #483: a retired page published in its (exiting) thread's tld slots must be taken back before
   // the tld goes -- this also clears `retired_at`, which we then set to the reserve stamp
-  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page, NULL); }
   const mi_msecs_t now = _mi_clock_now();
   page->retired_at = (now != 0 ? now : 1);   // non-zero: this marks the page as reserved
 

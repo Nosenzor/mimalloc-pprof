@@ -396,6 +396,8 @@ static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, si
   mi_assert_internal(mi_theap_contains_queue(theap, pq));
   mi_assert_internal(page_alignment > 0 || block_size > MI_LARGE_MAX_OBJ_SIZE || block_size == pq->block_size);
   #endif
+  MI_EVENT_IF(page_alignment == 0 && block_size > MI_MEDIUM_MAX_OBJ_SIZE && block_size <= MI_LARGE_MAX_OBJ_SIZE, MI_EVENT_LARGE_PAGE_REQUEST);   // #573
+  MI_PROBE2(page_fresh, block_size, page_alignment);
   #if MI_LARGE_REPURPOSE
   if (page_alignment == 0 && pq != NULL) {
     mi_page_t* const repurposed = mi_page_repurpose_retired(theap, pq, block_size);
@@ -519,6 +521,32 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
 #define MI_RETIRE_CYCLES      (16)
 
 #if MI_LARGE_REPURPOSE
+// #573: the ONLY place the geometry (`block_size`, `reserved`) of an existing page changes. The page
+// map covers only `block_size * reserved` of a page (`mi_page_map_get_idx`), so the new geometry
+// must be registered over its own extent: a block past the old extent otherwise maps to no page
+// (a debug build asserts in `_mi_ptr_page`; a release build loses the free). #572 shipped that bug
+// because the two writes and the re-registration were three separate statements in a caller;
+// `ci/check_page_geometry_writes.py` now rejects any other write to these fields of a page.
+// (Only when the extent changes: it covers whole slices, and most re-carves keep them; the extent
+// is `ceil((start offset + size) / slice)`, as `mi_page_map_get_idx` counts it.)
+// Also accounts the page in its new bin. Returns false, with the page already given back to the
+// arena, when the page map cannot be committed.
+static bool mi_page_set_geometry(mi_theap_t* theap, mi_page_t* page, size_t block_size, size_t reserved) {
+  const size_t start_offset = (size_t)(mi_page_start(page) - mi_page_slice_start(page));
+  const size_t old_extent = mi_slice_count_of_size(start_offset + mi_page_size(page));
+  const bool remap = (mi_slice_count_of_size(start_offset + reserved * block_size) != old_extent);
+  if (remap) { MI_EVENT(MI_EVENT_PAGE_MAP_REEXTEND); _mi_page_map_unregister(page); }
+  page->block_size = block_size;       // page-geometry
+  page->reserved = (uint16_t)reserved; // page-geometry
+  mi_assert_internal(!mi_page_has_interior_pointers(page));   // (`_mi_page_retire` cleared it)
+  mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);   // (before any free below: it debits this bin)
+  if (remap && mi_unlikely(!_mi_page_map_register(page))) {   // (cannot commit page-map memory)
+    _mi_arenas_page_free(page, theap);
+    return false;
+  }
+  return true;
+}
+
 // #530: a new page of a large bin, from another large bin's retired page of this theap.
 //
 // Every large bin a thread uses keeps its only page when it empties (`_mi_page_retire`), and
@@ -533,7 +561,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // Within this heartbeat's budget only. A repurposed page's own bin may need a page again soon and
   // take another's in turn: unbounded, that cascade was 548K page requests (and 79K arena round
   // trips as the misses aged retired pages out) instead of 292 on large-class/8, +16% CPU.
-  if (theap->tld->large_repurpose_left == 0) return NULL;
+  if (theap->tld->large_repurpose_left == 0) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_DENIED); return NULL; }   // (#573)
   #if MI_LARGE_REPURPOSE_ABANDONED_FIRST
   // an abandoned page of the bin (typically an exited thread's) comes first: the arena path
   // reclaims it, and it is resident and partly used
@@ -564,7 +592,9 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;
   theap->tld->large_repurpose_left--;
-  _mi_page_unpublish_retired(page);   // (#483) ours again before we touch its blocks
+  MI_EVENT(MI_EVENT_LARGE_REPURPOSE);   // (#573)
+  MI_PROBE2(page_repurpose, block_size, mi_page_block_size(page));   // (the page's old block size)
+  _mi_page_unpublish_retired(page, theap->tld);   // (#483) ours again before we touch its blocks
   mi_assert_internal(mi_page_all_free(page) && mi_page_is_owned(page) && !mi_page_is_abandoned(page));
   mi_assert_internal(mi_tf_block(mi_atomic_load_relaxed(&page->xthread_free)) == NULL);
   mi_assert_internal(mi_page_theap(page) == theap);
@@ -577,24 +607,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   page->capacity = 0;
   page->free_is_zero = false;
   page->memid.initially_zero = false;   // its blocks were handed out before
-  // The page map covers only `block_size * reserved` of a page (`mi_page_map_get_idx`), so the
-  // new geometry must be registered over its own extent: a block past the old extent otherwise
-  // maps to no page (a debug build asserts in `_mi_ptr_page`; a release build loses the free).
-  // (Only when the extent changes: it covers whole slices, and most re-carves keep them.)
-  // (The extent is `ceil((start offset + size) / slice)`, as `mi_page_map_get_idx` counts it, #573.)
-  const size_t start_offset = (size_t)(mi_page_start(page) - mi_page_slice_start(page));
-  const size_t old_extent = mi_slice_count_of_size(start_offset + mi_page_size(page));
-  const size_t new_reserved = best_size / block_size;
-  const bool remap = (mi_slice_count_of_size(start_offset + new_reserved * block_size) != old_extent);
-  if (remap) { _mi_page_map_unregister(page); }
-  page->block_size = block_size;
-  page->reserved = (uint16_t)new_reserved;
-  mi_assert_internal(!mi_page_has_interior_pointers(page));   // (`_mi_page_retire` cleared it)
-  mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);   // (before any free below: it debits this bin)
-  if (remap && mi_unlikely(!_mi_page_map_register(page))) {   // (cannot commit page-map memory)
-    _mi_arenas_page_free(page, theap);
-    return NULL;
-  }
+  if (!mi_page_set_geometry(theap, page, block_size, best_size / block_size)) return NULL;   // (the page is gone then)
   mi_page_queue_push(theap, pq, page);
   if (!_mi_page_init(theap, page)) {   // (cannot commit its first block: give it back)
     mi_page_queue_remove(pq, page);
@@ -823,7 +836,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   if (page->free != NULL) return true;
   #endif
   if (page->capacity >= page->reserved) return true;
-  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: before forming blocks in it
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page, theap->tld); }   // #483: before forming blocks in it
 
   size_t page_size;
   //uint8_t* page_start =
@@ -900,6 +913,22 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   return true;
 }
 
+#if MI_DEBUG>=1
+// #573 A4: a page's state on one line, for the message of an assertion that is about to abort
+// (`_mi_fprintf` does not allocate). Reads only fields, follows no pointer.
+void _mi_page_debug_print(const mi_page_t* page) {
+  if (page == NULL) { _mi_fprintf(NULL, NULL, "  page: NULL\n"); return; }
+  _mi_fprintf(NULL, NULL,
+              "  page %p: block_size %zu reserved %u capacity %u used %u memkind %d start %p slice_start %p\n"
+              "    retire_expire %u retired_slot %p retired_at %zu theap %p heap %p flags: abandoned %d full %d owned %d\n",
+              (const void*)page, page->block_size, (unsigned)page->reserved, (unsigned)page->capacity, (unsigned)page->used,
+              (int)page->memid.memkind, (const void*)mi_page_start(page), (const void*)mi_page_slice_start(page),
+              (unsigned)page->retire_expire, (const void*)page->retired_slot, (size_t)page->retired_at,
+              (const void*)page->theap, (const void*)page->heap,
+              (int)mi_page_is_abandoned(page), (int)mi_page_is_full(page), (int)mi_page_is_owned(page));
+}
+#endif
+
 #if MI_DEBUG>=2
 // #573: the page map covers `block_size * reserved` of a page (`mi_page_map_get_idx`), so it must
 // resolve the first byte of the first block and the last byte of the last block to the page. A
@@ -912,6 +941,9 @@ static bool mi_page_map_check_page(mi_page_t* page) {
   // (a huge page is mapped only up to its furthest interior pointer: as in `mi_page_map_get_idx`)
   if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }
   mi_assert_internal(page_size > 0);
+  if (_mi_unchecked_ptr_page(start) != page || _mi_unchecked_ptr_page(start + page_size - 1) != page) {
+    _mi_page_debug_print(page);   // (the assertions below abort)
+  }
   mi_assert_internal(_mi_unchecked_ptr_page(start) == page);
   mi_assert_internal(_mi_unchecked_ptr_page(start + page_size - 1) == page);
   MI_UNUSED(start);
