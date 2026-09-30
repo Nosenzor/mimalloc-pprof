@@ -581,9 +581,11 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // new geometry must be registered over its own extent: a block past the old extent otherwise
   // maps to no page (a debug build asserts in `_mi_ptr_page`; a release build loses the free).
   // (Only when the extent changes: it covers whole slices, and most re-carves keep them.)
-  const size_t old_extent = mi_slice_count_of_size(mi_page_size(page));
+  // (The extent is `ceil((start offset + size) / slice)`, as `mi_page_map_get_idx` counts it, #573.)
+  const size_t start_offset = (size_t)(mi_page_start(page) - mi_page_slice_start(page));
+  const size_t old_extent = mi_slice_count_of_size(start_offset + mi_page_size(page));
   const size_t new_reserved = best_size / block_size;
-  const bool remap = (mi_slice_count_of_size(new_reserved * block_size) != old_extent);
+  const bool remap = (mi_slice_count_of_size(start_offset + new_reserved * block_size) != old_extent);
   if (remap) { _mi_page_map_unregister(page); }
   page->block_size = block_size;
   page->reserved = (uint16_t)new_reserved;
@@ -898,6 +900,25 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   return true;
 }
 
+#if MI_DEBUG>=2
+// #573: the page map covers `block_size * reserved` of a page (`mi_page_map_get_idx`), so it must
+// resolve the first byte of the first block and the last byte of the last block to the page. A
+// re-carve (`mi_page_repurpose_retired`) that changes the geometry without re-registering left
+// blocks past the old extent mapped to no page: found only by a multi-threaded debug run, and
+// never under gdb. Checked whenever a page is (re)initialized.
+static bool mi_page_map_check_page(mi_page_t* page) {
+  size_t page_size;
+  const uint8_t* const start = mi_page_area(page, &page_size);
+  // (a huge page is mapped only up to its furthest interior pointer: as in `mi_page_map_get_idx`)
+  if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }
+  mi_assert_internal(page_size > 0);
+  mi_assert_internal(_mi_unchecked_ptr_page(start) == page);
+  mi_assert_internal(_mi_unchecked_ptr_page(start + page_size - 1) == page);
+  MI_UNUSED(start);
+  return true;
+}
+#endif
+
 // Initialize a fresh page (that is already partially initialized)
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(page != NULL);
@@ -913,6 +934,7 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_track_mem_noaccess(page_start,page_size);
   mi_assert_internal(page_size / mi_page_block_size(page) < (1L<<16));
   mi_assert_internal(page->reserved > 0);
+  mi_assert_internal(mi_page_map_check_page(page));
   #if (MI_PADDING || MI_ENCODE_FREELIST)
   page->keys[0] = _mi_theap_random_next(theap);
   page->keys[1] = _mi_theap_random_next(theap);

@@ -13,6 +13,11 @@ name: perf-ab
 # on a PR: a dispatch selects them through `workloads`, e.g. "#422" or "80 KiB|512 KiB".
 # `holes_report` (#529, #422 E4) appends an untimed allocator-internal snapshot per row and arm:
 # every worker's mi_purge_holes_report() in an MI_DIAGNOSTICS=ON build (see ci/perf_ab.py).
+# #573: the first repetition of every row is a sanity screen (`sanity_gate`): a head RSS metric
+# above 1.5x base + 8 MiB fails the job at once. A PR run cancels its older run on a new push
+# (one PR, one live run), and only the `perf-ab` label itself starts a run: another label
+# (ci-test, ci-full, ...) used to start a second and third run on the same SHA, each on a
+# different CPU model. `head_sha` dispatches a head that is not the ref the workflow runs from.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -22,6 +27,10 @@ on:
         description: "Base ref to compare against"
         type: string
         default: origin/main
+      head_sha:
+        description: "Head commit to measure (empty = the ref the workflow was dispatched on)"
+        type: string
+        default: ""
       reps:
         description: "Paired repetitions per workload"
         type: string
@@ -39,21 +48,35 @@ on:
         type: string
         default: ""
       holes_report:
-        description: "After the timed reps, one untimed MI_DIAGNOSTICS=ON run per row and arm printing every worker's mi_purge_holes_report() (#529)"
+        description: "After the timed reps, one untimed MI_DIAGNOSTICS=ON run per row and arm printing every worker's mi_purge_holes_report() and the allocator's statistics (#529, #573)"
         type: boolean
         default: false
+      sanity_gate:
+        description: "Fail after the first repetition when a head RSS metric exceeds 1.5x base + 8 MiB (#573); turn off for a knob that is meant to trade memory away"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
+# One live run per PR; a dispatch is its own group and is never cancelled by another. A run for
+# some other label skips the job below, so it gets its own group too: it must not cancel a live one.
+concurrency:
+  group: perf-ab-${{ github.event.pull_request.number || github.run_id }}-${{ github.event.action == 'labeled' && github.event.label.name != 'perf-ab' && github.run_id || 'live' }}
+  cancel-in-progress: true
+
 jobs:
   ab:
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'perf-ab')
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'perf-ab') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'perf-ab'))
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4.4.0
         with:
+          ref: ${{ inputs.head_sha || '' }}
           fetch-depth: 0
           persist-credentials: false
       - name: paired A/B
@@ -64,4 +87,5 @@ jobs:
           HEAD_ENV: ${{ inputs.head_env }}
           HEAD_CPPDEFS: ${{ inputs.head_cppdefs }}
           HOLES_REPORT: ${{ inputs.holes_report && '--holes-report' || '' }}
-        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT --summary "$GITHUB_STEP_SUMMARY"
+          NO_SANITY_GATE: ${{ inputs.sanity_gate == false && '--no-sanity-gate' || '' }}
+        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE --summary "$GITHUB_STEP_SUMMARY"

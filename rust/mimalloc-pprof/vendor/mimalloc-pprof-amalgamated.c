@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit c1b8b165 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 4d75ba73 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -2815,8 +2815,9 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // bits 0-2 the level (the span is MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT),
 // capped at MI_LARGE_PAGE_SIZE), bit 3 "a page of the bin filled up since the last page request",
 // bits 4-7 the pressure count, 4-bit two's complement (see MI_LARGE_SPAN_GROW_REQUESTS; 0 = none). One byte because
-// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes
-// keep it there, 64 would not.
+// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8168 bytes in the largest
+// configuration, checked by `MI_THEAP_META_MAX_SIZE` below): 16 more bytes keep it there, 64
+// would not.
 typedef uint8_t mi_large_span_bin_t;
 #endif
 
@@ -3271,6 +3272,19 @@ struct mi_theap_s {
   mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
   #endif
 };
+
+// #573: `mi_theap_t` (plus the block padding) is allocated from the meta-allocator and sits at the
+// edge of its 8 KiB size class. Eight more bytes made CI ASan `test-resident-first-churn` flaky
+// (8168 -> 8176 bytes), and nothing said so at compile time. This is the largest size any
+// configuration has today (MI_PADDING on, the profiler, memory events, diagnostics and DHAT all
+// in); a field that does not fit goes into `mi_tld_t` instead, or the budget is raised here,
+// deliberately, after checking the size class. (A negative array size is the portable static
+// assert: MSVC's C mode has none in every supported version.)
+#ifndef MI_THEAP_META_MAX_SIZE
+#define MI_THEAP_META_MAX_SIZE            (8176)
+#endif
+#define MI_STATIC_ASSERT(name,cond)       typedef char mi_static_assert_##name[(cond) ? 1 : -1]
+MI_STATIC_ASSERT(theap_meta_size, sizeof(struct mi_theap_s) + MI_PADDING_SIZE <= MI_THEAP_META_MAX_SIZE);
 
 
 
@@ -25563,9 +25577,11 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // new geometry must be registered over its own extent: a block past the old extent otherwise
   // maps to no page (a debug build asserts in `_mi_ptr_page`; a release build loses the free).
   // (Only when the extent changes: it covers whole slices, and most re-carves keep them.)
-  const size_t old_extent = mi_slice_count_of_size(mi_page_size(page));
+  // (The extent is `ceil((start offset + size) / slice)`, as `mi_page_map_get_idx` counts it, #573.)
+  const size_t start_offset = (size_t)(mi_page_start(page) - mi_page_slice_start(page));
+  const size_t old_extent = mi_slice_count_of_size(start_offset + mi_page_size(page));
   const size_t new_reserved = best_size / block_size;
-  const bool remap = (mi_slice_count_of_size(new_reserved * block_size) != old_extent);
+  const bool remap = (mi_slice_count_of_size(start_offset + new_reserved * block_size) != old_extent);
   if (remap) { _mi_page_map_unregister(page); }
   page->block_size = block_size;
   page->reserved = (uint16_t)new_reserved;
@@ -25880,6 +25896,25 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   return true;
 }
 
+#if MI_DEBUG>=2
+// #573: the page map covers `block_size * reserved` of a page (`mi_page_map_get_idx`), so it must
+// resolve the first byte of the first block and the last byte of the last block to the page. A
+// re-carve (`mi_page_repurpose_retired`) that changes the geometry without re-registering left
+// blocks past the old extent mapped to no page: found only by a multi-threaded debug run, and
+// never under gdb. Checked whenever a page is (re)initialized.
+static bool mi_page_map_check_page(mi_page_t* page) {
+  size_t page_size;
+  const uint8_t* const start = mi_page_area(page, &page_size);
+  // (a huge page is mapped only up to its furthest interior pointer: as in `mi_page_map_get_idx`)
+  if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }
+  mi_assert_internal(page_size > 0);
+  mi_assert_internal(_mi_unchecked_ptr_page(start) == page);
+  mi_assert_internal(_mi_unchecked_ptr_page(start + page_size - 1) == page);
+  MI_UNUSED(start);
+  return true;
+}
+#endif
+
 // Initialize a fresh page (that is already partially initialized)
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(page != NULL);
@@ -25895,6 +25930,7 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_track_mem_noaccess(page_start,page_size);
   mi_assert_internal(page_size / mi_page_block_size(page) < (1L<<16));
   mi_assert_internal(page->reserved > 0);
+  mi_assert_internal(mi_page_map_check_page(page));
   #if (MI_PADDING || MI_ENCODE_FREELIST)
   page->keys[0] = _mi_theap_random_next(theap);
   page->keys[1] = _mi_theap_random_next(theap);
@@ -26472,7 +26508,7 @@ static size_t mi_page_map_get_idx(mi_page_t* page, uint8_t** page_start, size_t*
   size_t page_size;
   *page_start = mi_page_area(page, &page_size);
   if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }  // furthest interior pointer
-  *slice_count = mi_slice_count_of_size(page_size) + ((*page_start - mi_page_slice_start(page))/MI_ARENA_SLICE_SIZE); // add for large aligned blocks
+  *slice_count = mi_slice_count_of_size(page_size + (size_t)(*page_start - mi_page_slice_start(page))); // (#573) the blocks start after the page header and large alignment padding: count the slices they end in
   return _mi_page_map_index(page);
 }
 
@@ -26825,11 +26861,19 @@ static bool mi_page_map_set_range(mi_page_map_t* pmap, mi_page_t* page, size_t i
 //
 // Re-open with a repro that actually corrupts -- most likely on a platform or path
 // where the os_align allocation has NO trailing slack.
+//
+// (#573) A different arithmetic slip in the same line WAS reproducible, by the page-map check that
+// `_mi_page_init` runs in a debug build (`mi_page_map_check_page`, page.c): with the term
+// `floor(offset / SLICE)` a page whose blocks start part-way into a slice (an OS-backed singleton:
+// offset 4096, 851968 bytes) registered one slice too few, so the last 4 KiB of its only block
+// mapped to no page (`test-diagnostic-walks-os`, MIMALLOC_DISALLOW_ARENA_ALLOC=1). The count is
+// now `ceil((offset + size) / SLICE)`: exact for the flat map, and for this map never lower than
+// before (the over-count above is unchanged in kind).
 static size_t mi_page_map_get_idx(mi_page_t* page, size_t* sub_idx, size_t* slice_count) {
   size_t page_size;
   uint8_t* page_start = mi_page_area(page, &page_size);
   if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }  // furthest interior pointer
-  *slice_count = mi_slice_count_of_size(page_size) + ((page_start - mi_page_slice_start(page))/MI_ARENA_SLICE_SIZE); // add for large aligned blocks
+  *slice_count = mi_slice_count_of_size(page_size + (size_t)(page_start - mi_page_slice_start(page))); // (#573) as above: the sub-slice part of the start offset can push the last block into one more slice
   return _mi_page_map_index(page_start, sub_idx);
 }
 
