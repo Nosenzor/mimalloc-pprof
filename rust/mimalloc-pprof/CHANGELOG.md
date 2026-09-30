@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 1.1.0
+
+- **New option `mi_option_large_span_max`** (Rust `Opt::LARGE_SPAN_MAX`,
+  [#575](https://github.com/zackees/mimalloc-pprof/issues/575)): the largest span, in KiB,
+  a demand-grown large page reaches. Default 1024 (1 MiB, two blocks of every large bin);
+  0 restores the 4 MiB policy of #532. Every Rust surface keeps the option in all
+  configurations.
+- **Large-page reuse policy** (#530, #544, #575): retired large pages are repurposed across
+  bins under a per-heartbeat budget, reclaimed on free when their bin has no page left, and
+  aged by the heartbeat; never-used free slices a THP fault made resident are purged. Lower
+  peak and after-drain RSS on large-buffer workloads; per-cell ledgers are on the issues.
+- **Fixes**: a destroyed sub-process no longer clobbers the caller's thread locals (#554);
+  page-map registration of repurposed pages and of a page whose blocks start mid-slice
+  (#573).
+- **Diagnostics** (`diagnostics` feature only): slow-path event counters, measured
+  residency, assertion backtraces, USDT probes and a per-page resident-byte split in the
+  holes report (#573, #575).
+
 ## 1.0.1
 
 - **Free arenas can be given back**:
