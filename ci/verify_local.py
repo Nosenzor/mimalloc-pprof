@@ -858,8 +858,23 @@ def run_lint(ctx: RunCtx) -> bool:
         log=ctx.log,
     )
     ok = ok and rc == 0
+    # (pytest and pyyaml in the same environment, as python-lint.yml's single `pip install`:
+    # without them pyright cannot resolve the test modules' imports and reports hundreds of
+    # errors that CI does not see)
     rc, _ = run_logged(
-        ["uv", "run", "--with", "pyright[nodejs]==1.1.411", "pyright"], cwd=ROOT, log=ctx.log
+        [
+            "uv",
+            "run",
+            "--with",
+            "pyright[nodejs]==1.1.411",
+            "--with",
+            "pyyaml==6.0.2",
+            "--with",
+            "pytest==8.3.4",
+            "pyright",
+        ],
+        cwd=ROOT,
+        log=ctx.log,
     )
     ok = ok and rc == 0
 
@@ -958,6 +973,8 @@ def run_lint(ctx: RunCtx) -> bool:
             "pyyaml==6.0.2",
             "--with",
             "pytest==8.3.4",
+            "python",
+            "-m",  # (python -m pytest puts the repository root on sys.path: `from ci import release`)
             "pytest",
             "ci/tests",
             "-q",
@@ -1098,9 +1115,14 @@ def run_asan(ctx: RunCtx) -> bool:
             "-DMI_PPROF=ON",
             "-DMI_DEBUG_FULL=ON",
             "-DMI_DHAT=ON",
+            "-DMI_MEMEVT=ON",
+            "-DMI_DIAGNOSTICS=ON",
             "-DMI_TRACK_ASAN=ON",
         ],
     )
+    # (MI_MEMEVT and MI_DIAGNOSTICS as asan.yml's rows have them: without MI_DIAGNOSTICS
+    # test-resident-first-churn is not even built, and this config once passed while CI's rows
+    # failed it, #573.)
     # `and` in this order, not short-circuited away by `debug_ok and ...`: --keep-going is
     # about seeing every failure in one run, and the release row is the interesting one here.
     release_ok = _run_asan_one(
@@ -1108,7 +1130,14 @@ def run_asan(ctx: RunCtx) -> bool:
         cc,
         cxx,
         "relwithdebinfo",
-        ["-DCMAKE_BUILD_TYPE=RelWithDebInfo", "-DMI_PPROF=ON", "-DMI_TRACK_ASAN=ON"],
+        [
+            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+            "-DMI_PPROF=ON",
+            "-DMI_DHAT=ON",
+            "-DMI_MEMEVT=ON",
+            "-DMI_DIAGNOSTICS=ON",
+            "-DMI_TRACK_ASAN=ON",
+        ],
     )
     # #366: the gated Debug row. MI_DEBUG_FULL (MI_DEBUG=3) is what arms the `_mi_gate_held`
     # leaf assertions -- the proof that no path reads owner-private state outside the gate --
@@ -1123,6 +1152,7 @@ def run_asan(ctx: RunCtx) -> bool:
             "-DMI_PPROF=ON",
             "-DMI_DEBUG_FULL=ON",
             "-DMI_OWNER_GATE=ON",
+            "-DMI_DIAGNOSTICS=ON",
             "-DMI_TRACK_ASAN=ON",
         ],
     )

@@ -3,6 +3,7 @@ the dispatch waits for the run it started (#573 B4, B8)."""
 
 from __future__ import annotations
 
+# pyright: reportMissingTypeStubs=false
 import argparse
 import json
 import re

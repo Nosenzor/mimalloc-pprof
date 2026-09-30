@@ -27,3 +27,4 @@ uv.lock
 
 # clud /grind run records: local only, never committed
 .clud/grind/
+.clud/logs/
