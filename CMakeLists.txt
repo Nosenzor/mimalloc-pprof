@@ -75,6 +75,7 @@ option(MI_PPROF             "Enable the allocation sampling profiler (#414: opt-
 option(MI_MEMEVT            "Enable allocation-change accounting and callbacks (#414: opt-in, default OFF)" OFF)
 option(MI_DIAGNOSTICS       "Enable the heap snapshot and the live-heap JSON dump (#414: opt-in, default OFF)" OFF)
 option(MI_DHAT              "Enable the exact DHAT v2 heap observer (#371: hooks cost nothing when OFF; opt-in, default OFF)" OFF)
+option(MI_USDT              "Static tracepoints (USDT probes) at the slow paths, for perf/bpftrace (#573; needs <sys/sdt.h>; opt-in, default OFF)" OFF)
 option(MI_OWNER_GATE        "Take a per-thread owner gate on every allocator call so mi_purge_all can sweep every thread (#366; slower fast path)" OFF)
 option(MI_STRICT_WARNINGS     "Strict diagnostics on the fork's own sources (#373); default ON" ON)
 option(MI_WARNINGS_AS_ERRORS  "Make compiler warnings fatal (-Werror, or /WX on MSVC). OFF for consumers, ON in CI (#373)" OFF)
@@ -91,6 +92,7 @@ set(mi_sources
     src/arena.c
     src/arena-reclaim.c
     src/arena-layout.c
+    src/event-counters.c
     src/bitmap.c
     src/heap.c
     src/heap-dump.c
@@ -489,7 +491,7 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
                       src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
-                      src/arena-layout.c src/large-span.c)
+                      src/arena-layout.c src/event-counters.c src/large-span.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()
@@ -597,6 +599,18 @@ else()
   # no flag load, no instruction -- and dhat.c keeps only stubs for the public API.
   message(STATUS "Compile out the DHAT observer (MI_DHAT=OFF)")
   list(APPEND mi_defines MI_DHAT=0)
+endif()
+
+if(MI_USDT)
+  # #573 A5: static tracepoints in the slow paths (include/mimalloc/usdt.h). Nothing else changes.
+  include(CheckIncludeFile)
+  check_include_file(sys/sdt.h MI_HAVE_SYS_SDT_H)
+  if(MI_HAVE_SYS_SDT_H)
+    message(STATUS "Static tracepoints at the slow paths (MI_USDT=ON)")
+    list(APPEND mi_defines MI_USDT=1)
+  else()
+    message(WARNING "MI_USDT=ON but <sys/sdt.h> was not found (systemtap-sdt-dev): no probes are compiled in")
+  endif()
 endif()
 
 if(MI_DEBUG_TSAN)
@@ -857,7 +871,7 @@ if(MI_USE_CXX)
   # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
   # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
   # test-large-span.c (#532): reads `_mi_ptr_page` / `mi_page_t` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-large-span.c PROPERTIES LANGUAGE CXX )
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-event-counters.c test/test-large-span.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -2233,6 +2247,18 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-arena-layout PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-arena-layout COMMAND mimalloc-test-arena-layout)
     set_tests_properties(test-arena-layout PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
+  endif()
+
+  # test-event-counters (#573 A2): the slow-path event counters and the retire-cascade budget.
+  # Built in EVERY configuration (with MI_DIAGNOSTICS it counts, without it checks the stubs).
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-event-counters test/test-event-counters.c)
+    target_compile_definitions(mimalloc-test-event-counters PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-event-counters PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-event-counters PRIVATE include)
+    target_link_libraries(mimalloc-test-event-counters PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-event-counters COMMAND mimalloc-test-event-counters)
+    set_tests_properties(test-event-counters PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
   endif()
 
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of

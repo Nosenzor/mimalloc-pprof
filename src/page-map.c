@@ -146,6 +146,7 @@ static size_t mi_page_map_get_idx(mi_page_t* page, uint8_t** page_start, size_t*
 
 bool _mi_page_map_register(mi_page_t* page) {
   mi_assert_internal(page != NULL);
+  MI_EVENT(MI_EVENT_PAGE_MAP_REGISTER);   // (#573)
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(mi_atomic_load_ptr_relaxed(uint8_t,&_mi_page_map) != NULL);  // should be initialized before multi-thread access!
   uint8_t* page_map = mi_atomic_load_ptr_relaxed(uint8_t,&_mi_page_map);
@@ -511,6 +512,7 @@ static size_t mi_page_map_get_idx(mi_page_t* page, size_t* sub_idx, size_t* slic
 
 bool _mi_page_map_register(mi_page_t* page) {
   mi_assert_internal(page != NULL);
+  MI_EVENT(MI_EVENT_PAGE_MAP_REGISTER);   // (#573)
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_page_map_t* pmap = _mi_page_map();
   mi_assert_internal(pmap != NULL);  // should be initialized before multi-thread access!

@@ -291,3 +291,53 @@ size class (`mi_chunkbin_t`), counts the runs of each kind with power-of-two run
 histograms. #514's signature was queued runs growing while small/medium claims spilled into
 fresh chunks; that shows up here without a bisect. Without `MI_DIAGNOSTICS` the section is
 absent and `mi_holes_report_t.arena_layout` stays zero.
+
+## Events, residency, probes and static checks (#573 A2-A5)
+
+Explain a change with counts and residency before timing it. These need no source patch:
+
+- **Event counters.** Build with `MI_DIAGNOSTICS=ON`; `mi_stats_print` and `mi_purge_holes_report`
+  end with one line, e.g. `events (#573): large_page_request=65 large_repurpose=64
+  large_repurpose_denied=1 ...` (fresh large-page requests, repurposes and denials, retired
+  publish/unpublish, page-map register/re-extent, large-span grow/shrink, arena page alloc/free).
+  The perf-ab `holes_report` replay prints them for both arms. `test-event-counters` uses them as a
+  deterministic budget for the retire cascade of #572 (548K page requests against 292): within one
+  heartbeat a thread repurposes at most `MI_LARGE_REPURPOSE_FRESH` retired pages.
+- **Residency.** The arena layout walk prints `resident (mincore)` per kind (in use, fresh, dirty,
+  queued, aged) next to what the bitmaps say, and the holes report lists per bin the empty pages,
+  the retired pages and the RAM those hold. A "fresh" slice can be resident (THP faults in its whole
+  2 MiB region); this replaces the scratch `mincore` probe.
+- **A failed assertion** prints a backtrace (`backtrace_symbols_fd`, no allocation; `addr2line -e
+  <binary>` resolves it without `-rdynamic`), and a page-map or geometry failure first prints the
+  page with `_mi_page_debug_print`.
+- **USDT probes.** `-DMI_USDT=ON` (needs `<sys/sdt.h>`, `systemtap-sdt-dev`) puts six probes in the
+  slow paths (`page_fresh`, `page_repurpose`, `arena_page_alloc`, `arena_page_free`,
+  `retired_publish`, `retired_release`); a probe is a NOP until a tracer attaches, so
+  `perf stat -e 'sdt_mimalloc:*'` or `bpftrace -e 'usdt:./app:mimalloc:page_fresh { @[arg0] = count(); }'`
+  answers "how often, with what arguments" without a rebuild. The default build has none
+  (`ci/check_usdt_probes.py`).
+
+Static checks that would have caught #572's bugs at compile time or on the first local run:
+
+- **One writer of a page's geometry.** `block_size` and `reserved` change in `mi_page_set_geometry`
+  (src/page.c), which owns the page-map re-registration; the arena writes them only when it creates
+  or frees a page. `ci/check_page_geometry_writes.py` fails any other write to `page->block_size` or
+  `page->reserved` under `src/`.
+- **Retired-slot mask.** At `MI_DEBUG>=2` a publish asserts that the owner-private mask never claims
+  fewer slots than the slots hold, and `_mi_page_unpublish_retired` takes the owner's tld from the
+  caller (`_mi_page_free` clears `page->theap` first).
+- **Struct size budget.** `ci/struct_size_budget.json` and `ci/check_struct_sizes.py` bound
+  `mi_theap_t` (plus padding) and `mi_tld_t`, which sit at the edge of their size classes, in every
+  configuration CI compiles; `MI_THEAP_META_MAX_SIZE` in types.h must equal the budget. To add a
+  field to either: run the script; if it fails, the field does not fit -- put the state in the other
+  struct or shrink something, and only then raise the budget and the constant together, with the
+  size class checked.
+
+**Finding (not fixed here).** A commit-stat reconciliation at `mi_process_done` (asserting
+`stats.committed.current >= 0`) fails in 9 of the 84 debug-full tests, by up to 2.6 MB. It is not an
+allocator bug: on POSIX the arenas are committed at reserve (every commit bit set), so `committed`
+is never credited at claim time, while a debug build's purge decommits (`mprotect`, because
+`_mi_prim_decommit_zero` uses `madvise` only when `!MI_DEBUG`) and debits `committed` for slices that
+were never credited. Release builds never debit, so the statistic there is exact; on Windows the
+arenas start uncommitted. The invariant therefore holds only where the debit path never runs, and
+the check was not shipped.

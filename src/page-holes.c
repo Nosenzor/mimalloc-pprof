@@ -803,6 +803,23 @@ void _mi_page_unpurge_all(mi_page_t* page) {
 #error "MI_RETIRED_PAGE_SLOTS must fit in the owner's slot mask (mi_tld_t.retired_used)"
 #endif
 
+#if MI_DEBUG>=2
+// #573: the owner-private mask never claims fewer slots than the slots hold. A slot the owner
+// filled always has its bit; only a foreign unpublish (a heap delete from another thread) leaves a
+// bit set with the slot empty, which the mask tolerates. The reverse -- a page in a slot whose bit
+// is clear -- is the leak's mirror image and would let a publish overwrite a live slot. (#572's
+// mask leak was the first: `_mi_page_free` cleared `page->theap` before unpublish, no bit was ever
+// cleared, and after 16 publishes nothing was published again -- idle RSS +225% to +1989%.)
+static bool mi_retired_mask_covers_slots(const mi_tld_t* tld) {
+  for (size_t k = 0; k < MI_RETIRED_PAGE_SLOTS; k++) {
+    if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) {
+      mi_assert_internal((tld->retired_used & ((size_t)1 << k)) != 0);
+    }
+  }
+  return true;
+}
+#endif
+
 // Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
 // scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
 void _mi_page_publish_retired(mi_page_t* page) {
@@ -810,6 +827,7 @@ void _mi_page_publish_retired(mi_page_t* page) {
   mi_assert_internal(page->retired_slot == NULL);
   if (page->retired_slot != NULL) return;
   mi_tld_t* const tld = mi_page_theap(page)->tld;
+  mi_assert_internal(mi_retired_mask_covers_slots(tld));
   // Only the owner ever fills or empties a slot (the scavenger borrows one for a discard and puts
   // the same page back), so an owner-private mask knows which are free without reading the slots
   // -- cache lines the scavenger also touches: scanning them was ~60% of this function's samples
@@ -838,6 +856,8 @@ void _mi_page_publish_retired(mi_page_t* page) {
   page->retired_at = 0;         // unstamped: the scavenger stamps it when it first sees the page (#544)
   page->retired_slot = slot;
   mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
+  MI_EVENT(MI_EVENT_RETIRED_PUBLISH);   // (#573)
+  MI_PROBE1(retired_publish, page->block_size);
   _mi_pages_release_schedule(mi_page_subproc(page));
 }
 
@@ -851,7 +871,7 @@ void _mi_pages_release_schedule(mi_subproc_t* subproc) {
 
 // Take a published page back from the scavenger for good: before a block is formed in it or it
 // is returned to the arena. If the scavenger holds the slot, that is for one discard only.
-void _mi_page_unpublish_retired(mi_page_t* page) {
+void _mi_page_unpublish_retired(mi_page_t* page, mi_tld_t* owner_tld) {
   _Atomic(mi_page_t*)* const slot = page->retired_slot;
   if (slot == NULL) return;
   mi_page_t* expected = page;
@@ -861,14 +881,20 @@ void _mi_page_unpublish_retired(mi_page_t* page) {
     _mi_prim_thread_yield();
   }
   page->retired_slot = NULL;
+  MI_EVENT(MI_EVENT_RETIRED_UNPUBLISH);   // (#573)
   page->retired_at = 0;   // #493: a non-zero stamp on an unpublished page marks a reserved one
   // Clear the slot's bit in the owner's mask. `_mi_page_free` clears `page->theap` before the page
   // reaches `_mi_arenas_page_free`, where it is unpublished; unpublishing is owner-side, so the
   // calling thread's tld is the owner's then. Missing that path leaked every bit: after 16
   // publishes nothing was published again, and idle RSS rose +225% to +1989% (perf-ab).
-  mi_theap_t* theap = page->theap;   // (raw: `mi_page_theap` asserts on an abandoned page)
-  if (theap == NULL) { theap = _mi_theap_default(); }
-  mi_tld_t* const tld = (theap != NULL ? theap->tld : NULL);
+  // (#573: a caller that knows the owner's tld says so; the fallbacks below are the heuristic that
+  // needed the comment above)
+  mi_tld_t* tld = owner_tld;
+  if (tld == NULL) {
+    mi_theap_t* theap = page->theap;   // (raw: `mi_page_theap` asserts on an abandoned page)
+    if (theap == NULL) { theap = _mi_theap_default(); }
+    tld = (theap != NULL ? theap->tld : NULL);
+  }
   if (tld != NULL && slot >= &tld->retired_pages[0] && slot < &tld->retired_pages[MI_RETIRED_PAGE_SLOTS]) {
     tld->retired_used &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
   }
@@ -882,7 +908,7 @@ void _mi_page_unpublish_retired(mi_page_t* page) {
 void _mi_theap_unpublish_retired(mi_theap_t* theap) {
   for (size_t bin = 0; bin <= MI_BIN_FULL; bin++) {
     for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
-      if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+      if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page, theap->tld); }
     }
   }
 }
@@ -922,7 +948,7 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
           // release can come at most one scavenger wake-up later, never earlier.
           if (page->retired_at == 0) { page->retired_at = (now != 0 ? now : 1); pending = true; }
           else if (now - page->retired_at < min_age) { pending = true; }
-          else { mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
+          else { MI_PROBE1(retired_release, page->block_size); mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
         }
         mi_atomic_store_ptr_release(mi_page_t, slot, page);
       }
@@ -1216,6 +1242,14 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   if (bs == 0 || cap > MI_HOLES_MAX_CAP) return;
   mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
   r->pages++;
+  if (page->used == 0) { r->empty_pages++; }   // #573 A3
+  if (page->retire_expire != 0 && page->used == 0) {
+    r->retired_pages++;
+    size_t area_size = 0;
+    const uint8_t* const area = mi_page_area(page, &area_size);
+    const size_t resident = _mi_diag_resident_bytes(area, area_size);
+    if (resident != SIZE_MAX) { r->retired_resident_bytes += resident; }
+  }
   if (bs > r->block_size) { r->block_size = bs; }
   rep->total_pages++;
   rep->page_committed_bytes += mi_page_committed(page);
@@ -1356,6 +1390,16 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
   mi_holes_mb(total.pinned_free_bytes, spfree, sizeof(spfree));
   mi_holes_mb(total.pinned_live_bytes, splive, sizeof(splive));
   _mi_fprintf(NULL, NULL, "  live %s MB, free %s MB\n", slive, sfree);
+  // #573 A3: per bin, the pages with no live block, those retired for reuse (#483), and the RAM
+  // those hold (`mincore`) -- the "one retired empty page per large bin" of #572
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->empty_pages == 0 && r->retired_pages == 0) continue;
+    char sres[32];
+    mi_holes_mb(r->retired_resident_bytes, sres, sizeof(sres));
+    _mi_fprintf(NULL, NULL, "  bin %zu (%zu B): %zu pages, %zu empty, %zu retired holding %s MB resident\n",
+                bin, r->block_size, r->pages, r->empty_pages, r->retired_pages, sres);
+  }
   _mi_fprintf(NULL, NULL, "  %zu pinned OS pages (>= 1 live block): %s MB live + %s MB free trapped in them\n",
               total.pinned_ospages, splive, spfree);
 
@@ -1512,4 +1556,5 @@ void mi_purge_holes_report(void) mi_attr_noexcept {
   mi_holes_report_t rep;
   _mi_purge_holes_report_collect(&rep);
   _mi_page_holes_report_print(&rep);
+  _mi_event_print();   // #573 A2
 }

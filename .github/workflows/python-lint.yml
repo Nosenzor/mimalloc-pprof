@@ -77,6 +77,22 @@ jobs:
           set -euo pipefail
           python3 ci/check_no_diagnostic_suppression.py --selftest
           python3 ci/check_no_diagnostic_suppression.py
+      # #573: a page's geometry changes in one place only (it owns the page-map re-registration),
+      # and the structs at a size-class edge stay within ci/struct_size_budget.json.
+      - name: Page geometry writes and struct size budget
+        run: |
+          set -euo pipefail
+          python3 ci/check_page_geometry_writes.py --selftest
+          python3 ci/check_page_geometry_writes.py
+          python3 ci/check_struct_sizes.py --selftest
+          python3 ci/check_struct_sizes.py
+      # #573 A5: the USDT probes are emitted when asked for (MI_USDT=1) and never otherwise.
+      - name: USDT probes are emitted, and only when asked for
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends systemtap-sdt-dev binutils
+          python3 ci/check_usdt_probes.py --selftest
+          python3 ci/check_usdt_probes.py --require
       # Macros are UPPER_CASE; ci/macro_case_baseline.txt grandfathers the inherited ones.
       - name: Macro names are upper case
         run: |

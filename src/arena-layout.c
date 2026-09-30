@@ -52,6 +52,42 @@
 #include "mimalloc/internal.h"
 #include "bitmap.h"   // mi_bbitmap_is_setN, mi_bitmap_is_set, mi_bbitmap_debug_get_bin
 
+#if !defined(_WIN32) && !defined(__wasi__) && MI_DIAGNOSTICS
+#include <sys/mman.h>   // mincore (#573 A3)
+#define MI_DIAG_RESIDENT  1
+#else
+#define MI_DIAG_RESIDENT  0
+#endif
+
+// #573 A3: the bytes of [start, start+size) resident in RAM now, by `mincore`, or SIZE_MAX when
+// this platform or build cannot say. An unmapped or reserved-only range counts as 0. Untimed
+// diagnostics only: one syscall per MI_DIAG_RESIDENT_PAGES pages, no allocation (a fixed buffer
+// on the stack).
+#ifndef MI_DIAG_RESIDENT_PAGES
+#define MI_DIAG_RESIDENT_PAGES  (256)
+#endif
+
+size_t _mi_diag_resident_bytes(const void* start, size_t size) {
+  #if MI_DIAG_RESIDENT
+  const size_t psize = _mi_os_page_size();
+  const uintptr_t lo = _mi_align_down((uintptr_t)start, psize);
+  const uintptr_t hi = _mi_align_up((uintptr_t)start + size, psize);
+  size_t resident = 0;
+  unsigned char vec[MI_DIAG_RESIDENT_PAGES];
+  for (uintptr_t at = lo; at < hi; ) {
+    const size_t pages = ((hi - at) / psize < MI_DIAG_RESIDENT_PAGES ? (hi - at) / psize : MI_DIAG_RESIDENT_PAGES);
+    if (mincore((void*)at, pages * psize, vec) == 0) {
+      for (size_t i = 0; i < pages; i++) { if ((vec[i] & 1) != 0) { resident += psize; } }
+    }   // (else: not mapped -- ENOMEM -- so nothing of it is resident)
+    at += pages * psize;
+  }
+  return resident;
+  #else
+  MI_UNUSED(start); MI_UNUSED(size);
+  return SIZE_MAX;
+  #endif
+}
+
 // The `run_hist` bucket of a run of `run_slices` slices: floor(log2(run_slices)), so bucket b
 // holds the lengths [2^b, 2^(b+1)). Needs no build flag: it is pure arithmetic.
 size_t _mi_arena_layout_bucket(size_t run_slices) {
@@ -70,8 +106,13 @@ static mi_arena_layout_kind_t mi_arena_layout_kind_at(mi_arena_t* arena, size_t 
   return MI_ARENA_LAYOUT_FRESH;
 }
 
-static void mi_arena_layout_add_run(mi_arena_layout_class_t* cls, mi_arena_layout_kind_t kind, size_t run_slices) {
+static void mi_arena_layout_add_run(mi_arena_t* arena, mi_arena_layout_class_t* cls, mi_arena_layout_kind_t kind, size_t run_start, size_t run_slices) {
   if (run_slices == 0) return;
+  // #573 A3: what is resident in RAM of this run, whatever its bitmap class says -- a "fresh" slice
+  // can be resident (THP faulted its 2 MiB region in), and that is the finding it exists to show
+  const uint8_t* const lo = mi_arena_slice_start(arena, run_start);
+  const size_t resident = _mi_diag_resident_bytes(lo, (size_t)(mi_arena_slice_end(arena, run_start + run_slices) - lo));
+  if (resident != SIZE_MAX) { cls->resident_bytes[kind] += resident; }
   cls->runs[kind]++;
   cls->run_hist[kind][_mi_arena_layout_bucket(run_slices)]++;
   if (run_slices > cls->max_run[kind]) { cls->max_run[kind] = run_slices; }
@@ -97,6 +138,7 @@ static void mi_arena_layout_walk_arena(mi_arena_t* arena, mi_arena_layout_t* out
 
     mi_arena_layout_kind_t run_kind = MI_ARENA_LAYOUT_IN_USE;
     size_t run_slices = 0;
+    size_t run_start = start;
     for (size_t i = start; i < end; i++) {
       const mi_arena_layout_kind_t kind = mi_arena_layout_kind_at(arena, i);
       cls->slices[kind]++;
@@ -105,12 +147,13 @@ static void mi_arena_layout_walk_arena(mi_arena_t* arena, mi_arena_layout_t* out
         run_slices++;
       }
       else {
-        mi_arena_layout_add_run(cls, run_kind, run_slices);
+        mi_arena_layout_add_run(arena, cls, run_kind, run_start, run_slices);
         run_kind = kind;
         run_slices = 1;
+        run_start = i;
       }
     }
-    mi_arena_layout_add_run(cls, run_kind, run_slices);   // runs never cross a chunk
+    mi_arena_layout_add_run(arena, cls, run_kind, run_start, run_slices);   // runs never cross a chunk
   }
 }
 
@@ -118,6 +161,7 @@ bool _mi_arena_layout_walk(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_la
   if (out == NULL) return false;
   _mi_memzero(out, sizeof(*out));
   if (subproc == NULL) return false;
+  out->resident_known = (MI_DIAG_RESIDENT != 0);
   if (arena != NULL) {
     if (arena->subproc != subproc) return false;
     mi_arena_layout_walk_arena(arena, out);
@@ -168,6 +212,20 @@ void _mi_arena_layout_print(const mi_arena_layout_t* layout) {
     _mi_fprintf(NULL, NULL, "    %-7s %7zu %10s %10s %10s %10s %10s\n", mi_arena_layout_class_name[c], cls->chunks,
                 s[MI_ARENA_LAYOUT_IN_USE], s[MI_ARENA_LAYOUT_FRESH], s[MI_ARENA_LAYOUT_FREE_DIRTY],
                 s[MI_ARENA_LAYOUT_QUEUED], s[MI_ARENA_LAYOUT_QUEUED_AGED]);
+  }
+  if (layout->resident_known) {
+    // #573 A3: resident RAM (`mincore`) per kind, next to what the bitmaps say
+    char r[MI_ARENA_LAYOUT_KIND_COUNT][32];
+    size_t total[MI_ARENA_LAYOUT_KIND_COUNT] = { 0 };
+    for (size_t c = 0; c < MI_CBIN_COUNT; c++) {
+      for (size_t k = 0; k < MI_ARENA_LAYOUT_KIND_COUNT; k++) { total[k] += layout->cls[c].resident_bytes[k]; }
+    }
+    for (size_t k = 0; k < MI_ARENA_LAYOUT_KIND_COUNT; k++) {
+      _mi_snprintf(r[k], sizeof(r[k]), "%zu.%02zu", total[k] / MI_MiB, ((total[k] % MI_MiB) * 100) / MI_MiB);
+    }
+    _mi_fprintf(NULL, NULL, "    resident (mincore): in use %s MB, fresh %s MB, free_dirty %s MB, queued %s MB, aged %s MB\n",
+                r[MI_ARENA_LAYOUT_IN_USE], r[MI_ARENA_LAYOUT_FRESH], r[MI_ARENA_LAYOUT_FREE_DIRTY],
+                r[MI_ARENA_LAYOUT_QUEUED], r[MI_ARENA_LAYOUT_QUEUED_AGED]);
   }
   _mi_fprintf(NULL, NULL, "    runs per class and kind (a run never crosses a chunk): count, longest, then length:count by power of two\n");
   for (size_t c = 0; c < MI_CBIN_COUNT; c++) {

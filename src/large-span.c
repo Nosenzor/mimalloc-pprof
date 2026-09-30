@@ -103,7 +103,7 @@ static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, si
     // a page of the bin filled up since its last request: demand beyond what the theap holds
     pressure++;
     if (pressure >= MI_LARGE_SPAN_GROW_REQUESTS) {
-      if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; }
+      if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; MI_EVENT(MI_EVENT_LARGE_SPAN_GROW); }   // (#573)
       pressure = 0;
     }
   }
@@ -112,6 +112,7 @@ static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, si
     pressure--;
     if (pressure <= -MI_LARGE_SPAN_DECAY_REQUESTS) {
       level--;
+      MI_EVENT(MI_EVENT_LARGE_SPAN_SHRINK);   // (#573)
       pressure = 0;
     }
   }
