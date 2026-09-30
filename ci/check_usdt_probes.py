@@ -82,8 +82,8 @@ def check(require: bool) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         on = compile_and_read(cc, readelf, ["-DMI_USDT=1"], Path(tmp))
         off = compile_and_read(cc, readelf, [], Path(tmp))
-    problems = []
-    if on != EXPECTED:
+    problems: list[str] = []
+    if on != set(EXPECTED):
         problems.append(f"MI_USDT=1 emits {sorted(on)}, expected {sorted(EXPECTED)}")
     if off:
         problems.append(f"the default build emits probes: {sorted(off)}")
