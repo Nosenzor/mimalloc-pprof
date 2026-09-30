@@ -37,6 +37,7 @@ import re
 import statistics
 import subprocess
 import tempfile
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -66,7 +67,11 @@ BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
     "diags": (["-DMI_DIAGNOSTICS=ON"], {}),
 }
 HOLES_KIND = "diags"
-HOLES_ENV = {"PERF_AB_HOLES_REPORT": "1"}
+# #573 A1: the untimed replay also counts (MI_STAT=1) and prints (MIMALLOC_SHOW_STATS) the
+# allocator's own statistics -- pages, abandoned, reclaims, retires -- for both arms, so a row's
+# cost is explained by event counts, not only by timing. Untimed, so nothing is perturbed.
+KIND_CPPDEFS = {HOLES_KIND: ["MI_STAT=1"]}
+HOLES_ENV = {"PERF_AB_HOLES_REPORT": "1", "MIMALLOC_SHOW_STATS": "1"}
 
 
 class Params(NamedTuple):
@@ -205,8 +210,9 @@ def holes_rows(reports: dict[tuple[str, str], str]) -> list[str]:
     rows = [
         "",
         "Allocator-internal snapshot (`--holes-report`, #529): one untimed run per row and arm in "
-        "an MI_DIAGNOSTICS=ON build; every worker's `mi_purge_holes_report()` once all workers "
-        "finished their stream, while each still holds its live slots.",
+        "an MI_DIAGNOSTICS=ON, MI_STAT=1 build; every worker's `mi_purge_holes_report()` once all "
+        "workers finished their stream, while each still holds its live slots, then the "
+        "allocator's statistics at exit (`MIMALLOC_SHOW_STATS`, #573).",
     ]
     for (workload, arm), text in reports.items():
         rows += [
@@ -231,7 +237,8 @@ def build(
     tree, out = work / f"src-{arm}", work / f"bin-{arm}-{kind}"
     if not tree.exists():
         run(["git", "worktree", "add", "--detach", str(tree), ref], cwd=ROOT)
-    extra = [f"-DMI_EXTRA_CPPDEFS={';'.join(cppdefs)}"] if cppdefs else []
+    defs = [*KIND_CPPDEFS.get(kind, []), *cppdefs]
+    extra = [f"-DMI_EXTRA_CPPDEFS={';'.join(defs)}"] if defs else []
     run(["cmake", "-S", str(tree), "-B", str(out), *FLAGS, *BUILDS[kind][0], *extra])
     run(["cmake", "--build", str(out), "--target", "mimalloc-static", "--parallel"])
     exe = out / "perf_ab"
@@ -251,6 +258,33 @@ def build(
         ]
     )
     return exe
+
+
+# #573 B2: the first repetition of every row doubles as a sanity screen. A head arm whose memory
+# is a multiple of base's is a bug, not noise (the slot-mask leak of #572 showed RSS at the
+# release bound +1989% and the job still passed); noise on a 1-rep sample is far below this.
+SANITY_FACTOR = 1.5
+SANITY_SLACK_MIB = 8.0
+
+
+def sanity_failures(
+    first: dict[tuple[str, str], list[float]],
+    workloads: Iterable[str],
+    factor: float = SANITY_FACTOR,
+    slack_mib: float = SANITY_SLACK_MIB,
+) -> list[str]:
+    """Rows whose head RSS in the first repetition exceeds factor x base + slack_mib."""
+    failures: list[str] = []
+    for workload in workloads:
+        for metric in sorted(IN_MIB):
+            index = METRICS.index(metric)
+            base, head = first[(workload, "base")][index], first[(workload, "head")][index]
+            if head > factor * base + slack_mib:
+                failures.append(
+                    f"{workload}: {metric} {base:,.1f} -> {head:,.1f} "
+                    f"(more than {factor}x base + {slack_mib:g} MiB)"
+                )
+    return failures
 
 
 def percent(b: float, h: float) -> float:
@@ -404,6 +438,12 @@ def main() -> int:
         help="defines (';' or space separated) the head arm's library is built with, as "
         "-DMI_EXTRA_CPPDEFS, e.g. MI_ENABLE_LARGE_PAGES=0",
     )
+    parser.add_argument(
+        "--no-sanity-gate",
+        action="store_true",
+        help=f"do not stop after the first repetition when a head RSS metric exceeds "
+        f"{SANITY_FACTOR}x base + {SANITY_SLACK_MIB:g} MiB (#573)",
+    )
     args = parser.parse_args()
     head_env = parse_env(args.head_env)
     cppdefs = parse_cppdefs(args.head_cppdefs)
@@ -446,6 +486,16 @@ def main() -> int:
                             if metric in IN_MIB:
                                 values[index] /= 2**20
                         samples[(workload, arm)].append(values)
+                if rep == 0 and not args.no_sanity_gate:
+                    broken = sanity_failures(
+                        {key: value[0] for key, value in samples.items()}, workloads
+                    )
+                    if broken:  # fail in minutes, not after the whole run (#573)
+                        message = "sanity gate (first repetition, #573):\n  " + "\n  ".join(broken)
+                        print(message)
+                        if args.summary:
+                            args.summary.write_text(message + "\n")
+                        return 1
             reports: dict[tuple[str, str], str] = {}
             if args.holes_report:  # untimed, after every timed rep
                 for workload, (_kind, params) in workloads.items():

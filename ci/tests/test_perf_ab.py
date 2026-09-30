@@ -296,3 +296,61 @@ def test_workflow_passes_holes_report_as_a_flag() -> None:
     step = workflow["jobs"]["ab"]["steps"][-1]
     assert step["env"]["HOLES_REPORT"] == "${{ inputs.holes_report && '--holes-report' || '' }}"
     assert " $HOLES_REPORT " in step["run"]
+
+
+def _first(base: list[float], head: list[float]) -> dict[tuple[str, str], list[float]]:
+    return {("row", "base"): base, ("row", "head"): head}
+
+
+def _metrics(**mib: float) -> list[float]:
+    values = [1.0] * len(perf_ab.METRICS)
+    for metric, value in mib.items():
+        values[perf_ab.METRICS.index(metric.replace("_", " "))] = value
+    return values
+
+
+def test_sanity_gate_flags_a_memory_leak_the_release_bound_hid() -> None:
+    # #572: RSS at the release bound reached +1989% while the job passed
+    base = _metrics(**{"RSS_at_release_bound_MiB": 10.0})
+    head = _metrics(**{"RSS_at_release_bound_MiB": 209.0})
+    failures = perf_ab.sanity_failures(_first(base, head), ["row"])
+    assert len(failures) == 1 and "RSS at release bound MiB" in failures[0]
+
+
+def test_sanity_gate_passes_noise_and_the_slack_floor() -> None:
+    base = _metrics(**{"peak_RSS_MiB": 100.0, "RSS_0.5_s_after_drain_MiB": 1.0})
+    # +40% on a large base and +7 MiB on a tiny base are both inside the gate
+    head = _metrics(**{"peak_RSS_MiB": 140.0, "RSS_0.5_s_after_drain_MiB": 8.0})
+    assert perf_ab.sanity_failures(_first(base, head), ["row"]) == []
+
+
+def test_sanity_gate_ignores_cpu_and_throughput() -> None:
+    base = _metrics()
+    head = _metrics()
+    head[perf_ab.METRICS.index("cpu s")] = 50.0
+    head[perf_ab.METRICS.index("ops/s")] = 0.001
+    assert perf_ab.sanity_failures(_first(base, head), ["row"]) == []
+
+
+def test_replay_build_counts_events_and_prints_them() -> None:
+    # #573 A1: the untimed replay carries MI_STAT=1 and asks for the statistics at exit
+    assert "MI_STAT=1" in perf_ab.KIND_CPPDEFS[perf_ab.HOLES_KIND]
+    assert perf_ab.HOLES_ENV["MIMALLOC_SHOW_STATS"] == "1"
+    # ... and only there: a timed build is not perturbed
+    assert set(perf_ab.KIND_CPPDEFS) == {perf_ab.HOLES_KIND}
+
+
+def test_workflow_gates_and_cancels_per_pr() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    inputs = workflow[True]["workflow_dispatch"]["inputs"]
+    assert inputs["sanity_gate"]["default"] is True
+    assert inputs["head_sha"]["default"] == ""
+    assert workflow["concurrency"]["cancel-in-progress"] is True
+    # another label's (skipped) run must not share the group of a live perf-ab run
+    assert "github.event.label.name != 'perf-ab'" in workflow["concurrency"]["group"]
+    condition = workflow["jobs"]["ab"]["if"]
+    assert "github.event.label.name == 'perf-ab'" in condition
+    step = workflow["jobs"]["ab"]["steps"][-1]
+    assert step["env"]["NO_SANITY_GATE"].endswith("'--no-sanity-gate' || '' }}")
+    assert " $NO_SANITY_GATE " in step["run"]
+    assert "${{" not in step["run"]

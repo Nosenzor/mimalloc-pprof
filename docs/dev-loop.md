@@ -113,6 +113,31 @@ If Docker Desktop is unavailable, the documented fallback is a host-side soldr
 cross-build followed by a slim Linux runtime container. It is slower because
 the build runs on the Windows filesystem; run the Docker recovery tool first.
 
+## Explaining an allocator change before timing it (#573)
+
+Explain a memory or CPU change with event counts and residency first, and use `perf-ab` to
+confirm it, not to explore. The safety nets that make that cheap:
+
+- **Stats in the untimed replay.** A `perf-ab` dispatch with `holes_report` builds the replay
+  with `MI_DIAGNOSTICS=ON` and `MI_STAT=1` and sets `MIMALLOC_SHOW_STATS=1`, so each row and arm
+  prints the pages, abandoned, reclaim and retire counters next to `mi_purge_holes_report()`.
+  Nothing timed is perturbed.
+- **First-repetition sanity gate.** Repetition 0 of every row is compared before the rest run.
+  A head arm whose peak RSS, RSS after drain or RSS at the release bound exceeds
+  `1.5 x base + 8 MiB` fails the job at once (`SANITY_FACTOR`, `SANITY_SLACK_MIB` in
+  `ci/perf_ab.py`). A dispatch that is meant to trade memory away sets `sanity_gate: false`.
+- **One live run per PR.** `perf-ab` cancels its older run on a new push, and only the
+  `perf-ab` label itself starts a run. `head_sha` dispatches a commit other than the ref the
+  workflow runs from.
+- **Page-map check.** At `MI_DEBUG>=2`, `_mi_page_init` asserts that the page map resolves the
+  first byte and the last byte of a page's blocks to that page. A re-carve that changes a page's
+  geometry without re-registering it fails on the first local debug ctest, not in a
+  multi-threaded perf run. `test-large-span` case (g2) re-carves every ordered pair of large
+  sizes on one thread at a time.
+- **`mi_theap_t` size budget.** `MI_THEAP_META_MAX_SIZE` (types.h) is a compile-time budget on
+  `sizeof(mi_theap_t) + MI_PADDING_SIZE`: the meta-allocator size class it sits in is the edge
+  that made CI ASan `test-resident-first-churn` flaky. Put new per-thread state in `mi_tld_t`.
+
 ## Memory gate: fast local loop (#517)
 
 Memory measurements are fine to take locally: a peak RSS on this box is stable to about
