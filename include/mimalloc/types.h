@@ -377,6 +377,16 @@ terms of the MIT license. A copy of the license can be found in the file
 #ifndef MI_LARGE_SPAN_COMPACT_SLICES
 #define MI_LARGE_SPAN_COMPACT_SLICES      (16)
 #endif
+// #575: the largest span a bin's page grows to (KiB; `mi_option_large_span_max`, MIMALLOC_LARGE_SPAN_MAX).
+// Every thread keeps one page per large bin it uses and each is resident in full once it has held its
+// blocks (a page carved over resident slices keeps the old tenant's bytes), so 4 MiB spans made a
+// thread that cycles 96-512 KiB blocks hold ~19 MiB for 1.3 MiB live (large-class/8: 154 MiB against
+// jemalloc's 61). 1 MiB keeps two blocks of every large bin; a bin that needs more blocks uses more
+// pages, and repurposing (MI_LARGE_REPURPOSE_PER_TICK) moves them between bins. 0 = MI_LARGE_PAGE_SIZE
+// (the #532 behaviour); `-DMI_LARGE_SPAN_MAX_KIB=0` builds that in.
+#ifndef MI_LARGE_SPAN_MAX_KIB
+#define MI_LARGE_SPAN_MAX_KIB             (1024)
+#endif
 // each demand step multiplies the span by 2^MI_LARGE_SPAN_GROW_SHIFT (1: 1 -> 2 -> 4 MiB)
 #ifndef MI_LARGE_SPAN_GROW_SHIFT
 #define MI_LARGE_SPAN_GROW_SHIFT          (1)
@@ -707,11 +717,15 @@ typedef struct mi_page_s {
 #define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
 #endif
 // #530: how many retired large pages a thread may repurpose per heartbeat (every 1000 generic
-// mallocs). Each take can make the donor bin take another's in turn: a hot large-class workload
-// re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
-// one it needs.
+// mallocs). Each take can make the donor bin take another's in turn (a cascade of re-carves: a page
+// re-init, no fault and no purge, so it costs no resident byte). #530 bounded it at 64 after a hot
+// large-class workload re-carved 469K pages (+16% CPU); #575 measured what the bound costs in
+// memory: a bin without a page then opens a fresh 1-4 MiB one while every other bin's retired page
+// stays resident, so large-class/8 kept ~10 pages per worker for ~8 live blocks. Raised to 1024, at
+// which large-class/8 and sparse-large-buffers/8 lose 18% and 29% of their peak (untimed probe).
+// `-DMI_LARGE_REPURPOSE_PER_TICK=64` restores the #530 bound.
 #ifndef MI_LARGE_REPURPOSE_PER_TICK
-#define MI_LARGE_REPURPOSE_PER_TICK       (64)
+#define MI_LARGE_REPURPOSE_PER_TICK       (1024)
 #endif
 // ... and the budget a new thread starts with, before its first heartbeat
 // ... and whether a bin with abandoned pages (typically an exited thread's) reclaims those first

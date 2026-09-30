@@ -63,6 +63,11 @@ void _mi_event_print(void) {
     any = true;
   }
   if (any) { _mi_fprintf(NULL, NULL, "\n"); }
+  mi_arena_claim_counters_t c;
+  if (_mi_arena_claim_counters(&c)) {
+    _mi_fprintf(NULL, NULL, "arena claims (#517): resident_first=%zu/%zu plain_reused=%zu/%zu plain_fresh=%zu/%zu (claims/slices)\n",
+      c.resident_first_claims, c.resident_first_slices, c.plain_reused_claims, c.plain_reused_slices, c.plain_fresh_claims, c.plain_fresh_slices);
+  }
 }
 
 #else  // !MI_DIAGNOSTICS: the query functions stay, `MI_EVENT` is nothing
