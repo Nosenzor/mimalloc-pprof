@@ -18,6 +18,8 @@ name: perf-ab
 # (one PR, one live run), and only the `perf-ab` label itself starts a run: another label
 # (ci-test, ci-full, ...) used to start a second and third run on the same SHA, each on a
 # different CPU model. `head_sha` dispatches a head that is not the ref the workflow runs from.
+# `null_arm`, `max_reps` and the raw-samples artifact are #573 B3, B6 and B4; several head variants
+# (`head_env` / `head_cppdefs` split on ' || ') run as one rotation on one VM (B5).
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -51,6 +53,14 @@ on:
         description: "After the timed reps, one untimed MI_DIAGNOSTICS=ON run per row and arm printing every worker's mi_purge_holes_report() and the allocator's statistics (#529, #573)"
         type: boolean
         default: false
+      null_arm:
+        description: "Measure base a second time in the rotation: its base-vs-base intervals are the per-cell noise floor (#573 B3); costs one more arm of runner time"
+        type: boolean
+        default: false
+      max_reps:
+        description: "Adaptive reps (#573 B6): after `reps`, add 5 at a time to the rows whose rule-12 ledger is still INCONCLUSIVE, up to this many (0 = none)"
+        type: string
+        default: "0"
       sanity_gate:
         description: "Fail after the first repetition when a head RSS metric exceeds 1.5x base + 8 MiB (#573); turn off for a knob that is meant to trade memory away"
         type: boolean
@@ -88,4 +98,16 @@ jobs:
           HEAD_CPPDEFS: ${{ inputs.head_cppdefs }}
           HOLES_REPORT: ${{ inputs.holes_report && '--holes-report' || '' }}
           NO_SANITY_GATE: ${{ inputs.sanity_gate == false && '--no-sanity-gate' || '' }}
-        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE --summary "$GITHUB_STEP_SUMMARY"
+          NULL_ARM: ${{ inputs.null_arm && '--null-arm' || '' }}
+          MAX_REPS: ${{ inputs.max_reps || '0' }}
+        run: python3 ci/perf_ab.py --base "$BASE_REF" --head HEAD --reps "$REPS" --max-reps "$MAX_REPS" --workloads "$WORKLOADS" --head-env "$HEAD_ENV" --head-cppdefs "$HEAD_CPPDEFS" $HOLES_REPORT $NO_SANITY_GATE $NULL_ARM --json perf-ab-samples.json --summary "$GITHUB_STEP_SUMMARY"
+      # the raw per-repetition samples (#573 B4): ci/perf_ab_dispatch.py and ci/perf_ab_ledger.py
+      # re-judge them, and runs on the same CPU model can be pooled
+      - name: upload the samples
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: perf-ab-samples
+          path: perf-ab-samples.json
+          if-no-files-found: ignore
+          retention-days: 30
