@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 063120df of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3fa3726a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -713,6 +713,7 @@ typedef enum mi_option_e {
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
+  mi_option_large_span_max,             // the largest span (KiB) a demand-grown large page grows to (=1024: 1 MiB, two blocks of every large bin). 0 = 4 MiB (the #532 policy); a page always holds at least two blocks (#575)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2783,6 +2784,16 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #ifndef MI_LARGE_SPAN_COMPACT_SLICES
 #define MI_LARGE_SPAN_COMPACT_SLICES      (16)
 #endif
+// #575: the largest span a bin's page grows to (KiB; `mi_option_large_span_max`, MIMALLOC_LARGE_SPAN_MAX).
+// Every thread keeps one page per large bin it uses and each is resident in full once it has held its
+// blocks (a page carved over resident slices keeps the old tenant's bytes), so 4 MiB spans made a
+// thread that cycles 96-512 KiB blocks hold ~19 MiB for 1.3 MiB live (large-class/8: 154 MiB against
+// jemalloc's 61). 1 MiB keeps two blocks of every large bin; a bin that needs more blocks uses more
+// pages, and repurposing (MI_LARGE_REPURPOSE_PER_TICK) moves them between bins. 0 = MI_LARGE_PAGE_SIZE
+// (the #532 behaviour); `-DMI_LARGE_SPAN_MAX_KIB=0` builds that in.
+#ifndef MI_LARGE_SPAN_MAX_KIB
+#define MI_LARGE_SPAN_MAX_KIB             (1024)
+#endif
 // each demand step multiplies the span by 2^MI_LARGE_SPAN_GROW_SHIFT (1: 1 -> 2 -> 4 MiB)
 #ifndef MI_LARGE_SPAN_GROW_SHIFT
 #define MI_LARGE_SPAN_GROW_SHIFT          (1)
@@ -3113,11 +3124,15 @@ typedef struct mi_page_s {
 #define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
 #endif
 // #530: how many retired large pages a thread may repurpose per heartbeat (every 1000 generic
-// mallocs). Each take can make the donor bin take another's in turn: a hot large-class workload
-// re-carved 469K pages (+16% CPU) unbounded; a workload with rare large-page events takes every
-// one it needs.
+// mallocs). Each take can make the donor bin take another's in turn (a cascade of re-carves: a page
+// re-init, no fault and no purge, so it costs no resident byte). #530 bounded it at 64 after a hot
+// large-class workload re-carved 469K pages (+16% CPU); #575 measured what the bound costs in
+// memory: a bin without a page then opens a fresh 1-4 MiB one while every other bin's retired page
+// stays resident, so large-class/8 kept ~10 pages per worker for ~8 live blocks. Raised to 1024, at
+// which large-class/8 and sparse-large-buffers/8 lose 18% and 29% of their peak (untimed probe).
+// `-DMI_LARGE_REPURPOSE_PER_TICK=64` restores the #530 bound.
 #ifndef MI_LARGE_REPURPOSE_PER_TICK
-#define MI_LARGE_REPURPOSE_PER_TICK       (64)
+#define MI_LARGE_REPURPOSE_PER_TICK       (1024)
 #endif
 // ... and the budget a new thread starts with, before its first heartbeat
 // ... and whether a bin with abandoned pages (typically an exited thread's) reclaims those first
@@ -6319,6 +6334,7 @@ typedef struct mi_arena_layout_s {
 // #573 A3: the bytes of [start, start+size) resident in RAM now, or SIZE_MAX when the platform
 // cannot say. Diagnostics only (a syscall per call): the layout walk and the holes report.
 size_t        _mi_diag_resident_bytes(const void* start, size_t size);
+bool          _mi_diag_resident_map(const void* start, size_t npages, unsigned char* vec);   // #575
 uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);   // src/arena.c: the slice must exist
 uint8_t*      mi_arena_slice_end(mi_arena_t* arena, size_t slice_end);       // src/arena.c: one past a range; may be the arena's end (#573)
 
@@ -6331,6 +6347,13 @@ void          _mi_arena_layout_print(const mi_arena_layout_t* layout);
 
 #define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
 #define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
+
+// #575: what a resident byte of a page is
+#define MI_HOLES_RES_LIVE      (0)   // inside an allocated block
+#define MI_HOLES_RES_FREE      (1)   // inside a formed free block (free-listed)
+#define MI_HOLES_RES_UNFORMED  (2)   // inside a block not formed yet (`capacity <= idx < reserved`)
+#define MI_HOLES_RES_SLACK     (3)   // in the page's slices but outside `reserved * block_size` (header, geometry slack)
+#define MI_HOLES_RES_COUNT     (4)
 
 typedef struct mi_holes_bin_s {
   size_t block_size;           // the largest block size seen in this bin
@@ -6350,6 +6373,12 @@ typedef struct mi_holes_bin_s {
   size_t pinned_free_bytes;    // free bytes trapped inside those pinned OS pages
   size_t pinned_live_bytes;    // live bytes inside those pinned OS pages
   size_t hist[MI_HOLES_HIST_BUCKETS];
+  // #575: RESIDENT bytes of this bin's pages (`mincore`, whole page extent), split by what the bytes
+  // are. Index 0: pages with a live block; 1: empty pages (retired or not).
+  size_t res[2][MI_HOLES_RES_COUNT];
+  size_t res_extent;           // #575: the bytes of address space the bin's pages span
+  size_t res_formed[2];        // #575: bytes of formed blocks (`capacity * block_size`), [0] used pages, [1] empty ones
+  size_t res_reserved[2];      // #575: bytes of the block area (`reserved * block_size`), same split
 } mi_holes_bin_t;
 
 typedef struct mi_holes_report_s {
@@ -23015,6 +23044,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(large_span) }             // #532: demand-sized large-page spans (MIMALLOC_LARGE_SPAN); 0 = every large page is MI_LARGE_PAGE_SIZE
+  ,{ MI_LARGE_SPAN_MAX_KIB, MI_OPTION_UNINIT, MI_OPTION(large_span_max) }   // #575: largest demand-grown span in KiB (MIMALLOC_LARGE_SPAN_MAX); 0 = MI_LARGE_PAGE_SIZE
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -28331,6 +28361,65 @@ static void mi_page_holes_granularity_curve(const mi_page_t* page, const uint64_
   }
 }
 
+
+// #575 (#422 Step 0): split the RESIDENT bytes of this page's whole slice extent (`mincore`, so a
+// THP fault-around neighbour counts like any other resident byte) by what each byte is: inside a
+// live block, a formed free block, a block not formed yet, or outside `reserved * block_size`
+// (header and geometry slack). Read-only, untimed, diagnostics only. `freelisted` is NULL for a
+// page with no formed block.
+#ifndef MI_HOLES_RES_CHUNK_PAGES
+#define MI_HOLES_RES_CHUNK_PAGES  (1024)
+#endif
+static void mi_page_residency_split(const mi_page_t* page, const uint64_t* freelisted, mi_holes_report_t* rep) {
+  if (page->memid.memkind != MI_MEM_ARENA) return;
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  const size_t psize = _mi_os_page_size();
+  const uintptr_t lo = (uintptr_t)mi_page_slice_start(page);
+  const uintptr_t hi = lo + ((size_t)page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE);
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t cend = pstart + (cap * bs);                        // end of the formed blocks
+  const uintptr_t rend = pstart + ((size_t)page->reserved * bs);     // end of the block area
+  mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
+  const size_t u = (page->used == 0 ? 1 : 0);
+  r->res_extent += (size_t)(hi - lo);
+  r->res_formed[u] += cap * bs;
+  r->res_reserved[u] += (size_t)page->reserved * bs;
+  unsigned char vec[MI_HOLES_RES_CHUNK_PAGES];
+  for (uintptr_t at = lo; at < hi; ) {
+    size_t n = (size_t)(hi - at) / psize;
+    if (n > MI_HOLES_RES_CHUNK_PAGES) n = MI_HOLES_RES_CHUNK_PAGES;
+    if (n == 0) break;
+    if (!_mi_diag_resident_map((const void*)at, n, vec)) return;
+    for (size_t k = 0; k < n; k++) {
+      if (vec[k] == 0) continue;
+      const uintptr_t olo = at + (k * psize);
+      const uintptr_t ohi = olo + psize;
+      // (1) bytes before the block area or past `reserved`: slack
+      uintptr_t a = olo;
+      if (a < pstart) { const uintptr_t e = (ohi < pstart ? ohi : pstart); r->res[u][MI_HOLES_RES_SLACK] += (size_t)(e - a); a = e; }
+      if (a < ohi && a < cend) {   // (2) formed blocks: live or free, block by block
+        const uintptr_t e = (ohi < cend ? ohi : cend);
+        size_t idx = (size_t)(a - pstart) / bs;
+        while (a < e) {
+          const uintptr_t bend = pstart + ((idx + 1) * bs);
+          const uintptr_t x = (bend < e ? bend : e);
+          const bool is_free = (freelisted != NULL && mi_holes_block_is_free(page, freelisted, idx));
+          r->res[u][is_free ? MI_HOLES_RES_FREE : MI_HOLES_RES_LIVE] += (size_t)(x - a);
+          a = x; idx++;
+        }
+      }
+      if (a < ohi && a < rend) {   // (3) unformed blocks
+        const uintptr_t x = (ohi < rend ? ohi : rend);
+        r->res[u][MI_HOLES_RES_UNFORMED] += (size_t)(x - a);
+        a = x;
+      }
+      if (a < ohi) { r->res[u][MI_HOLES_RES_SLACK] += (size_t)(ohi - a); }   // (4) past the block area
+    }
+    at += n * psize;
+  }
+}
+
 void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   if (page == NULL || rep == NULL) return;
   const size_t bs = page->block_size;
@@ -28351,7 +28440,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   rep->page_committed_bytes += mi_page_committed(page);
   if (page->reserved > cap) { rep->unformed_bytes += ((size_t)page->reserved - cap) * bs; }
   rep->unformed_discarded_bytes += _mi_page_unformed_purged_bytes(page);
-  if (cap == 0) return;
+  if (cap == 0) { mi_page_residency_split(page, NULL, rep); return; }
 
   uint64_t freelisted[MI_HOLES_MAX_CAP / 64];
   const size_t nwords = _mi_divide_up(cap, 64);
@@ -28360,6 +28449,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   mi_holes_mark_free_list(page, page->local_free, freelisted);
   mi_holes_mark_free_list(page, mi_page_thread_free((mi_page_t*)page), freelisted);   // a concurrent free can push after this read: that block reads as live (a diagnostic, so this is fine)
 
+  mi_page_residency_split(page, freelisted, rep);   // #575
   if (mi_page_holes_madvisable(page)) { mi_page_holes_granularity_curve(page, freelisted, rep); }
   else { rep->unmadvisable_pages++; }
 
@@ -28451,6 +28541,35 @@ static void mi_holes_print_row(const char* name, const mi_holes_bin_t* r) {
               name, r->pages, slive, sfree, sundisc, sdisc, avg100 / 100, avg100 % 100);
 }
 
+// #575: the resident-byte attribution, per bin and in total (this thread's own pages only)
+static void mi_holes_print_residency(const mi_holes_report_t* rep) {
+  static const char* const names[MI_HOLES_RES_COUNT] = { "live", "free_formed", "unformed", "slack" };
+  size_t tot[2][MI_HOLES_RES_COUNT] = {{0}};
+  size_t extent = 0, pages = 0, pages_used = 0, pages_empty = 0;
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->pages == 0) continue;
+    extent += r->res_extent;
+    pages += r->pages;
+    pages_empty += r->empty_pages;
+    for (size_t u = 0; u < 2; u++) { for (size_t c = 0; c < MI_HOLES_RES_COUNT; c++) { tot[u][c] += r->res[u][c]; } }
+    _mi_fprintf(NULL, NULL, "ATTR bin block_size=%zu pages=%zu empty=%zu extent=%zu"
+                " used_live=%zu used_free=%zu used_unformed=%zu used_slack=%zu"
+                " empty_live=%zu empty_free=%zu empty_unformed=%zu empty_slack=%zu"
+                " formed_used=%zu formed_empty=%zu reserved_used=%zu reserved_empty=%zu\n",
+                r->block_size, r->pages, r->empty_pages, r->res_extent,
+                r->res[0][0], r->res[0][1], r->res[0][2], r->res[0][3],
+                r->res[1][0], r->res[1][1], r->res[1][2], r->res[1][3],
+                r->res_formed[0], r->res_formed[1], r->res_reserved[0], r->res_reserved[1]);
+  }
+  pages_used = pages - pages_empty;
+  _mi_fprintf(NULL, NULL, "ATTR total pages=%zu used_pages=%zu empty_pages=%zu extent=%zu", pages, pages_used, pages_empty, extent);
+  for (size_t u = 0; u < 2; u++) {
+    for (size_t c = 0; c < MI_HOLES_RES_COUNT; c++) { _mi_fprintf(NULL, NULL, " %s_%s=%zu", (u == 0 ? "used" : "empty"), names[c], tot[u][c]); }
+  }
+  _mi_fprintf(NULL, NULL, "\n");
+}
+
 void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
   if (rep == NULL) return;
   static const char* hist_name[MI_HOLES_HIST_BUCKETS] = { "1", "2", "3-4", "5-8", "9+" };
@@ -28529,6 +28648,7 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
     _mi_fprintf(NULL, NULL, "      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\n");
   }
 
+  mi_holes_print_residency(rep);   // #575
   _mi_arena_layout_print(&rep->arena_layout);   // #519: prints nothing unless MI_DIAGNOSTICS
 
   _mi_fprintf(NULL, NULL, "%10s %8s %10s %10s %18s %13s %13s\n",
@@ -28736,6 +28856,18 @@ static mi_large_span_bin_t mi_large_span_pack(size_t level, long pressure) {
   return (mi_large_span_bin_t)((((unsigned long)pressure & 0x0F) << MI_LARGE_SPAN_PRESSURE_SHIFT) | level);   // (the full bit clear)
 }
 
+// #575: the largest span a demand-grown page gets, in slices: `mi_option_large_span_max` (KiB, default
+// MI_LARGE_SPAN_MAX_KIB), never below the compact span, and 0 = MI_LARGE_PAGE_SIZE (the #532 policy).
+// The block-count minimum (MI_LARGE_SPAN_MIN_BLOCKS) still wins over it: a page always holds its blocks.
+static size_t mi_large_span_cap_slices(void) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  const long kib = mi_option_get(mi_option_large_span_max);
+  if (kib <= 0) return full;
+  size_t cap = mi_slice_count_of_size((size_t)kib * MI_KiB);
+  if (cap < MI_LARGE_SPAN_COMPACT_SLICES) { cap = MI_LARGE_SPAN_COMPACT_SLICES; }
+  return (cap < full ? cap : full);
+}
+
 // the span of `level`, uncapped (the shift is bounded: a level only grows while below the full span)
 static size_t mi_large_span_level_slices(size_t level) {
   return ((size_t)MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT));
@@ -28753,13 +28885,14 @@ void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
 // in the worst case (meta in front, guard page).
 static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, size_t overhead, mi_large_span_bin_t* next) {
   const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  const size_t cap = mi_large_span_cap_slices();   // (#575)
   size_t level = mi_large_span_level(b);
   long pressure = mi_large_span_pressure(b);
   if ((b & MI_LARGE_SPAN_FULL_BIT) != 0) {
     // a page of the bin filled up since its last request: demand beyond what the theap holds
     pressure++;
     if (pressure >= MI_LARGE_SPAN_GROW_REQUESTS) {
-      if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; MI_EVENT(MI_EVENT_LARGE_SPAN_GROW); }   // (#573)
+      if (mi_large_span_level_slices(level) < cap && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; MI_EVENT(MI_EVENT_LARGE_SPAN_GROW); }   // (#573)
       pressure = 0;
     }
   }
@@ -28778,6 +28911,7 @@ static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, si
   *next = mi_large_span_pack(level, pressure);
 
   size_t slices = mi_large_span_level_slices(level);
+  if (slices > cap) { slices = cap; }
   const size_t min_slices = mi_slice_count_of_size(MI_LARGE_SPAN_MIN_BLOCKS * block_size + overhead);
   if (slices < min_slices) { slices = min_slices; }
   if (slices > full) { slices = full; }
@@ -29737,6 +29871,20 @@ size_t _mi_diag_resident_bytes(const void* start, size_t size) {
   #endif
 }
 
+// #575: which OS pages of [start, start + npages * page size) are resident (`mincore`): vec[i] is
+// 1 or 0 per OS page. False when this platform or build cannot say (or the range is unmapped).
+bool _mi_diag_resident_map(const void* start, size_t npages, unsigned char* vec) {
+  #if MI_DIAG_RESIDENT
+  const size_t psize = _mi_os_page_size();
+  if (mincore((void*)start, npages * psize, vec) != 0) return false;
+  for (size_t i = 0; i < npages; i++) { vec[i] &= 1; }
+  return true;
+  #else
+  MI_UNUSED(start); MI_UNUSED(npages); MI_UNUSED(vec);
+  return false;
+  #endif
+}
+
 // The `run_hist` bucket of a run of `run_slices` slices: floor(log2(run_slices)), so bucket b
 // holds the lengths [2^b, 2^(b+1)). Needs no build flag: it is pure arithmetic.
 size_t _mi_arena_layout_bucket(size_t run_slices) {
@@ -29973,6 +30121,11 @@ void _mi_event_print(void) {
     any = true;
   }
   if (any) { _mi_fprintf(NULL, NULL, "\n"); }
+  mi_arena_claim_counters_t c;
+  if (_mi_arena_claim_counters(&c)) {
+    _mi_fprintf(NULL, NULL, "arena claims (#517): resident_first=%zu/%zu plain_reused=%zu/%zu plain_fresh=%zu/%zu (claims/slices)\n",
+      c.resident_first_claims, c.resident_first_slices, c.plain_reused_claims, c.plain_reused_slices, c.plain_fresh_claims, c.plain_fresh_slices);
+  }
 }
 
 #else  // !MI_DIAGNOSTICS: the query functions stay, `MI_EVENT` is nothing
