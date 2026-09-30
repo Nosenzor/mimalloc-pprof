@@ -15,6 +15,13 @@
    counters are wired at all) that it made some claims.
 
    It asserts on claim counts, not RSS: the counters are exact, while RSS depends on the kernel.
+   What it asserts is the MECHANISM, not its symptom (#573): the churn's small and medium claims
+   never take a resident-first claim. With the bug (MI_RESIDENT_FIRST_MIN_SLICES=1) 3100-3500 of
+   the 3840 claims are resident-first, every run; without it none are, in every build. The symptom
+   -- claims on never-dirty slices -- is NOT deterministic: it is 0 in a plain Debug build but 32 to
+   304 per pass, and different every pass, under ASan (the sanitizer changes how the eight threads
+   interleave and which chunk size class a free run ends up in), so asserting it made the ASan rows
+   fail at random on PRs that change no allocator code. It is still printed.
    They exist only with MI_DIAGNOSTICS=1 (`_mi_arena_claim_counters` returns false otherwise, and
    the test skips). ctest turns the scavenger off, so no background purge runs, and sets
    MIMALLOC_PURGE_ZEROES=0, because a purge that zeroes a range clears its dirty bits and the
@@ -38,7 +45,7 @@
 #define CHURN_SMALL_ALLOCS  1500
 #define CHURN_SMALL_BASE    64
 #define CHURN_SMALL_SPREAD  900
-#define MAX_FRESH_CLAIMS    0      // after warm-up the churn must reuse dirty slices only
+#define MAX_RESIDENT_FIRST_CLAIMS  0   // the churn's claims are all below MI_RESIDENT_FIRST_MIN_SLICES
 
 /* ---- portable threading (from test/test-memory-gate.c) ------------------- */
 
@@ -185,10 +192,11 @@ int main(void) {
     fprintf(stderr, "FAILED (setup): no reused claims were counted, so the claim counters are not wired\n");
     return 1;
   }
-  if (c.plain_fresh_claims > MAX_FRESH_CLAIMS) {
-    fprintf(stderr, "FAILED (#517): the warmed-up churn claimed never-dirty arena slices %zu times; "
-                    "resident-first on small claims (below MI_RESIDENT_FIRST_MIN_SLICES) takes other size classes' queued runs\n",
-            c.plain_fresh_claims);
+  if (c.resident_first_claims > MAX_RESIDENT_FIRST_CLAIMS) {
+    fprintf(stderr, "FAILED (#517): the warmed-up churn made %zu resident-first claims (%zu slices); "
+                    "resident-first on small claims (below MI_RESIDENT_FIRST_MIN_SLICES) takes other size classes' queued runs "
+                    "and spills their pages into never-dirty chunks (%zu fresh claims here)\n",
+            c.resident_first_claims, c.resident_first_slices, c.plain_fresh_claims);
     return 1;
   }
   return 0;
