@@ -97,8 +97,8 @@ def parse(stdout: str, stderr: str) -> dict[str, Any]:
         )
         if not head:
             continue
-        tot = kv(next(l for l in b.splitlines() if l.startswith("ATTR total")))
-        bins = [kv(l) for l in b.splitlines() if l.startswith("ATTR bin")]
+        tot = kv(next(ln for ln in b.splitlines() if ln.startswith("ATTR total")))
+        bins = [kv(ln) for ln in b.splitlines() if ln.startswith("ATTR bin")]
         smaps = re.search(r"Rss (\d+) kB, Anonymous (\d+) kB, AnonHugePages (\d+) kB", b)
         if smaps is None:
             continue
