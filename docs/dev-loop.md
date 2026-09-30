@@ -20,8 +20,9 @@ uv run ci/verify_local.py --keep-going          # run every config even after on
 uv run ci/verify_local.py --selftest            # trivially fast dry-run, no real builds
 ```
 
-Eleven configs run concurrently (`release`, `off`, `debug-full`, `guarded`, `shared`,
-`bundle`, `memory-gate`, `diag`, `rust`, `lint`, `asan`), each building into its own directory
+Configs run concurrently (`release`, `off`, `debug-full`, `guarded`, `shared`,
+`bundle`, `memory-gate`, `diag`, `rust`, `lint`, `asan`, and `stress` and `tsan`, which have no CI
+twin, #573), each building into its own directory
 under `out/verify/<config>/` (gitignored, incremental across invocations) with Ninja
 and ccache when available. `asan` needs `clang`/`clang++` on `PATH` and reports
 SKIPPED with a reason otherwise. The long tests (`test-profile-race`,
@@ -137,6 +138,70 @@ confirm it, not to explore. The safety nets that make that cheap:
 - **`mi_theap_t` size budget.** `MI_THEAP_META_MAX_SIZE` (types.h) is a compile-time budget on
   `sizeof(mi_theap_t) + MI_PADDING_SIZE`: the meta-allocator size class it sits in is the edge
   that made CI ASan `test-resident-first-churn` flaky. Put new per-thread state in `mi_tld_t`.
+
+### The perf-ab pipeline (#573 B3-B8)
+
+```bash
+# dispatch, wait, print the rule-12 ledger (the wrapper is the sanctioned way to wait)
+uv run ci/perf_ab_dispatch.py --ref perf/my-branch --reps 15 --null-arm --max-reps 25
+# several knob values in ONE rotation on ONE VM: variants split on ' || '
+uv run ci/perf_ab_dispatch.py --ref perf/my-branch --head-env 'MIMALLOC_X=4 || MIMALLOC_X=16 || MIMALLOC_X=32'
+# re-judge, or pool, downloaded artifacts (pooling refuses another CPU model or other commits)
+uv run ci/perf_ab_dispatch.py --from-json a.json b.json
+```
+
+- **Raw samples.** Every run uploads `perf-ab-samples` (`perf-ab-samples.json`): per-repetition
+  values for every row and arm, the base and head SHAs, defines, environment, CPU model and the
+  RSS floor. `ci/perf_ab_ledger.py` judges them; nothing is scraped from a log.
+- **Rule-12 ledger.** Per row: `saved%` of the reducible peak-RSS gap (against the RSS floor
+  `ci/perf_ab.c` prints: the RSS before the work plus the live requested bytes), then for
+  throughput, CPU, faults, peak and after-drain RSS the paired change, its allowance (`saved%/3`
+  for the first three, noise for memory and for cells that saved nothing) and PASS, FAIL or
+  INCONCLUSIVE. INCONCLUSIVE is not a pass.
+- **Honest intervals.** The interval on a median is the distribution-free sign-test interval, not
+  a percentile bootstrap (anticonservative at 7 or 15 reps). Only the rule-12 metrics are marked.
+- **Noise floor.** `null_arm` measures base a second time in the same rotation; a difference is
+  marked only when it exceeds what base-vs-base produced. A control counts as unchanged when its
+  whole interval lies inside +-`EQUIVALENCE_MARGIN_PCT` (3%, an owner decision that is still open).
+- **Adaptive reps.** `max_reps` adds 5 reps at a time to the rows whose ledger is still
+  INCONCLUSIVE, up to that many; conclusive rows stop at `reps`.
+- **`fp` build.** `--force-kind fp` builds every row with `-fno-omit-frame-pointer`, for
+  `perf record -g` and caller-report shims.
+
+### Local tooling (#573 C)
+
+The dev box is a loaded Ryzen 3700X: never time on it, but attribute on it.
+
+- **Kernel symbols.** `kernel.kptr_restrict=0` (NixOS: `boot.kernel.sysctl."kernel.kptr_restrict" = 0;`)
+  makes kernel samples (faults, madvise, THP zeroing) resolvable; tracefs access gives
+  `perf trace -s` (mmap/madvise/munmap counts) and `perf probe`.
+- **Instructions, not seconds.** `taskset -c 2 perf stat -r 10 -e instructions:u,cycles:u,minor-faults ./perf_ab ...`
+  is largely immune to host load and answers "did this add user instructions per op" in minutes;
+  `valgrind --tool=cachegrind` `Ir` is an exact pre-screen (use single-thread rows, or the
+  scavenger off, for stable counts). Neither replaces perf-ab for cache contention or kernel time.
+- **Call graphs.** `perf record --call-graph dwarf` plus `perf report --inline` replaces the
+  frame-pointer rebuild and the `LD_PRELOAD` `clock_gettime` shim; the `fp` kind above covers
+  `perf record -g`. On Zen2 use `ibs_op//`, not LBR.
+- **Races that never show under gdb.** `rr record --chaos` (after `scripts/zen_workaround.py`) and
+  `rr replay`; fallback `coredumpctl debug -A "-batch -ex 'thread apply all bt full'"`.
+- **Layouts.** `clang -Xclang -fdump-record-layouts -fsyntax-only -Iinclude -D... src/static.c`,
+  or `pahole`, per configuration; `MI_THEAP_META_MAX_SIZE` is the compile-time budget.
+- **Not worth it here:** heaptrack, bytehound and massif profile an application's malloc calls,
+  not the allocator's internals; magic-trace needs Intel PT; `perf c2c` needs `ldlat`, which this
+  `ibs_op` lacks; coz and DAMON are too noisy for these questions.
+
+### Debug stress lane (#573 D)
+
+`uv run ci/verify_local.py --only stress,tsan` runs the multi-threaded perf_ab rows (large-class,
+ephemeral generations, bursty idle drain, random-large, small, larson) at small operation counts
+against a `MI_DEBUG_FULL` build and against a `clang -fsanitize=thread` build (`STRESS_OPS` in
+`ci/verify_local.py`). A row fails on a non-zero exit, an assertion or a TSAN report. These are the
+workloads that exposed #572's page-map extent and retired-slot mask bugs, which only the
+label-gated release-build perf-ab job ran. The inherited TSAN row of `test.yaml` runs only on
+`dev*` pushes and tags, so it never sees this fork's PRs.
+
+**Diagnosis order: events before timing.** Explain a change with event counts and residency
+first; use perf-ab to confirm, not to explore.
 
 ## Memory gate: fast local loop (#517)
 

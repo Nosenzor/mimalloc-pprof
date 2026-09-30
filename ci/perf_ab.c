@@ -442,6 +442,7 @@ int main(int argc, char** argv) {
 #else
   const double start = now_s();
 #endif
+  const long baseline_rss = rss_bytes();   /* #573: the RSS floor is this plus the live requested bytes */
   for (int i = 0; i < threads; i++) pthread_create(&t[i], NULL, &worker_main, &st[i]);
   while (atomic_load(&drained) < threads) usleep(100);
 #if defined(PERF_AB_DIAGNOSTIC)
@@ -467,6 +468,12 @@ int main(int argc, char** argv) {
     }
 #endif
   }
+  long live_bytes = 0;   /* every worker is done and holds its live slots (`drained` was released) */
+  for (int i = 0; i < threads; i++) {
+    for (int k = 0; k < st[i].slots; k++) { if (st[i].slot[k] != NULL) live_bytes += (long)st[i].size[k]; }
+  }
+  const long ideal_rss = baseline_rss + live_bytes;
+  (void)ideal_rss;   /* (printed by the default output only; the diagnostic JSON schema is fixed) */
   const long rss_final = rss_at[samples - 1];
   long release_ms = 0;
   while (release_ms / RELEASE_SAMPLE_MS < samples - 1 && rss_at[release_ms / RELEASE_SAMPLE_MS] > rss_final + RELEASE_TOLERANCE) {
@@ -520,8 +527,8 @@ int main(int argc, char** argv) {
   }
 #else
   {
-    printf("%.1f %.4f %.4f %ld %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
-           owner_cpu, ru.ru_minflt, rss_peak, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
+    printf("%.1f %.4f %.4f %ld %ld %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
+           owner_cpu, ru.ru_minflt, rss_peak, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms, ideal_rss);
   }
 #endif
   atomic_store(&release_workers, 1);

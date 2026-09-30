@@ -5,6 +5,7 @@ and the --holes-report snapshot (#529)."""
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from pathlib import Path
@@ -14,6 +15,8 @@ import pytest
 import yaml
 
 import perf_ab
+import perf_ab_ledger
+import perf_ab_stats
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/perf-ab.yml"
@@ -99,7 +102,7 @@ def run_main(
     builds: list[tuple[str, list[str]]] = []
     children: list[list[str]] = []
 
-    def build(arm: str, ref: str, work: Path, kind: str, cppdefs: list[str]) -> Path:
+    def build(arm: str, ref: str, work: Path, kind: str, cppdefs: list[str], **_: object) -> Path:
         builds.append((arm, cppdefs) if kind != perf_ab.HOLES_KIND else (f"{arm}:{kind}", cppdefs))
         return work / f"bin-{arm}-{kind}" / "perf_ab"
 
@@ -111,7 +114,7 @@ def run_main(
         if cmd[0] == "git":
             return ""
         children.append(cmd)
-        return "1 1 1 1 1048576 1048576 1048576 0\n"
+        return "1 1 1 1 1048576 1048576 1048576 0 1048576\n"
 
     def run_stderr(cmd: list[str], env: dict[str, str]) -> str:
         assert env["PERF_AB_HOLES_REPORT"] == "1"
@@ -234,11 +237,16 @@ def test_sparse_twin_matches_the_benchmark_suite() -> None:
     assert all((p.min_size, p.max_size) == perf_ab.SPARSE_LARGE_BUFFERS for p in twins)
 
 
+def ab_step(workflow: dict[Any, Any]) -> dict[str, Any]:
+    (step,) = [s for s in workflow["jobs"]["ab"]["steps"] if s.get("name") == "paired A/B"]
+    return step
+
+
 def test_workflow_passes_head_cppdefs_through_the_environment() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["head_cppdefs"]["default"] == ""
-    step = workflow["jobs"]["ab"]["steps"][-1]
+    step = ab_step(workflow)
     assert step["env"]["HEAD_CPPDEFS"] == "${{ inputs.head_cppdefs }}"
     assert '--head-cppdefs "$HEAD_CPPDEFS"' in step["run"]
     assert "${{" not in step["run"]  # inputs reach the shell as data, never as script
@@ -293,7 +301,7 @@ def test_workflow_passes_holes_report_as_a_flag() -> None:
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["holes_report"]["type"] == "boolean"
     assert inputs["holes_report"]["default"] is False
-    step = workflow["jobs"]["ab"]["steps"][-1]
+    step = ab_step(workflow)
     assert step["env"]["HOLES_REPORT"] == "${{ inputs.holes_report && '--holes-report' || '' }}"
     assert " $HOLES_REPORT " in step["run"]
 
@@ -350,7 +358,246 @@ def test_workflow_gates_and_cancels_per_pr() -> None:
     assert "github.event.label.name != 'perf-ab'" in workflow["concurrency"]["group"]
     condition = workflow["jobs"]["ab"]["if"]
     assert "github.event.label.name == 'perf-ab'" in condition
-    step = workflow["jobs"]["ab"]["steps"][-1]
+    step = ab_step(workflow)
     assert step["env"]["NO_SANITY_GATE"].endswith("'--no-sanity-gate' || '' }}")
     assert " $NO_SANITY_GATE " in step["run"]
     assert "${{" not in step["run"]
+
+
+# ---- #573 B3-B6: statistics, ledger, variants, null arm, adaptive reps, artifact -------------
+
+
+@pytest.mark.parametrize(
+    ("n", "low", "high"),
+    [(7, 1, 7), (15, 4, 12), (25, 8, 18), (3, 1, 3), (1, 1, 1)],
+)
+def test_sign_interval_is_the_order_statistic_interval(n: int, low: int, high: int) -> None:
+    mid, lo, hi = perf_ab_stats.sign_interval(list(range(1, n + 1)))
+    assert (lo, hi) == (low, high)
+    assert lo <= mid <= hi
+
+
+def test_sign_interval_has_at_least_its_coverage() -> None:
+    # by construction: P(Binomial(n, 1/2) <= j) <= 0.025 for the j it picks, so the interval
+    # misses the true median with probability <= 2 * 0.025
+    for n in (6, 7, 11, 15, 25):
+        _, low, high = perf_ab_stats.sign_interval(list(range(n)))
+        j = int(low)
+        assert 2 * perf_ab_stats._cdf(n, j) <= 0.05 + 1e-12  # pyright: ignore[reportPrivateUsage]
+        assert high == n - 1 - j
+
+
+def test_noise_floor_and_beyond_noise() -> None:
+    null = perf_ab_stats.sign_interval([-2.0, 1.0, 3.0, 0.5, -1.0, 2.0, 0.0])
+    floor = perf_ab_stats.noise_floor(null)
+    assert floor == 3.0
+    assert perf_ab_stats.beyond_noise((5.0, 4.0, 6.0), floor)
+    assert not perf_ab_stats.beyond_noise((2.0, 1.0, 3.0), floor)  # excludes 0, inside the noise
+    assert not perf_ab_stats.beyond_noise((5.0, -1.0, 9.0), None)  # includes 0
+    assert perf_ab_stats.equivalent((0.5, -1.0, 2.0))
+    assert not perf_ab_stats.equivalent((0.5, -1.0, 4.0))
+
+
+def ledger_samples(base: float, head: float, spread: float = 0.0) -> dict[str, list[float]]:
+    return {"x": [base + spread * (i % 3 - 1) for i in range(7)], "y": [head] * 7}
+
+
+def metric_columns(
+    peak: tuple[float, float], cpu: tuple[float, float], ops: tuple[float, float]
+) -> tuple[dict[str, list[float]], dict[str, list[float]]]:
+    def arm(index: int) -> dict[str, list[float]]:
+        return {
+            "ops/s": [ops[index] * (1 + 0.001 * i) for i in range(7)],
+            "cpu s": [cpu[index] * (1 + 0.001 * i) for i in range(7)],
+            "minor faults": [1000.0 * (1 + 0.001 * i) for i in range(7)],
+            perf_ab_ledger.PEAK: [peak[index] * (1 + 0.001 * i) for i in range(7)],
+            perf_ab_ledger.DRAIN: [50.0 * (1 + 0.001 * i) for i in range(7)],
+        }
+
+    return arm(0), arm(1)
+
+
+def test_ledger_allows_a_third_of_the_saved_gap_in_cpu() -> None:
+    # 200 -> 100 MiB against an ideal of 50: 66.7% of the gap saved, so up to +22.2% CPU
+    base, head = metric_columns((200.0, 100.0), (10.0, 12.0), (1000.0, 1000.0))
+    saved, cells = perf_ab_ledger.cells(base, head, 50.0), None
+    assert (
+        abs(
+            perf_ab_ledger.credit(base[perf_ab_ledger.PEAK], head[perf_ab_ledger.PEAK], 50.0)
+            - 66.67
+        )
+        < 0.1
+    )
+    cells = perf_ab_ledger.cells(base, head, 50.0)
+    cpu = next(c for c in cells if c.metric == "cpu s")
+    assert abs(cpu.allowance - 22.2) < 0.1
+    assert cpu.verdict == "PASS"  # +20% is within +22.2%
+    del saved
+
+
+def test_ledger_fails_cpu_beyond_the_allowance_and_controls_allow_none() -> None:
+    base, head = metric_columns((200.0, 100.0), (10.0, 14.0), (1000.0, 1000.0))  # +40% CPU
+    cpu = next(c for c in perf_ab_ledger.cells(base, head, 50.0) if c.metric == "cpu s")
+    assert cpu.verdict == "FAIL"
+    # a control: no RSS credit, so +5% CPU is a regression
+    base, head = metric_columns((200.0, 200.0), (10.0, 10.5), (1000.0, 1000.0))
+    cells = perf_ab_ledger.cells(base, head, 50.0)
+    cpu = next(c for c in cells if c.metric == "cpu s")
+    assert cpu.allowance == 0.0 and cpu.verdict == "FAIL"
+    assert perf_ab_ledger.row_verdict(cells) == "FAIL"
+
+
+def test_ledger_throughput_is_signed_the_other_way() -> None:
+    base, head = metric_columns((200.0, 200.0), (10.0, 10.0), (1000.0, 900.0))  # -10% ops/s
+    ops = next(c for c in perf_ab_ledger.cells(base, head, 50.0) if c.metric == "ops/s")
+    assert ops.regression[0] > 0 and ops.verdict == "FAIL"
+    base, head = metric_columns((200.0, 200.0), (10.0, 10.0), (1000.0, 1100.0))  # faster
+    ops = next(c for c in perf_ab_ledger.cells(base, head, 50.0) if c.metric == "ops/s")
+    assert ops.verdict == "PASS"
+
+
+def test_ledger_is_inconclusive_when_the_interval_straddles_the_allowance() -> None:
+    base, head = metric_columns((200.0, 200.0), (10.0, 10.0), (1000.0, 1000.0))
+    head["cpu s"] = [10.0 * f for f in (0.95, 0.98, 1.0, 1.03, 1.06, 1.1, 1.02)]
+    cpu = next(c for c in perf_ab_ledger.cells(base, head, 50.0) if c.metric == "cpu s")
+    assert cpu.verdict == "INCONCLUSIVE"
+    assert perf_ab_ledger.inconclusive([cpu])
+
+
+def test_a_peak_fall_inside_the_noise_earns_no_credit() -> None:
+    base, head = metric_columns((200.0, 199.0), (10.0, 10.0), (1000.0, 1000.0))
+    head[perf_ab_ledger.PEAK] = [199.0, 201.0, 198.0, 202.0, 197.0, 203.0, 200.0]
+    assert perf_ab_ledger.credit(base[perf_ab_ledger.PEAK], head[perf_ab_ledger.PEAK], 50.0) == 0.0
+
+
+def test_variants_split_on_the_separator_and_broadcast() -> None:
+    one = perf_ab.parse_variants("", "")
+    assert [(v.arm, v.env, v.cppdefs) for v in one] == [("head", {}, [])]
+    several = perf_ab.parse_variants("A=1 || A=2 || B=3", "MI_X=1")
+    assert [v.arm for v in several] == ["hd01", "hd02", "hd03"]
+    assert [v.env for v in several] == [{"A": "1"}, {"A": "2"}, {"B": "3"}]
+    assert all(v.cppdefs == ["MI_X=1"] for v in several)
+    assert len({len(v.arm) for v in several} | {len("base")}) == 1  # equal-length arm names
+    with pytest.raises(SystemExit):
+        perf_ab.parse_variants("A=1 || A=2", "MI_X=1 || MI_X=2 || MI_X=3")
+    with pytest.raises(SystemExit):
+        perf_ab.parse_variants("A=1 ||  || A=3", "")
+
+
+def test_several_variants_share_one_rotation_and_one_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    table, builds, children = run_main(
+        tmp_path,
+        monkeypatch,
+        "--workloads",
+        "small",
+        "--head-cppdefs",
+        "MI_A=1 || MI_A=2",
+        "--null-arm",
+    )
+    assert sorted(builds) == [("base", []), ("hd01", ["MI_A=1"]), ("hd02", ["MI_A=2"])]
+    # base, hd01, hd02 and the null arm each ran once in the one repetition
+    assert len(children) == 4
+    assert "### hd01" in table and "### hd02" in table
+    assert table.count("Rule-12 ledger") == 2
+    assert "Noise floor" in table
+
+
+def test_null_arm_reuses_the_base_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, _, children = run_main(tmp_path, monkeypatch, "--workloads", "small", "--null-arm")
+    exes = [cmd[0] for cmd in children]
+    assert len(exes) == 3 and len(set(exes)) == 2  # base twice, head once
+
+
+def test_adaptive_reps_extend_only_the_inconclusive_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts: dict[str, int] = {}
+
+    def noisy_run(
+        cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None
+    ) -> str:
+        if cmd[0] == "git":
+            return ""
+        if cmd[1:2] == ["probe"]:
+            return ""
+        arm = "head" if "bin-head" in cmd[0] else "base"
+        row = f"{cmd[1]}/{cmd[3]}"  # threads and min size identify the row
+        counts[f"{row}:{arm}"] = counts.get(f"{row}:{arm}", 0) + 1
+        n = counts[f"{row}:{arm}"]
+        cpu = 10.0 if arm == "base" else 10.0 + (0.6 if (n % 2) else -0.6) * (n % 4)
+        if cmd[3] == str(16):  # the small-object control: identical arms, conclusive at once
+            cpu = 10.0
+        return f"1000 {cpu} {cpu} 1000 209715200 52428800 52428800 0 52428800\n"
+
+    def fake_build(
+        arm: str, ref: str, work: Path, kind: str, cppdefs: list[str], **_: object
+    ) -> Path:
+        return work / f"bin-{arm}-{kind}" / "perf_ab"
+
+    monkeypatch.setattr(perf_ab, "build", fake_build)
+    monkeypatch.setattr(perf_ab, "run", noisy_run)
+    monkeypatch.setattr(perf_ab, "cpu_model", lambda: "test CPU")
+    summary = tmp_path / "summary.md"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "perf_ab.py",
+            "--base",
+            "B",
+            "--head",
+            "H",
+            "--reps",
+            "5",
+            "--max-reps",
+            "15",
+            "--workloads",
+            "large-class/8|small/8",
+            "--no-sanity-gate",
+            "--summary",
+            str(summary),
+        ],
+    )
+    perf_ab.main()
+    small = counts["8/16:head"]
+    large = counts["8/98304:head"]
+    assert small == 5  # conclusive after the first five: no extra reps
+    assert 5 < large <= 15 and (large - 5) % perf_ab.ADAPTIVE_STEP == 0
+
+
+def test_json_artifact_holds_the_raw_samples(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "samples.json"
+    run_main(tmp_path, monkeypatch, "--workloads", "small", "--null-arm", "--json", str(out))
+    data = json.loads(out.read_text())
+    assert data["version"] == 1 and data["cpu"] == "test CPU"
+    assert data["fields"][-1] == "ideal RSS MiB" and len(data["fields"]) == len(perf_ab.METRICS) + 1
+    row = data["samples"]["small/8 (control)"]
+    assert set(row) == {"base", "head", "null"}
+    assert all(len(reps) == 1 and len(reps[0]) == len(data["fields"]) for reps in row.values())
+    assert data["workloads"]["small/8 (control)"]["params"]["threads"] == 8
+    assert data["variants"] == [{"arm": "head", "env": {}, "cppdefs": []}]
+
+
+def test_force_kind_builds_every_row_with_frame_pointers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert "-fno-omit-frame-pointer" in " ".join(perf_ab.BUILDS["fp"][0])
+    _, builds, _ = run_main(tmp_path, monkeypatch, "--workloads", "small", "--force-kind", "fp")
+    assert sorted(builds) == [("base", []), ("head", [])]
+
+
+def test_workflow_uploads_the_samples_and_takes_the_new_inputs() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    inputs = workflow[True]["workflow_dispatch"]["inputs"]
+    assert inputs["null_arm"]["default"] is False
+    assert inputs["max_reps"]["default"] == "0"
+    step = ab_step(workflow)
+    assert " $NULL_ARM " in step["run"] and '--max-reps "$MAX_REPS"' in step["run"]
+    assert "--json perf-ab-samples.json" in step["run"]
+    assert "${{" not in step["run"]
+    (upload,) = [s for s in workflow["jobs"]["ab"]["steps"] if "upload" in s.get("name", "")]
+    assert upload["if"] == "always()"  # a failed sanity gate still leaves its samples
+    assert upload["with"]["name"] == "perf-ab-samples"

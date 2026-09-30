@@ -39,7 +39,10 @@ import subprocess
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
+
+import perf_ab_ledger
+import perf_ab_stats
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAGS = [
@@ -65,6 +68,9 @@ BUILDS: dict[str, tuple[list[str], dict[str, str]]] = {
     "chart": (["-DMI_PPROF=ON", "-DMI_MEMEVT=ON"], {}),
     # #529: only the untimed --holes-report replay; MI_DIAGNOSTICS adds the arena layout walk
     "diags": (["-DMI_DIAGNOSTICS=ON"], {}),
+    # #573 A4: --force-kind fp builds every row with frame pointers, so `perf record -g` and a
+    # caller-report shim can walk the stack without DWARF (see docs/dev-loop.md)
+    "fp": (["-DCMAKE_C_FLAGS=-fno-omit-frame-pointer"], {}),
 }
 HOLES_KIND = "diags"
 # #573 A1: the untimed replay also counts (MI_STAT=1) and prints (MIMALLOC_SHOW_STATS) the
@@ -192,6 +198,9 @@ METRICS = (
     "release ms",
 )
 IN_MIB = {"peak RSS MiB", "RSS 0.5 s after drain MiB", "RSS at release bound MiB"}
+# ci/perf_ab.c prints one more number (#573): the RSS floor -- the RSS before the work plus the
+# live requested bytes -- which the rule-12 ledger takes as `ideal`. It is not a table column.
+IDEAL_FIELD = len(METRICS)
 # #491: the promise "idle memory is back within bound_ms"; perf-ab fails when head breaks it
 RATCHET = ROOT / "ci/release_ratchet.json"
 RELEASE_PERCENTILE = 95
@@ -228,13 +237,20 @@ def holes_rows(reports: dict[tuple[str, str], str]) -> list[str]:
 
 
 def build(
-    arm: str, ref: str, work: Path, kind: str, cppdefs: list[str], diagnostic: bool = False
+    arm: str,
+    ref: str,
+    work: Path,
+    kind: str,
+    cppdefs: list[str],
+    diagnostic: bool = False,
+    tree_name: str | None = None,
 ) -> Path:
     # Paths named by arm ("base"/"head") and build (BUILDS), never by ref: every
     # executable path then has the same length, and so does the process's initial stack. A
     # longer argv/environment shifts stack alignment, the likely reason identical binaries
     # differed by 17% on the small-object row of #494's null run.
-    tree, out = work / f"src-{arm}", work / f"bin-{arm}-{kind}"
+    # (several head variants share the tree of `ref`, each with its own build directory)
+    tree, out = work / f"src-{tree_name or arm}", work / f"bin-{arm}-{kind}"
     if not tree.exists():
         run(["git", "worktree", "add", "--detach", str(tree), ref], cwd=ROOT)
     defs = [*KIND_CPPDEFS.get(kind, []), *cppdefs]
@@ -389,8 +405,9 @@ def header(
         ]
     rows += [
         arms + f" on {cpu}, {reps} paired reps, alternating order. "
-        "Median base -> head, then median paired difference [bootstrap 95%]; "
-        "**bold** when the interval excludes 0.",
+        "Median base -> head, then median paired difference [95% sign-test interval]; "
+        "**bold** when the interval excludes 0 (and, with a null arm, exceeds its noise floor) "
+        "on a rule-12 metric.",
         "",
         "| workload | " + " | ".join(METRICS) + " |",
         "|---|" + "---|" * len(METRICS),
@@ -407,6 +424,187 @@ def cpu_model() -> str:
     return "unknown CPU"
 
 
+# ---------------------------------------------------------------------------------------------
+# arms, repetitions and the report (#573 B3-B6)
+
+VARIANT_SEPARATOR = "||"  # --head-env / --head-cppdefs: one head arm per item, same VM and run
+NULL_ARM = "null"  # base measured a second time: what "no difference" looks like on this VM
+ADAPTIVE_STEP = 5  # --max-reps: reps added at a time to the rows still inconclusive
+RULE12 = tuple(perf_ab_ledger.RULE12)
+
+
+class Variant(NamedTuple):
+    arm: str
+    env_text: str
+    env: dict[str, str]
+    cppdefs: list[str]
+
+
+def _split(text: str, flag: str) -> list[str]:
+    items = [item.strip() for item in text.split(VARIANT_SEPARATOR)] if text.strip() else [""]
+    if any(not item for item in items) and len(items) > 1:
+        raise SystemExit(f"{flag}: an empty variant between {VARIANT_SEPARATOR!r} separators")
+    return items
+
+
+def parse_variants(head_env: str, head_cppdefs: str) -> list[Variant]:
+    """The head arms: --head-env and --head-cppdefs each split on ' || ' into variants; a list of
+    one is shared by all. One variant is the arm `head`; several are `hd01`, `hd02`, ... (names of
+    the same length as `base`, which keeps every executable path the same length)."""
+    envs = _split(head_env, "--head-env")
+    defs = _split(head_cppdefs, "--head-cppdefs")
+    count = max(len(envs), len(defs))
+    for items, flag in ((envs, "--head-env"), (defs, "--head-cppdefs")):
+        if len(items) not in (1, count):
+            raise SystemExit(f"{flag}: {len(items)} variants, but the other flag has {count}")
+    variants: list[Variant] = []
+    for index in range(count):
+        env_text = envs[index if len(envs) > 1 else 0]
+        defs_text = defs[index if len(defs) > 1 else 0]
+        arm = "head" if count == 1 else f"hd{index + 1:02d}"
+        variants.append(Variant(arm, env_text, parse_env(env_text), parse_cppdefs(defs_text)))
+    return variants
+
+
+def measure(exe: Path, params: Params, env: dict[str, str], bound_ms: int) -> list[float]:
+    """One child run: the METRICS, then the RSS floor; byte counts in MiB."""
+    values = list(map(float, run([str(exe), *map(str, params), str(bound_ms)], env=env).split()))
+    for index, metric in enumerate(METRICS):
+        if metric in IN_MIB:
+            values[index] /= 2**20
+    values[IDEAL_FIELD] /= 2**20
+    return values
+
+
+def column(samples: list[list[float]], metric: str) -> list[float]:
+    return [s[METRICS.index(metric)] for s in samples]
+
+
+def ledger_row(
+    base: list[list[float]], head: list[list[float]], null: list[list[float]] | None
+) -> tuple[float, list[perf_ab_ledger.Cell]]:
+    """The rule-12 ledger of one row and one head arm: (saved%, cells). The RSS floor is base's
+    median; a null arm turns its base-vs-base intervals into per-metric noise floors."""
+    ideal = perf_ab_stats.sign_interval([s[IDEAL_FIELD] for s in base])[0]
+    noise = (
+        {
+            m: perf_ab_stats.noise_floor(
+                perf_ab_stats.paired_percent(column(base, m), column(null, m))
+            )
+            for m in RULE12
+        }
+        if null
+        else None
+    )
+    b = {m: column(base, m) for m in RULE12}
+    h = {m: column(head, m) for m in RULE12}
+    saved = perf_ab_ledger.credit(b[perf_ab_ledger.PEAK], h[perf_ab_ledger.PEAK], ideal)
+    return saved, perf_ab_ledger.cells(b, h, ideal, noise)
+
+
+def render_variant(
+    variant: Variant,
+    args: argparse.Namespace,
+    workloads: dict[str, tuple[str, Params]],
+    samples: dict[tuple[str, str], list[list[float]]],
+    bound_ms: int,
+    cpu: str,
+    probes: dict[str, dict[int, str]],
+    sizes: list[int],
+    reports: dict[tuple[str, str], str],
+) -> tuple[list[str], bool]:
+    """The tables of one head arm against base, and whether its release bound held."""
+    reps = min(len(samples[(w, variant.arm)]) for w in workloads)
+    rows = header(args.base, args.head, variant.env_text, variant.cppdefs, cpu, reps)
+    with_null = NULL_ARM in {a for _, a in samples}
+    ledger: dict[str, tuple[float, list[perf_ab_ledger.Cell]]] = {}
+    for workload in workloads:
+        base, head = samples[(workload, "base")], samples[(workload, variant.arm)]
+        null = samples[(workload, NULL_ARM)] if with_null else None
+        cells: list[str] = []
+        for metric in METRICS:
+            interval = perf_ab_stats.paired_percent(column(base, metric), column(head, metric))
+            noise = (
+                perf_ab_stats.noise_floor(
+                    perf_ab_stats.paired_percent(column(base, metric), column(null, metric))
+                )
+                if null
+                else None
+            )
+            mid, low, high = interval
+            delta = f"{mid:+.1f}% [{low:+.1f}, {high:+.1f}]"
+            if metric in RULE12 and perf_ab_stats.beyond_noise(interval, noise):
+                delta = f"**{delta}**"
+            b = statistics.median(column(base, metric))
+            h = statistics.median(column(head, metric))
+            cells.append(f"{b:,.4g} -> {h:,.4g}<br>{delta}")
+        rows.append(f"| {workload} | " + " | ".join(cells) + " |")
+        ledger[workload] = ledger_row(base, head, null)
+    # #491: the release promise, per workload, on head; the worst P95 is the evidence a lower
+    # bound in ci/release_ratchet.json needs (`p95_release_ms`)
+    release = METRICS.index("release ms")
+    p95 = {
+        w: percentile([s[release] for s in samples[(w, variant.arm)]], RELEASE_PERCENTILE)
+        for w in workloads
+    }
+    late = {w: p for w, p in p95.items() if p > bound_ms}
+    worst = max(p95, key=lambda w: p95[w])
+    rows += [
+        "",
+        f"Release bound (ci/release_ratchet.json): {bound_ms} ms; head P{RELEASE_PERCENTILE} "
+        f"release, worst workload: {p95[worst]:.0f} ms ({worst}) -- "
+        + (", ".join(f"**{w}: {p:.0f} ms, LATE**" for w, p in late.items()) or "held"),
+    ]
+    rows += perf_ab_ledger.table(ledger)
+    if with_null:
+        rows += [
+            "",
+            f"Noise floor: a base-vs-base arm ran in the same rotation; a difference is bold only "
+            f"when it exceeds what that arm's interval reached. A control cell counts as the same "
+            f"when its whole interval lies inside +-{perf_ab_stats.EQUIVALENCE_MARGIN_PCT:g}%.",
+        ]
+    if sizes:
+        rows += probe_rows(sizes, probes["base"], probes[variant.arm])
+    own = {k: v for k, v in reports.items() if k[1] in ("base", variant.arm)}
+    if own:
+        rows += holes_rows(own)
+    return rows, not late
+
+
+def artifact(
+    args: argparse.Namespace,
+    variants: list[Variant],
+    workloads: dict[str, tuple[str, Params]],
+    samples: dict[tuple[str, str], list[list[float]]],
+    bound_ms: int,
+    cpu: str,
+) -> dict[str, Any]:
+    """The raw per-repetition samples with everything needed to reproduce and re-judge them."""
+
+    def rev(ref: str) -> str:
+        return run(["git", "rev-parse", ref], cwd=ROOT).strip()
+
+    return {
+        "version": 1,
+        "base": {"ref": args.base, "sha": rev(args.base)},
+        "head": {"ref": args.head, "sha": rev(args.head)},
+        "cpu": cpu,
+        "reps": args.reps,
+        "max_reps": args.max_reps,
+        "release_bound_ms": bound_ms,
+        "fields": [*METRICS, "ideal RSS MiB"],
+        "variants": [{"arm": v.arm, "env": v.env, "cppdefs": v.cppdefs} for v in variants],
+        "workloads": {
+            name: {"kind": kind, "params": params._asdict()}
+            for name, (kind, params) in workloads.items()
+        },
+        "samples": {
+            name: {arm: samples[(name, arm)] for arm in sorted({a for _, a in samples})}
+            for name in workloads
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -415,12 +613,30 @@ def main() -> int:
     parser.add_argument("--head", required=True)
     parser.add_argument("--reps", type=int, default=7)
     parser.add_argument(
+        "--max-reps",
+        type=int,
+        default=0,
+        help=f"adaptive reps (#573 B6): after --reps, add {ADAPTIVE_STEP} at a time to the rows "
+        "whose rule-12 ledger is still INCONCLUSIVE, up to this many (0 = no extra reps)",
+    )
+    parser.add_argument(
+        "--null-arm",
+        action="store_true",
+        help="measure base a second time in the rotation (#573 B3): its base-vs-base intervals are "
+        "the per-cell noise floor",
+    )
+    parser.add_argument(
         "--workloads",
         default="",
         help="only the workloads whose name contains this text ('|' separates alternatives); "
         f"the diagnostic rows ('{DIAGNOSTIC_TAG}') run only when named",
     )
     parser.add_argument("--summary", type=Path)
+    parser.add_argument(
+        "--json",
+        type=Path,
+        help="write the raw per-repetition samples, SHAs, defines, environment and CPU here (#573 B4)",
+    )
     parser.add_argument(
         "--holes-report",
         action="store_true",
@@ -430,13 +646,15 @@ def main() -> int:
     parser.add_argument(
         "--head-env",
         default="",
-        help="KEY=VALUE pairs (space separated) set on the head arm only, e.g. MIMALLOC_ARENA_PURGE_MULT=1",
+        help="KEY=VALUE pairs (space separated) set on the head arm only, e.g. "
+        f"MIMALLOC_ARENA_PURGE_MULT=1; several variants separated by {VARIANT_SEPARATOR!r} run "
+        "as several head arms of one rotation (#573 B5)",
     )
     parser.add_argument(
         "--head-cppdefs",
         default="",
         help="defines (';' or space separated) the head arm's library is built with, as "
-        "-DMI_EXTRA_CPPDEFS, e.g. MI_ENABLE_LARGE_PAGES=0",
+        f"-DMI_EXTRA_CPPDEFS, e.g. MI_ENABLE_LARGE_PAGES=0; variants separated by {VARIANT_SEPARATOR!r}",
     )
     parser.add_argument(
         "--no-sanity-gate",
@@ -444,106 +662,128 @@ def main() -> int:
         help=f"do not stop after the first repetition when a head RSS metric exceeds "
         f"{SANITY_FACTOR}x base + {SANITY_SLACK_MIB:g} MiB (#573)",
     )
+    parser.add_argument(
+        "--force-kind",
+        choices=sorted(BUILDS),
+        help="build every row with this BUILDS kind (e.g. fp: frame pointers for perf/callers, #573 A4)",
+    )
     args = parser.parse_args()
-    head_env = parse_env(args.head_env)
-    cppdefs = parse_cppdefs(args.head_cppdefs)
+    variants = parse_variants(args.head_env, args.head_cppdefs)
     workloads = select(args.workloads)
     if not workloads:
         parser.error(f"no workload matches {args.workloads!r}")
+    if args.force_kind:
+        workloads = {n: (args.force_kind, p) for n, (_, p) in workloads.items()}
+    args.max_reps = max(args.max_reps, args.reps)
     bound_ms = int(json.loads(RATCHET.read_text())["bound_ms"])
+    head_arms = [v.arm for v in variants]
+    arms = ["base", *head_arms, *([NULL_ARM] if args.null_arm else [])]
+    env_of = {"base": {}, NULL_ARM: {}, **{v.arm: v.env for v in variants}}
+    cpu = cpu_model()
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         try:
-            kinds = {k for k, _ in workloads.values()}
+            wanted: set[str] = {k for k, _ in workloads.values()}
             if args.holes_report:
-                kinds.add(HOLES_KIND)
-            exes = {
-                (arm, kind): build(arm, ref, work, kind, cppdefs if arm == "head" else [])
-                for arm, ref in (("base", args.base), ("head", args.head))
-                for kind in sorted(kinds)
-            }
-            sizes = probe_sizes(workloads, cppdefs)
-            probe_kind = min(k for _, k in exes)  # a bin is the same in every BUILDS kind
+                wanted.add(HOLES_KIND)
+            kinds = sorted(wanted)
+            exes = {("base", kind): build("base", args.base, work, kind, []) for kind in kinds}
+            for v in variants:
+                for kind in kinds:
+                    exes[(v.arm, kind)] = build(
+                        v.arm, args.head, work, kind, v.cppdefs, tree_name="head"
+                    )
+            for kind in kinds:
+                exes[(NULL_ARM, kind)] = exes[("base", kind)]  # the same binary: only luck differs
+            sizes = probe_sizes(workloads, [d for v in variants for d in v.cppdefs])
+            probe_kind = min(kinds)  # a bin is the same in every BUILDS kind
             probes = {
                 arm: probe(exes[(arm, probe_kind)], sizes) if sizes else {}
-                for arm in ("base", "head")
+                for arm in ["base", *head_arms]
             }
             samples: dict[tuple[str, str], list[list[float]]] = {
-                (w, a): [] for w in workloads for a in ("base", "head")
+                (w, a): [] for w in workloads for a in arms
             }
+
+            def run_rep(rep: int, rows: Iterable[str]) -> None:
+                for workload in rows:
+                    kind, params = workloads[workload]
+                    for arm in arms if rep % 2 == 0 else reversed(arms):
+                        env = {**os.environ, **BUILDS[kind][1], **env_of[arm]}
+                        samples[(workload, arm)].append(
+                            measure(exes[(arm, kind)], params, env, bound_ms)
+                        )
+
             for rep in range(args.reps):
-                for workload, (kind, params) in workloads.items():
-                    for arm in ("base", "head") if rep % 2 == 0 else ("head", "base"):
-                        exe = str(exes[(arm, kind)])
-                        env = {
-                            **os.environ,
-                            **BUILDS[kind][1],
-                            **(head_env if arm == "head" else {}),
-                        }
-                        cmd = [exe, *map(str, params), str(bound_ms)]
-                        values = list(map(float, run(cmd, env=env).split()))
-                        for index, metric in enumerate(METRICS):
-                            if metric in IN_MIB:
-                                values[index] /= 2**20
-                        samples[(workload, arm)].append(values)
+                run_rep(rep, workloads)
                 if rep == 0 and not args.no_sanity_gate:
-                    broken = sanity_failures(
-                        {key: value[0] for key, value in samples.items()}, workloads
-                    )
+                    broken: list[str] = []
+                    for arm in head_arms:
+                        first = {(w, "base"): samples[(w, "base")][0] for w in workloads}
+                        first |= {(w, "head"): samples[(w, arm)][0] for w in workloads}
+                        broken += [f"[{arm}] {m}" for m in sanity_failures(first, workloads)]
                     if broken:  # fail in minutes, not after the whole run (#573)
                         message = "sanity gate (first repetition, #573):\n  " + "\n  ".join(broken)
                         print(message)
                         if args.summary:
                             args.summary.write_text(message + "\n")
                         return 1
+            # #573 B6: extra reps only where the ledger cannot yet say pass or fail
+            done = args.reps
+            while done < args.max_reps:
+                pending = [
+                    w
+                    for w in workloads
+                    if any(
+                        perf_ab_ledger.inconclusive(
+                            ledger_row(
+                                samples[(w, "base")],
+                                samples[(w, arm)],
+                                samples[(w, NULL_ARM)] if args.null_arm else None,
+                            )[1]
+                        )
+                        for arm in head_arms
+                    )
+                ]
+                if not pending:
+                    break
+                for rep in range(done, min(done + ADAPTIVE_STEP, args.max_reps)):
+                    run_rep(rep, pending)
+                done = min(done + ADAPTIVE_STEP, args.max_reps)
             reports: dict[tuple[str, str], str] = {}
             if args.holes_report:  # untimed, after every timed rep
                 for workload, (_kind, params) in workloads.items():
-                    for arm in ("base", "head"):
-                        env = {**os.environ, **HOLES_ENV, **(head_env if arm == "head" else {})}
+                    for arm in ["base", *head_arms]:
+                        env = {**os.environ, **HOLES_ENV, **env_of[arm]}
                         cmd = [str(exes[(arm, HOLES_KIND)]), *map(str, params), str(bound_ms)]
                         reports[(workload, arm)] = run_stderr(cmd, env)
+            data = (
+                artifact(args, variants, workloads, samples, bound_ms, cpu) if args.json else None
+            )
         finally:  # unregister the trees while they still exist: a prune here would find nothing to prune
             for tree in work.glob("src-*"):
                 run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
-    rows = header(args.base, args.head, args.head_env, cppdefs, cpu_model(), args.reps)
-    for workload in workloads:
-        cells: list[str] = []
-        for index, _metric in enumerate(METRICS):
-            base = [s[index] for s in samples[(workload, "base")]]
-            head = [s[index] for s in samples[(workload, "head")]]
-            mid, low, high = paired(base, head)
-            delta = f"{mid:+.1f}% [{low:+.1f}, {high:+.1f}]"
-            if low > 0 or high < 0:
-                delta = f"**{delta}**"
-            cells.append(
-                f"{statistics.median(base):,.4g} -> {statistics.median(head):,.4g}<br>{delta}"
-            )
-        rows.append(f"| {workload} | " + " | ".join(cells) + " |")
-    # #491: the release promise, per workload, on head; the worst P95 is the evidence a lower
-    # bound in ci/release_ratchet.json needs (`p95_release_ms`)
-    release = METRICS.index("release ms")
-    p95 = {
-        w: percentile([s[release] for s in samples[(w, "head")]], RELEASE_PERCENTILE)
-        for w in workloads
-    }
-    late = {w: p for w, p in p95.items() if p > bound_ms}
-    worst = max(p95, key=lambda w: p95[w])
-    rows.append("")
-    rows.append(
-        f"Release bound (ci/release_ratchet.json): {bound_ms} ms; head P{RELEASE_PERCENTILE} "
-        f"release, worst workload: {p95[worst]:.0f} ms ({worst}) -- "
-        + (", ".join(f"**{w}: {p:.0f} ms, LATE**" for w, p in late.items()) or "held")
-    )
-    if sizes:
-        rows += probe_rows(sizes, probes["base"], probes["head"])
-    if reports:
-        rows += holes_rows(reports)
+    if args.json and data is not None:
+        args.json.write_text(json.dumps(data, indent=1) + "\n")
+    rows: list[str] = []
+    held = True
+    for variant in variants:
+        if len(variants) > 1:
+            rows += [
+                "",
+                f"### {variant.arm}: `{variant.env_text or '-'}` / `{';'.join(variant.cppdefs) or '-'}`",
+                "",
+            ]
+        text, ok = render_variant(
+            variant, args, workloads, samples, bound_ms, cpu, probes, sizes, reports
+        )
+        rows += text
+        held = held and ok
     table = "\n".join(rows) + "\n"
     print(table)
     if args.summary:
         args.summary.write_text(table)
-    return 1 if late else 0
+    return 0 if held else 1
 
 
 if __name__ == "__main__":
