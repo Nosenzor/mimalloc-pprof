@@ -63,10 +63,11 @@ typedef char mi_scav_atomic_widths_assert_t[
 
     RUNNING  -- only the owner may touch its theaps (the normal state)
     PARKED   -- the owner published "I will not allocate or free until I say otherwise"
-    SWEEPING -- the scavenger claimed a PARKED tld and is doing its idle work right now
+    SWEEPING -- a sweeper claimed a PARKED tld and is working on its theaps right now
 
-  Only the owner takes a tld out of RUNNING; only the scavenger takes it PARKED -> SWEEPING
-  and back. SWEEPING is what keeps the tld alive across a sweep without holding
+  Only the owner takes a tld out of RUNNING; only a sweeper (the scavenger, `mi_purge_all`,
+  the arena reclaim, the diagnostic walk; #366) takes it PARKED -> SWEEPING and back.
+  SWEEPING is what keeps the tld alive across a sweep without holding
   `subproc->tlds_lock`: every path out of a park (`mi_on_thread_idle_end`, and thread
   teardown / fork-prepare via `_mi_park_leave`) waits for SWEEPING to clear first.
 ----------------------------------------------------------- */
@@ -116,7 +117,8 @@ static mi_theap_t* mi_tld_sweep_theap0(mi_tld_t* tld) {
 //
 // `force` reaches both per-page loops: `MI_FORCE` for the collect, and for the hole sweep it
 // skips the `purge_holes_min_interval` pacing and (MI_GATE_FLAG_RECLAIM_IGNORED, set by the
-// claimant) lets the sweep run to completion instead of stopping at the owner's reclaim.
+// claimant) lets the hole walk run to completion instead of stopping at the owner's reclaim
+// (the collect's per-page loop and the abandoned-page pass still stop at it).
 void _mi_thread_idle_work_ex(mi_tld_t* tld, mi_theap_t* theap0, bool force) {
   if (tld == NULL) return;
   const bool foreign = (tld->thread_id != _mi_thread_id());
@@ -320,13 +322,15 @@ static _Atomic(uintptr_t) _mi_scavenger_running;  // 0 = not running, 1 = runnin
 // thread any more. Without it `_mi_scavenger_start_lazy` -- reachable from a thread that parks
 // while the process is tearing down -- can spawn a scavenger AFTER the stop that was supposed
 // to join it, leaving a thread walking a subproc that is being dismantled.
-// #366: the scavenger's own thread id. In a Windows DLL build the loader's TLS callback runs
-// `mi_win_main(DLL_THREAD_ATTACH)` -> `mi_thread_init` for EVERY new thread, this one included,
-// so the scavenger owns a registered tld it never allocates from and never parks -- a thread
-// that would sit RUNNING forever and be reported "pending" by every `mi_purge_all`. The walk
-// skips it (src/purge-all.c) -- by POINTER, never by thread id: a fork child's first new thread
-// reuses the dead sibling's TLS base, i.e. its id, and an id match would alias that orphan.
-// NULL until the thread runs, or when it has no tld (every non-DLL build); reset in the child.
+// #366: the scavenger's own tld, if it ever had one. It was added for a Windows DLL build on the
+// belief that the loader's TLS callback runs `mi_thread_init` for every new thread; it does not
+// (`mi_win_main` ignores DLL_THREAD_ATTACH), and the scavenger never initialises a theap of its
+// own (#272 invariant 3, asserted at the end of `mi_scavenger_run`), so this is NULL in every
+// build today. A registered tld the scavenger never allocates from and never parks would sit
+// RUNNING forever and be reported "pending" by every `mi_purge_all`, so the walks still skip it
+// (src/purge-all.c, src/arena-reclaim.c) -- by POINTER, never by thread id: a fork child's first
+// new thread reuses the dead sibling's TLS base, i.e. its id, and an id match would alias that
+// orphan. Reset in the child.
 static _Atomic(uintptr_t) _mi_scavenger_tld;
 mi_tld_t* _mi_scavenger_tld_ptr(void) { return (mi_tld_t*)mi_atomic_load_acquire(&_mi_scavenger_tld); }
 

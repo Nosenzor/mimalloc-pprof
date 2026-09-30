@@ -50,11 +50,14 @@ typedef size_t mi_purge_park_state_t;
   to it -- a report is "what left during this call", not "what this call's own madvise calls
   discarded", and it never under-reports what the caller asked for.
 
-  - `hole_bytes`: `mi_purge_holes_stats_get().purged_bytes_total`, bytes ever discarded by
-    hole punching (src/page-holes.c).
+  - `hole_bytes`: `mi_purge_holes_stats_get().purged_bytes_total`, bytes of free blocks ever
+    discarded by hole punching (src/page-holes.c).
   - `arena_bytes`: the sum over subprocs of `stats.purged.total` -- which `_mi_os_purge*` AND
     `_mi_os_discard` (the hole path) both feed -- minus the hole delta, clamped at zero. So it
-    is the OS-level bytes purged by the arena passes (A, E, and the collects' page frees).
+    is the OS-level bytes purged by the arena passes (A, E, and the collects' page frees),
+    plus the sweep's unformed-tail discards (and, from a concurrent scavenger tick, the tail
+    and slack discards of released retired pages): those go through `_mi_os_discard` but
+    never reach `purged_bytes_total`.
 ----------------------------------------------------------- */
 
 typedef struct mi_purge_snapshot_s {
@@ -149,7 +152,7 @@ typedef struct mi_purge_walk_s {
 static mi_tld_t* mi_purge_walk_claim(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purge_walk_t* w, bool* unstamped) {
   mi_tld_t* claimed = NULL;
   const uintptr_t me = (uintptr_t)_mi_thread_id();
-  mi_tld_t* const scav_tld = _mi_scavenger_tld_ptr();   // NULL: the scavenger has no tld (every non-DLL build), or none runs
+  mi_tld_t* const scav_tld = _mi_scavenger_tld_ptr();   // NULL in every build today (see `_mi_scavenger_tld`); kept as a guard
   *unstamped = false;
   mi_lock(&sp->tlds_lock) {
     for (mi_tld_t* tld = sp->tlds; tld != NULL; tld = tld->subproc_next) {
@@ -158,7 +161,7 @@ static mi_tld_t* mi_purge_walk_claim(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purg
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);
         continue;
       }
-      if (scav_tld != NULL && tld == scav_tld) {                           // the scavenger's own tld (Windows DLL build):
+      if (scav_tld != NULL && tld == scav_tld) {                           // the scavenger's own tld, if it ever has one:
         mi_atomic_store_relaxed(&tld->purge_epoch, w->seq);                // it owns nothing and never parks -- neither swept nor pending
         continue;
       }

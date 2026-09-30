@@ -794,8 +794,9 @@ bool _mi_theap_area_visit_blocks(const mi_heap_area_t* area, mi_page_t* page, mi
   // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b):
   // purged blocks are free too, but held off the free list (see `src/page-holes.c`): a block is
   // purged exactly when it overlaps a discarded OS page. Marking them free here is what keeps a
-  // visitor (mi_heap_visit_blocks, the DHAT/memory-events walkers, mi_prof_snapshot) from ever
-  // being handed a pointer into discarded memory (#272 profiler-interaction point 2).
+  // visitor (mi_heap_visit_blocks, mi_theap_visit_blocks, mi_memory_visit_live_allocations, the
+  // diagnostic walk behind mi_heap_dump_json) from ever being handed a pointer into discarded
+  // memory (#272 profiler-interaction point 2).
   size_t purged_count = 0;
   if (mi_page_has_purged(page)) {
     for (size_t blockidx = 0; blockidx < page->capacity; blockidx++) {

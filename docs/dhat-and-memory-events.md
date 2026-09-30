@@ -6,9 +6,13 @@
 
 `<mimalloc/dhat.h>` provides an **exact**, high-overhead heap/lifetime observer that
 writes [DHAT file-version 2](https://valgrind.org/docs/manual/dh-manual.html) JSON for
-`dh_view.html`. Unlike the production-oriented sampled pprof profiler, it retains one
-raw-OS-backed record for every observed live allocation. Use it for short tests and
-focused investigations, not a continuously running production workload.
+`dh_view.html`. Unlike the production-oriented sampled pprof profiler, it keeps one
+raw-OS-backed record for every allocation it observes. A freed allocation's record is
+unlinked but its memory is not reused, so collector memory grows with the number of
+allocations in the session, not with the live set: about 49 bytes each in a measured run,
+so the default 64 MiB budget covers roughly 1.3 million allocations. Nothing is returned
+until the next `mi_dhat_start`. Use it for short tests and focused investigations, not a
+continuously running production workload.
 
 **DHAT is opt-in at build time** and compiled out by default: configure CMake with
 `-DMI_DHAT=ON` (default `OFF`), enable the Rust crate's `dhat` feature
@@ -37,8 +41,11 @@ not allocator slack, and emits heap/lifetime metrics only (`bklt: true`, `bkacc:
 it does **not** claim reads, writes, copy traffic, access histograms, or instruction
 counts.
 
-Set `MIMALLOC_DHAT=1` to start at process initialization and
-`MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json` to write an exit report. The timestamps
+`MIMALLOC_DHAT=1` is meant to start DHAT at process initialization, but that is a
+**known issue** today: the variable is read into a buffer smaller than `_mi_getenv`'s
+64-byte minimum, so it is never seen and DHAT stays off. Until that is fixed, call
+`mi_dhat_start()` (Rust: `dhat::start()`) yourself.
+`MIMALLOC_DHAT_DUMP_AT_EXIT=heap.dhat.json` writes an exit report and is unaffected. The timestamps
 are monotonic wall-clock milliseconds (`tu: "ms"`), not Valgrind instruction counts.
 `MIMALLOC_DHAT_MAX_BYTES` bounds persistent raw-OS collector state (default 64 MiB).
 When the budget is exhausted the application allocation still succeeds; the collector

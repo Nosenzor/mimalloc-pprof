@@ -6,16 +6,23 @@ Every divergence from upstream mimalloc, with its origin and current upstream st
 point is that you should not have to read git history to answer *"is this theirs, ours, or
 someone else's?"* — which matters most when deciding whether to depend on a behaviour.
 
-**Total C-core divergence: ~2,340 lines**, of which ~1,970 are new files. The patches into
-upstream's own files come to about 60 lines across 11 files — deliberately small, because
-every one of them is a line that has to be re-reasoned on each upstream sync.
+**Total C-core divergence from the pinned base: about 13,900 added lines** (`git diff
+--shortstat 6def7be9 HEAD -- src include`), of which about 8,800 are 21 new files. The
+patches into upstream's own files now come to about +5,100/−350 lines across 32 files. The
+bulk of that is the Bun imports (the scavenger and idle handoff, hole purging, fork safety,
+the heap-teardown protocol; see the README's [Bun features](../README.md#bun-features)
+table), this fork's own `mi_purge_all` and arena reclaim, and the comments that explain
+them. New
+logic still goes into new files, because every line patched into an upstream file has to
+be re-reasoned on each upstream sync.
 
 ## Features (new files — none of this exists upstream)
 
 | Feature | Source | Upstream status | Where |
 |---|---|---|---|
-| pprof-compatible sampled heap profiler | this fork | not upstream — but see the note below | `src/profile.c` (893), `src/profile-stack.c` (185), `src/profile-maps.c` (172), `include/mimalloc/profile.h` |
-| Memory-events accounting + callbacks | this fork | not upstream | `src/memory-events.c` (408), `include/mimalloc/memory-events.h` |
+| pprof-compatible sampled heap profiler | this fork | not upstream — but see the note below | `src/profile.c` (1151), `src/profile-stack.c` (210), `src/profile-maps.c` (172), `include/mimalloc/profile.h` |
+| Memory-events accounting + callbacks | this fork | not upstream | `src/memory-events.c` (628), `include/mimalloc/memory-events.h` |
+| DHAT v2 exact heap profiler (`mi_dhat_*`, opt-in `MI_DHAT`) | this fork | not upstream | `src/dhat.c` (640), `src/dhat-stack.c` (47), `include/mimalloc/dhat.h` |
 | `mi_unwrapped_*` non-recursive scratch allocator | this fork | not upstream | `src/memory-events.c` |
 | Rust crate + `GlobalAlloc`, incl. the zeroing-realloc family | this fork | n/a | `rust/mimalloc-pprof/` |
 
@@ -44,25 +51,28 @@ The first three are described in depth in [upstream bugs](upstream-bugs.md).
 |---|---|---|
 | Zero-tracking — `zalloc` skips its `memset` after a zeroing purge | idea from [Bun](https://github.com/oven-sh/mimalloc); implementation ours | on `main` since the v4 line was dissolved (#129), **off by default** (`mi_option_purge_zeroes`). −10.8% on the anti-workload on Windows; **no effect on Linux**; macOS unmeasured |
 | Zero the new TLS slots after the slot array grows | code from [`oven-sh/mimalloc@d078ad06`](https://github.com/oven-sh/mimalloc/commit/d078ad06), MIT | landed in #148. `rezalloc` preserves the uninitialized slack between the requested size and the bin size, and `_mi_thread_local_get` validates a slot only by its version lane — so garbage could be returned as a `mi_theap_t*`. Bun fixed the zeroing; we had separately fixed the array's provenance (#128 B3), which **they still lack**. Each fork had one half |
+| Background scavenger thread + `mi_on_thread_idle*` | [Bun](https://github.com/oven-sh/mimalloc) @ `942b8342`, MIT | imported by #272 (landed as #299), **on by default** (`mi_option_scavenger`). The objection this page used to record — a purge decommitting a page that a live sample record still points into — is met by construction: records live in the profiler's raw-OS arena, every free unlinks its record before a page can go back to the arena, and `mi_arenas_page_free_ex` asserts that in `MI_PPROF` debug builds |
+| Page hole purging (`purge_holes*`) | Bun @ `942b8342`, MIT | imported by #272 (landed as #302), **on by default** (`mi_option_purge_holes`). The engine lives in the new `src/page-holes.c` rather than in `src/page.c`, which carries only single-line calls. It does not change what `mi_usable_size` or the memory-events counters report |
 
 ## Deliberately not adopted
 
 | Change | Source | Why not |
 |---|---|---|
-| Background purge thread | Bun | purge can decommit a page a live sample record still points into — use-after-decommit at dump time, as the *default* behaviour |
-| Hole purging | Bun | ~1000 lines in the file we already patch most; changes what `mi_usable_size` and our memory-events counters mean |
 | `mi_theap_merge_stats` NULL guard | Bun | already fixed differently upstream (`b6dc592b`); **Bun dropped it too** |
 | Arena/page-map rollback helper | Bun | already fixed differently upstream (`66fd7a99`); **Bun dropped it too** |
 | MetaSafe liveness bits, `MI_MUSL_BUILTIN`, Arma 3 defaults | various | see [`MIMALLOC_FORKS.md`](../MIMALLOC_FORKS.md) |
 
 Reasoning and per-change ratings for the whole fork survey are in
-[`MIMALLOC_FORKS.md`](../MIMALLOC_FORKS.md).
+[`MIMALLOC_FORKS.md`](../MIMALLOC_FORKS.md). The complete list of what was imported from Bun,
+with the PR that landed each piece, is the README's [Bun features](../README.md#bun-features)
+table.
 
 ## Engine
 
-Tracks `upstream/dev3`, pinned at **`bcee5a88`**. The pin is bumped deliberately rather than
-continuously — see [#80](https://github.com/zackees/mimalloc-pprof/issues/80) for the method
-and what the last bump found.
+Tracks `upstream/dev3`, pinned at **`6def7be9`** (Bun's merge-base), bumped from `bcee5a88`
+by [#266](https://github.com/zackees/mimalloc-pprof/issues/266). The pin is bumped
+deliberately rather than continuously — see
+[#80](https://github.com/zackees/mimalloc-pprof/issues/80) for the method.
 
 ## What the hardening pass changed
 

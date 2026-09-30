@@ -72,7 +72,7 @@ the next allocation:
 
 | Option | Env var | Default | What it does |
 |---|---|---|---|
-| `mi_option_scavenger` | `MIMALLOC_SCAVENGER` | `1` | Runs a background thread that purges arena memory on a timer (`mi_option_purge_delay`, `MIMALLOC_PURGE_DELAY`, 100 ms in this fork) instead of only on allocation. `mi_scavenger_stop()` stops it for good; it restarts on demand unless stopped. |
+| `mi_option_scavenger` | `MIMALLOC_SCAVENGER` | `1` | Runs a background thread that purges arena memory on a timer (`mi_option_purge_delay`, `MIMALLOC_PURGE_DELAY`, 100 ms in this fork) instead of only on allocation. It starts lazily, when a second thread of the main sub-process initializes or a thread first parks. `mi_scavenger_stop()` stops it for good: nothing starts it again in that process (a `fork()`ed child starts afresh), and a due purge then runs inline, as upstream does. |
 | `mi_option_purge_holes` | `MIMALLOC_PURGE_HOLES` | `1` | At each idle point, discards the free blocks **inside** a still-used page (in OS-page units), so one long-lived object no longer pins the whole page resident. |
 | `mi_option_purge_holes_min_interval` | `MIMALLOC_PURGE_HOLES_MIN_INTERVAL` | `100` (ms) | Minimum time between two hole sweeps of the same thread's heaps. |
 | `mi_option_purge_holes_eager_zero` | `MIMALLOC_PURGE_HOLES_EAGER_ZERO` | `0` | Debug/test knob: zero a range before discarding it, so a mis-scoped discard corrupts visibly rather than silently on an OS that reclaims lazily. Always on when `MI_DEBUG>1`. Makes discarding more expensive, not cheaper. |

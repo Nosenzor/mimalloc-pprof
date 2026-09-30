@@ -7,8 +7,9 @@
    block size matching a page size. #374 captures pages and their blocks together
    using raw-OS scratch storage.
 
-   Independent of MI_PPROF (src/heap-dump.c is unconditional), so this test is built and
-   registered unconditionally too, like test-memory-events.c / test-dhat.c. */
+   Independent of MI_PPROF. Since #414 src/heap-dump.c compiles in only with MI_DIAGNOSTICS
+   (stubs otherwise), and this test is built and registered only under the same flag, the
+   way test-memory-events.c / test-dhat.c follow MI_MEMEVT / MI_DHAT. */
 #ifdef NDEBUG
 #undef NDEBUG
 #endif

@@ -32,7 +32,8 @@ terms of the MIT license.
    that). glibc's list is unbounded, so this case only bites on macOS.
 
    Case A is probabilistic. Case B is made deterministic via the
-   MI_DEBUG-gated mi_debug_stall_in_theap_init hook (see src/theap.c).
+   MI_DEBUG-gated mi_debug_stall_in_thread_theaps_done hook (see src/init.c;
+   imported under the same name from Bun's init.c).
 
    Expected with bugs present: case_b child times out (SIGALRM -> exit 2).
 
@@ -140,7 +141,7 @@ static int case_a(void) {
 
 // ---------------------------------------------------------------------------
 // Case B: deterministic -- fork while another thread holds tld->theaps_lock
-// inside _mi_theap_init; child should be able to mi_heap_delete without
+// inside mi_thread_theaps_done; child should be able to mi_heap_delete without
 // blocking on that vanished thread's tld lock.
 //
 // #272 re-enabled this: `mi_debug_stall_in_thread_theaps_done` now exists (src/init.c) and
@@ -175,10 +176,12 @@ static int case_b(void) {
   if (pid == 0) {
     signal(SIGALRM, on_alarm);
     alarm(5);
-    // child: stalled thread is gone; its tld->theaps_lock is still held.
-    // fork_child re-inits heap-level locks but not dead-thread tld locks.
-    // mi_heap_delete -> _mi_heap_detach_theaps -> acquires
-    // theap->tld->theaps_lock for the vanished thread's theap -> deadlock.
+    // child: stalled thread is gone; its tld->theaps_lock was held at the fork.
+    // Before #272 fork_child re-initialized heap-level locks but not dead-thread
+    // tld locks, so mi_heap_delete -> _mi_heap_detach_theaps -> acquiring
+    // theap->tld->theaps_lock for the vanished thread's theap never succeeded
+    // (the alarm fires). `_mi_process_fork_child` now re-initializes every
+    // registered tld's theaps_lock, so this returns.
     mi_heap_delete(g_heap);
     _exit(0);
   }

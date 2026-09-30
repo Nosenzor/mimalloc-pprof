@@ -4,13 +4,15 @@ mi-heapview: query a mimalloc heap snapshot written by mi_heap_snapshot().
 Standalone tool with no dependency on the mimalloc library; only depends on
 the binary snapshot format (see src/heap-snapshot.c).
 
-Usage:
+Usage (see usage() below for the authoritative list):
   mi-heapview <snapshot> summary
-  mi-heapview <snapshot> sizes   [--bytes] [--top N]
+  mi-heapview <snapshot> sizes   [--top N] [--by-tid|--by-heap]
   mi-heapview <snapshot> frag    [--top N] [--min-waste BYTES]
   mi-heapview <snapshot> arenas
-  mi-heapview <snapshot> pages   [--top N] [--size BYTES] [--sort waste|addr|used]
+  mi-heapview <snapshot> pages   [--top N] [--size BYTES] [--sort waste|addr|used] [--min-waste BYTES]
   mi-heapview <snapshot> blocks  --addr 0xADDR
+  mi-heapview <snapshot> diff    <snapshot2> [--top N] [--by-tid|--by-heap]
+  mi-heapview <snapshot> peek    --core FILE --size BYTES [--tid T] [--sample N] [--bytes N]
   mi-heapview <snapshot> json
 
 All sizes printed in bytes unless --human. Output is column-aligned plain text

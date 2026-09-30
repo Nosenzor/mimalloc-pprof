@@ -11,10 +11,13 @@ terms of the MIT license. A copy of the license can be found in the file
 // mimalloc-pprof: imported verbatim from oven-sh/mimalloc @ b20b60d9 (MIT), issue #338
 // (Bun parity). Format version 1 is a parity contract -- a snapshot from either allocator
 // must open in either viewer -- so this file carries no fork extensions; the reference
-// reader in examples/heap-snapshot/mi_snapshot.py is the executable format spec. Two
-// local deviations, both outside the format: the two arena.c helpers below are declared
-// here because this tree's internal.h does not export them, and the exit message goes
-// through `_mi_verbose_message` (this tree has no ungated `_mi_message`).
+// reader in examples/heap-snapshot/mi_snapshot.py is the executable format spec. Five
+// local deviations, none of which changes the format: the two arena.c helpers below
+// are declared here because this tree's internal.h does not export them; the exit message
+// goes through `_mi_verbose_message` (this tree has no ungated `_mi_message`); the #414
+// `MI_DIAGNOSTICS` guard and its stubs; the #366 owner-gate enter/leave around
+// `mi_heap_snapshot`; and the inverted `_mi_getenv` test in `_mi_heap_snapshot_on_exit`
+// (this tree's returns an errno-style code, Bun's a bool).
 //
 // Allocation discipline (CLAUDE.md rule 4 spirit): the writer allocates nothing -- a
 // 16 KiB stack buffer and a 512-byte stack free-map -- so it is safe to run from
@@ -22,10 +25,11 @@ terms of the MIT license. A copy of the license can be found in the file
 //
 // The snapshot is a point-in-time, best-effort view intended for answering
 // "why is this process using so much memory". It does not stop other threads,
-// so counts for pages owned by other threads may be slightly stale. All reads
-// of shared state are done through atomics or const fields; no page state is
-// mutated except for pages owned by the calling thread when MI_SNAPSHOT_BLOCKS
-// is requested (those pages have their free lists collected).
+// so counts for pages owned by other threads may be slightly stale: arena slots,
+// bitmap words and the page owner are read atomically, but another thread's
+// `used`/`capacity`/`reserved` are plain reads of fields its owner is writing. No
+// page state is mutated except for pages owned by the calling thread when
+// MI_SNAPSHOT_BLOCKS is requested (those pages have their free lists collected).
 
 #include "mimalloc.h"
 #include "mimalloc/internal.h"
@@ -61,7 +65,9 @@ uint8_t* mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);  // arena.
 #endif
 
 // ---------------------------------------------------------------------------
-// Binary format (little-endian). Keep in sync with tools/mi-heapview.c.
+// Binary format (host byte order: every integer is a memcpy of a native value; every target
+// this fork builds and tests is little-endian, which is what the readers decode). Keep in
+// sync with tools/mi-heapview.c.
 // ---------------------------------------------------------------------------
 
 #define MI_SNAPSHOT_MAGIC    0x5348494Du   // 'MIHS'
@@ -175,8 +181,8 @@ static void mi_snap_emit_page_freemap(mi_snap_out_t* out, mi_page_t* page) {
       size_t idx = (hi + off) >> shift;
       if (idx < cap) { map[idx >> 3] |= (uint8_t)(1u << (idx & 7)); }
     }
-    // purged blocks are free as well, but held off the free list (see the hole purging
-    // section in `page.c`): a block is purged when it overlaps a discarded OS page.
+    // purged blocks are free as well, but held off the free list (see the header of
+    // `src/page-holes.c`): a block is purged when it overlaps a discarded OS page.
     if (mi_page_has_purged(page)) {
       for (size_t idx = 0; idx < cap; idx++) {
         if (mi_page_block_index_is_purged(page, idx)) { map[idx >> 3] |= (uint8_t)(1u << (idx & 7)); }

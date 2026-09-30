@@ -24,8 +24,10 @@ terms of the MIT license. A copy of the license can be found in the file
 
    The bar is deliberately far below what a healthy allocator does: upstream mimalloc, Bun's
    fork, jemalloc and tcmalloc all measure 2.5-2.6x on the 4-vCPU runner, and this fork
-   measured 5.3x locally after the fix, so 2.0x leaves a wide margin for a noisy shared
-   machine while still failing a regression that lands anywhere near 1.0x. A test that only
+   measured 5.3x locally after the fix. The floor is `MIN_SPEEDUP` (1.20x, from 1 to 4
+   threads; the measurements behind it are next to its definition), which leaves a wide
+   margin for a noisy shared machine while still failing a regression that lands anywhere
+   near 1.0x. A test that only
    passes on a quiet machine belongs in the RUN_SERIAL group, which is where this is
    registered -- never behind a retry.
 */

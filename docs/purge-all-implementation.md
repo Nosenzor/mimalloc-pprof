@@ -60,8 +60,8 @@ New fields on `mi_tld_t`, appended at the **tail** (after `holes_sweep_visited`;
 | `purge_epoch` | `_Atomic(size_t)` | purge driver, `mi_tld_register` | walk progress / cutoff |
 | `gate_flags` | `_Atomic(size_t)` | fork child, purge driver | bit 0 `orphan` (inherited from a vanished pre-fork thread); bit 1 `reclaim_ignored` (this claimed sweep ignores `park_reclaim`) |
 
-Process-wide: `_Atomic(uintptr_t) mi_purge_admission` (holder thread id, 0 = free),
-`_Atomic(size_t) mi_purge_seq`.
+Process-wide: `_Atomic(uintptr_t) _mi_purge_admission` (holder thread id, 0 = free),
+`_Atomic(size_t) _mi_purge_seq`.
 
 `gate_depth` and `gate_flags` exist in both builds (so `mi_tld_t` layout does not depend
 on the flag and the Rust layout probe stays single); only the gated build reads them.
@@ -236,8 +236,8 @@ profiler bookkeeping emitted by a foreign sweep is attributed to the purging thr
 ## 7. `mi_purge_all_ex` (`src/purge-all.c`, new; included from `src/static.c` unconditionally)
 
 ```
-seq = ++mi_purge_seq
-if !CAS(mi_purge_admission, 0 -> me): return MI_PURGE_BUSY        // before any work
+seq = ++_mi_purge_seq
+if !CAS(_mi_purge_admission, 0 -> me): return MI_PURGE_BUSY        // before any work
 A. for each subproc: _mi_arenas_try_purge(force, visit_all=true, sp, 0)   (FORCE)
                      or _mi_arenas_purge_now(sp)                            (otherwise)
 B. for each subproc, under sp->heaps_lock: for each heap (skip heap->releasing):
@@ -277,7 +277,7 @@ Rules the loop encodes:
 
 - **No pointer to an unclaimed tld leaves `tlds_lock`** — the scavenger's rule, and what
   makes the no-leave teardown in §5.1 safe.
-- **Registry cutoff**: `mi_tld_register` (`src/init.c`) stamps `purge_epoch = mi_purge_seq`
+- **Registry cutoff**: `mi_tld_register` (`src/init.c`) stamps `purge_epoch = _mi_purge_seq`
   under `tlds_lock`, so threads created during a walk are excluded and thread churn cannot
   extend it.
 - **Bounded waiting**: `wait_ms` bounds acquisition only. A worker blocked inside an
@@ -349,10 +349,10 @@ completion. `subprocs_pending == 0 && !layer_busy` is reported as `reclaimed`.
   clear `reclaim_ignored`. Orphans keep `park_state = RUNNING` as today; their pages are
   reclaimed by the existing #271 mechanisms (`_mi_process_is_forked_child`-gated
   re-derivation from the arena bitmaps), which this plan does not touch.
-- Child reset also clears `mi_purge_admission` (a purge in flight in the parent must not
+- Child reset also clears `_mi_purge_admission` (a purge in flight in the parent must not
   leave the child permanently `BUSY`; same class as `_mi_arenas_fork_child`).
 - Lock-order table: no new `mi_lock_t`. Add entries under "non-lock state with child
-  resets" for `mi_purge_admission`, `sweeper`, and the documented cross-tld ordering
+  resets" for `_mi_purge_admission`, `sweeper`, and the documented cross-tld ordering
   *self `RUNNING` → other `SWEEPING`* (a sweeper never waits on the owner it holds).
 - `MI_DEBUG>2` checker: the walk's edges (`tlds_lock` → claim CAS → release → sweep body's
   existing edges) are already tabled; `test-fork-locks` gets a case to prove it.

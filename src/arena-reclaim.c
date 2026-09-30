@@ -335,7 +335,7 @@ static void mi_arena_reclaim_release_heap_pages(mi_subproc_t* subproc, mi_heap_t
 static bool mi_arena_reclaim_claim_all(mi_subproc_t* sp, mi_tld_t* my_tld)
 {
   const uintptr_t me = (uintptr_t)_mi_thread_id();
-  mi_tld_t* const scav_tld = _mi_scavenger_tld_ptr();   // NULL in every build without a scavenger tld (Windows DLL only)
+  mi_tld_t* const scav_tld = _mi_scavenger_tld_ptr();   // NULL in every build today (see `_mi_scavenger_tld`); kept as a guard
   bool ok = true;
   for (mi_tld_t* tld = sp->tlds; tld != NULL; tld = tld->subproc_next) {
     if (tld == my_tld) continue;                        // we are inside the allocator (the driver entered the gate)

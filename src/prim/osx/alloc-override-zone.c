@@ -395,8 +395,8 @@ static void intro_log(malloc_zone_t* zone, void* p) {
 
 // #270: macOS calls `force_lock` on every registered zone before a fork() actually
 // forks (from `_malloc_fork_prepare`), the same moment `pthread_atfork`'s prepare
-// callback fires. Wire it to the same handler `pthread_atfork` uses (src/init.c);
-// `mi_fork_depth` (subproc.c) makes the two calls for one fork() idempotent -- only
+// callback fires. Wire it to the same handler `pthread_atfork` uses (src/fork.c,
+// registered in src/init.c); `mi_fork_depth` (src/fork.c) makes the two calls for one fork() idempotent -- only
 // whichever fires first does the real work.
 static void intro_force_lock(malloc_zone_t* zone) {
   MI_UNUSED(zone);
@@ -435,7 +435,7 @@ static boolean_t intro_zone_locked(malloc_zone_t* zone) {
 // atfork_child handler (_malloc_fork_child) without a NULL check. Leaving it NULL
 // makes the forked child jump to address 0 and crash in fork().
 // #270: mimalloc itself is not zone-lock-free anymore -- wire this to the same
-// child handler `pthread_atfork` uses (src/init.c) so the locks documented at the
+// child handler `pthread_atfork` uses (src/fork.c, registered in src/init.c) so the locks documented at the
 // top of src/fork.c actually get reset in the child, whichever of `pthread_atfork`
 // or this zone callback macOS invokes first for a given fork() (mi_fork_depth
 // makes the pair idempotent).
@@ -592,9 +592,9 @@ static int mi_malloc_jumpstart(uintptr_t cookie) {
 // #270: DYLD interposition (below) redirects every process-wide call to libSystem's own
 // `_malloc_fork_prepare/parent/child` -- the functions its own fork() implementation
 // calls internally, and what the default zone's atfork machinery targets -- to these.
-// This is a third path into the same handlers as `pthread_atfork` (src/init.c) and the
-// zone introspection callbacks `intro_force_lock`/`intro_force_unlock`/
-// `intro_reinit_lock` above; `mi_fork_depth` (subproc.c) is exactly what makes calling
+// This is a third path into the same handlers as `pthread_atfork` (src/fork.c, registered
+// in src/init.c) and the zone introspection callbacks `intro_force_lock`/`intro_force_unlock`/
+// `intro_reinit_lock` above; `mi_fork_depth` (src/fork.c) is exactly what makes calling
 // the real handler from all three safe and idempotent for one fork().
 static void mi__malloc_fork_prepare(void) {
   _mi_process_fork_prepare();
