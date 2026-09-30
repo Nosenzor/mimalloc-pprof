@@ -581,9 +581,11 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   // new geometry must be registered over its own extent: a block past the old extent otherwise
   // maps to no page (a debug build asserts in `_mi_ptr_page`; a release build loses the free).
   // (Only when the extent changes: it covers whole slices, and most re-carves keep them.)
-  const size_t old_extent = mi_slice_count_of_size(mi_page_size(page));
+  // (The extent is `ceil((start offset + size) / slice)`, as `mi_page_map_get_idx` counts it, #573.)
+  const size_t start_offset = (size_t)(mi_page_start(page) - mi_page_slice_start(page));
+  const size_t old_extent = mi_slice_count_of_size(start_offset + mi_page_size(page));
   const size_t new_reserved = best_size / block_size;
-  const bool remap = (mi_slice_count_of_size(new_reserved * block_size) != old_extent);
+  const bool remap = (mi_slice_count_of_size(start_offset + new_reserved * block_size) != old_extent);
   if (remap) { _mi_page_map_unregister(page); }
   page->block_size = block_size;
   page->reserved = (uint16_t)new_reserved;
