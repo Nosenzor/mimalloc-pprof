@@ -144,15 +144,13 @@ confirm it, not to explore. The safety nets that make that cheap:
 ## Perf campaign method (#575 retrospective)
 
 The #575 campaign took `large-class-persistent/8` from 2.3-2.5x to about 1.0x jemalloc peak RSS
-in two rounds; the method below is what worked. Data lives on #575 and PRs #582-#584; do not
+in two rounds; the method below is what worked. Data lives on #575 and PRs #582-#584 (#582's commits landed via #584); do not
 copy it here.
 
 1. **Step 0 is attribution, and earlier claims are hypotheses.** #575's issue text said
    `persistent` "has few retired pages"; the probe showed 43% of its peak RSS was resident,
    empty, retired large pages. Run `uv run ci/attribution_probe.py --reps 5` before designing
-   anything. (Pending: the tool is only on PR #582's branch `perf/575-step0-attribution`, draft
-   and diagnostics-only; #582 must be made mergeable before this section is reachable from
-   `main`.) It builds `MI_DIAGNOSTICS=ON MI_STAT=1`, runs `ci/perf_ab.c` rows `large-class/8`
+   anything. The tool is on `main` (landed via #584; #582 was closed as landed). It builds `MI_DIAGNOSTICS=ON MI_STAT=1`, runs `ci/perf_ab.c` rows `large-class/8`
    and the `sparse-large-buffers/8` twin with `PERF_AB_HOLES_REPORT=1`, and, with every worker
    still holding its live slots, has each print `mi_purge_holes_report()`, which `mincore`-walks
    every page. It is untimed, so it may run locally. Buckets (they sum to the snapshot RSS;
