@@ -4835,7 +4835,13 @@ SCALING_INK = {
     "title": "#e8eef7",
     "muted": "#7d8da5",
     "badge": "#f0b429",
-    "oversubscribed": "#1a2230",
+    # Oversubscription is a warning zone: a clearly red tint, edge and label.
+    "oversubscribed": "#3b1219",
+    "oversubscribed_edge": "#e5484d",
+    "oversubscribed_label": "#ff8085",
+    # Display labels (CPU / MEMORY): one accent per chart family.
+    "cpu_label": "#79c0ff",
+    "memory_label": "#d2a8ff",
     # #534: the live-data floor, dashed and neutral: a reference, not an allocator.
     "floor": "#c9d1d9",
 }
@@ -4848,10 +4854,17 @@ RSS_FLOOR_LEGEND_GAP = 8
 RSS_FLOOR_LEGEND_SWATCH = 22
 RSS_FLOOR_LEGEND_SWATCH_LIFT = 5
 # One fixed color per allocator, reused identically on every panel.
+SCALING_DISPLAY_SIZE = 28
+SCALING_DISPLAY_SPACING = 6
+SCALING_TITLE_SIZE = 22
+SCALING_SUBTITLE_SIZE = 12
+SCALING_LEGEND_SWATCH = 22
+SCALING_LEGEND_PITCH = 34
+SCALING_LEGEND_CHAR_WIDTH = 7.4
 SCALING_SERIES = {
-    "mimalloc-pprof": "#58a6ff",
+    "mimalloc-pprof": "#ffffff",
     "upstream-mimalloc": "#3fb950",
-    "bun-mimalloc": "#ff9d5c",
+    "bun-mimalloc": "#ff5fa2",
     "tcmalloc": "#e3b341",
     "jemalloc": "#bc8cff",
 }
@@ -4867,12 +4880,84 @@ def svg_text(
     weight: str = "normal",
     anchor: str = "start",
     family: str = "system-ui,-apple-system,Segoe UI,Roboto,sans-serif",
+    spacing: float = 0.0,
 ) -> str:
+    spacing_attribute = f' letter-spacing="{spacing:g}"' if spacing else ""
     return (
         f'<text x="{x:.1f}" y="{y:.1f}" fill="{fill}" font-size="{size:.0f}" '
-        f'font-family="{family}" font-weight="{weight}" text-anchor="{anchor}">'
-        f"{escaped(value)}</text>"
+        f'font-family="{family}" font-weight="{weight}" text-anchor="{anchor}"'
+        f"{spacing_attribute}>{escaped(value)}</text>"
     )
+
+
+def display_label(x: float, y: float, kind: str) -> str:
+    """The stylised CPU / MEMORY label: bold, large, letter-spaced, right-justified
+    at x (the trailing letter-spacing is compensated so the edge is flush)."""
+
+    text, ink = ("CPU", "cpu_label") if kind == "cpu" else ("MEMORY", "memory_label")
+    return svg_text(
+        x + SCALING_DISPLAY_SPACING,
+        y,
+        text,
+        fill=SCALING_INK[ink],
+        size=SCALING_DISPLAY_SIZE,
+        weight="800",
+        anchor="end",
+        spacing=SCALING_DISPLAY_SPACING,
+    )
+
+
+def legend_entry_width(label: str) -> float:
+    return SCALING_LEGEND_PITCH + SCALING_LEGEND_CHAR_WIDTH * len(label)
+
+
+def allocator_legend(
+    allocators: Sequence[str],
+    x: float,
+    y: float,
+    *,
+    right_edge: float | None = None,
+    floor: bool = False,
+) -> list[str]:
+    """One legend row with text baseline y. With right_edge the row is
+    right-justified so it ends exactly there (memory charts), else it starts at x."""
+
+    labels = [allocator_label(allocator) for allocator in allocators]
+    widths = [legend_entry_width(label) for label in labels]
+    floor_width = (
+        SCALING_LEGEND_SWATCH
+        + RSS_FLOOR_LEGEND_GAP
+        + SCALING_LEGEND_CHAR_WIDTH * len(RSS_FLOOR_LEGEND_LABEL)
+        if floor
+        else 0.0
+    )
+    if right_edge is not None:
+        # Each entry advances by its label width plus a 4 px gap the last one does not draw.
+        trailing_gap = 0.0 if floor else SCALING_LEGEND_PITCH - 30
+        x = right_edge - (sum(widths) + floor_width - trailing_gap)
+    out: list[str] = []
+    for allocator, label, width in zip(allocators, labels, widths):
+        emphasis = allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR
+        color = SCALING_SERIES[allocator]
+        stroke = f' stroke="{SCALING_INK["plot"]}" stroke-width="0.8"' if emphasis else ""
+        out.append(
+            f'<rect x="{x:.1f}" y="{y - 7:.1f}" width="{SCALING_LEGEND_SWATCH}" height="4" '
+            f'rx="2" fill="{color}"{stroke}/>'
+        )
+        out.append(
+            svg_text(
+                x + 30,
+                y,
+                label,
+                fill=SCALING_INK["title" if emphasis else "axis"],
+                size=12,
+                weight="600" if emphasis else "normal",
+            )
+        )
+        x += width
+    if floor:
+        out.extend(rss_floor_legend(x, y))
+    return out
 
 
 def axis_unit(ceiling: float) -> tuple[float, str, int]:
@@ -4939,6 +5024,7 @@ def _scaling_plot_parts(
     subtitle: str,
     unit: tuple[float, str, int],
     thread_points: Sequence[int] = SCALING_THREAD_POINTS,
+    kind: str = "cpu",
 ) -> None:
     """Append one dark line plot: x is worker count (log2), y one series per
     allocator, with the oversubscribed band shaded."""
@@ -4966,13 +5052,21 @@ def _scaling_plot_parts(
             f'height="{plot_height}" fill="{SCALING_INK["oversubscribed"]}" rx="6"/>'
         )
         parts.append(
+            f'<line x1="{band_start:.1f}" y1="{top}" x2="{band_start:.1f}" y2="{top + plot_height}" '
+            f'stroke="{SCALING_INK["oversubscribed_edge"]}" stroke-width="1.5" stroke-dasharray="6 5"/>'
+        )
+        # Bottom-right, right-justified: the top corner is where the largest
+        # RSS values sit, so a label there collided with the data.
+        parts.append(
             svg_text(
-                left + plot_width - 8,
-                top + 20,
+                left + plot_width - 10,
+                top + plot_height - 12,
                 f"oversubscribed (> {allowed} vCPU)",
-                fill=SCALING_INK["muted"],
+                fill=SCALING_INK["oversubscribed_label"],
                 size=12,
+                weight="700",
                 anchor="end",
+                spacing=1.5,
             )
         )
     for step in range(5):
@@ -5041,10 +5135,22 @@ def _scaling_plot_parts(
                 f'cy="{scaling_y_of(value, ceiling, top, plot_height):.1f}" r="4.5" '
                 f'fill="{SCALING_INK["background"]}" stroke="{color}" stroke-width="2.5"/>'
             )
+    parts.append(display_label(left + plot_width, top - 72, kind))
     parts.append(
-        svg_text(left - 12, top - 46, title, fill=SCALING_INK["title"], size=20, weight="600")
+        svg_text(
+            left - 12,
+            top - 46,
+            title,
+            fill=SCALING_INK["title"],
+            size=SCALING_TITLE_SIZE,
+            weight="600",
+        )
     )
-    parts.append(svg_text(left - 12, top - 24, subtitle, fill=SCALING_INK["muted"], size=13))
+    parts.append(
+        svg_text(
+            left - 12, top - 24, subtitle, fill=SCALING_INK["muted"], size=SCALING_SUBTITLE_SIZE
+        )
+    )
 
 
 def scaling_svg(scaling: ScalingView, pattern: str) -> bytes:
@@ -5124,6 +5230,7 @@ def scaling_svg(scaling: ScalingView, pattern: str) -> bytes:
             "external smaps_rollup peak during the measured block; lower is better",
             rss_unit,
             thread_points,
+            "memory",
         )
     else:
         width = SCALING_WIDTH
@@ -5146,17 +5253,19 @@ def scaling_svg(scaling: ScalingView, pattern: str) -> bytes:
             unit,
             thread_points,
         )
-    legend_x = SCALING_LEFT - 12
-    for allocator in ALLOCATOR_IDS:
-        if allocator not in series:
-            continue
-        color = SCALING_SERIES[allocator]
-        parts.append(
-            f'<rect x="{legend_x:.1f}" y="{height - 54}" width="22" height="4" rx="2" fill="{color}"/>'
+    legend_allocators = [allocator for allocator in ALLOCATOR_IDS if allocator in series]
+    if scaling.rss_cells:
+        # Memory charts: right-justified, flush with the right panel's edge.
+        parts.extend(
+            allocator_legend(
+                legend_allocators,
+                0.0,
+                height - 47,
+                right_edge=SCALING_DUAL_RSS_LEFT + SCALING_DUAL_PLOT_WIDTH,
+            )
         )
-        label = allocator_label(allocator)
-        parts.append(svg_text(legend_x + 30, height - 47, label, fill=SCALING_INK["axis"], size=12))
-        legend_x += 34 + 7.4 * len(label)
+    else:
+        parts.extend(allocator_legend(legend_allocators, SCALING_LEFT - 12, height - 47))
     parts.append(
         svg_text(
             SCALING_LEFT - 12,
@@ -5317,13 +5426,16 @@ def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> b
         f"<desc>One panel with one median line per allocator, all on a shared zero-based axis from 0 to {ceiling:g} with tick step {step:g}, shared across both workloads of the family. Each line is the median of {DISTRIBUTION_BLOCKS} paired repetitions; the spread is in latest.json and the dashboard table.{floor_desc}</desc>",
         f'<metadata data-y-domain-min="0" data-y-domain-max="{ceiling:g}" data-y-tick-step="{step:g}" data-quantiles="linear-h=(n-1)p" data-samples="{DISTRIBUTION_BLOCKS}"{floor_metadata}/>',
         f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
-        svg_text(left, 42, title, fill=SCALING_INK["title"], size=24, weight="600"),
+        display_label(left + plot_width, 48, "cpu" if metric == "throughput" else "memory"),
+        svg_text(
+            left, 42, title, fill=SCALING_INK["title"], size=SCALING_TITLE_SIZE + 2, weight="600"
+        ),
         svg_text(
             left,
             70,
             f"{metric_title}; median of n={DISTRIBUTION_BLOCKS}",
             fill=SCALING_INK["muted"],
-            size=14,
+            size=SCALING_SUBTITLE_SIZE + 1,
         ),
         f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="{SCALING_INK["plot"]}" rx="6"/>',
     ]
@@ -5343,13 +5455,21 @@ def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> b
             f'height="{plot_height}" fill="{SCALING_INK["oversubscribed"]}" rx="6"/>'
         )
         parts.append(
+            f'<line x1="{band_start:.1f}" y1="{top}" x2="{band_start:.1f}" y2="{top + plot_height}" '
+            f'stroke="{SCALING_INK["oversubscribed_edge"]}" stroke-width="1.5" stroke-dasharray="6 5"/>'
+        )
+        # Bottom-right, right-justified: the top corner is where the largest
+        # RSS values sit, so a label there collided with the data.
+        parts.append(
             svg_text(
-                left + plot_width - 8,
-                top + 20,
+                left + plot_width - 10,
+                top + plot_height - 12,
                 f"oversubscribed (> {allowed} vCPU)",
-                fill=SCALING_INK["muted"],
+                fill=SCALING_INK["oversubscribed_label"],
                 size=12,
+                weight="700",
                 anchor="end",
+                spacing=1.5,
             )
         )
     for tick in range(round(ceiling / step) + 1):
@@ -5431,23 +5551,16 @@ def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> b
                 f'r="{DISTRIBUTION_MARKER_RADIUS:g}" '
                 f'fill="{SCALING_INK["background"]}" stroke="{color}" stroke-width="{stroke_width:g}"/>'
             )
-    legend_x = float(left)
     legend_y = top + plot_height + 76
-    for allocator in ALLOCATOR_IDS:
-        color = SCALING_SERIES[allocator]
-        parts.append(
-            f'<rect x="{legend_x:.1f}" y="{legend_y - 7}" width="22" height="4" rx="2" fill="{color}"/>'
+    parts.extend(
+        allocator_legend(
+            list(ALLOCATOR_IDS),
+            float(left),
+            legend_y,
+            right_edge=float(left + plot_width) if metric == "rss" else None,
+            floor=bool(floors),
         )
-        label = allocator_label(allocator)
-        weight = "600" if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR else "normal"
-        parts.append(
-            svg_text(
-                legend_x + 30, legend_y, label, fill=SCALING_INK["axis"], size=12, weight=weight
-            )
-        )
-        legend_x += 34 + 7.4 * len(label)
-    if floors:
-        parts.extend(rss_floor_legend(legend_x, legend_y))
+    )
     parts.append(
         svg_text(
             left,
@@ -5536,8 +5649,11 @@ def thread_churn_svg(scaling: ScalingView, bound_ms: int) -> bytes:
         f"<desc>Resident memory of each allocator's process at fixed times after its worker threads were joined, one median line per allocator on a shared zero-based axis from 0 to {ceiling:g} MiB, and a table of when each one's memory settled.{floor_desc}</desc>",
         f'<metadata data-y-domain-min="0" data-y-domain-max="{ceiling:g}" data-y-unit="MiB" data-x-offsets-ms="{" ".join(str(offset) for offset in offsets)}" data-samples="{churn.block_count}"{floor_metadata}/>',
         f'<rect width="{width}" height="{height}" fill="{SCALING_INK["background"]}"/>',
-        svg_text(left, 42, title, fill=SCALING_INK["title"], size=24, weight="600"),
-        svg_text(left, 70, subtitle, fill=SCALING_INK["muted"], size=14),
+        display_label(left + plot_width, 48, "memory"),
+        svg_text(
+            left, 42, title, fill=SCALING_INK["title"], size=SCALING_TITLE_SIZE + 2, weight="600"
+        ),
+        svg_text(left, 70, subtitle, fill=SCALING_INK["muted"], size=SCALING_SUBTITLE_SIZE + 1),
         f'<rect x="{left}" y="{top}" width="{plot_width}" height="{plot_height}" fill="{SCALING_INK["plot"]}" rx="6"/>',
     ]
     for tick in range(round(ceiling / step) + 1):
@@ -5635,23 +5751,16 @@ def thread_churn_svg(scaling: ScalingView, bound_ms: int) -> bytes:
                 f'r="{DISTRIBUTION_MARKER_RADIUS:g}" '
                 f'fill="{SCALING_INK["background"]}" stroke="{color}" stroke-width="{stroke_width:g}"/>'
             )
-    legend_x = float(left)
     legend_y = top + plot_height + 84
-    for allocator in ALLOCATOR_IDS:
-        color = SCALING_SERIES[allocator]
-        parts.append(
-            f'<rect x="{legend_x:.1f}" y="{legend_y - 7}" width="22" height="4" rx="2" fill="{color}"/>'
+    parts.extend(
+        allocator_legend(
+            list(ALLOCATOR_IDS),
+            float(left),
+            legend_y,
+            right_edge=float(left + plot_width) if True else None,
+            floor=bool(floor),
         )
-        label = allocator_label(allocator)
-        weight = "600" if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR else "normal"
-        parts.append(
-            svg_text(
-                legend_x + 30, legend_y, label, fill=SCALING_INK["axis"], size=12, weight=weight
-            )
-        )
-        legend_x += 34 + 7.4 * len(label)
-    if floor is not None:
-        parts.extend(rss_floor_legend(legend_x, legend_y))
+    )
     # Time-to-release table: peak, the median at each offset, and when it settled.
     headers = ("peak", *(format_seconds(offset) for offset in offsets), "released by")
     row_y = THREAD_CHURN_TABLE_TOP
