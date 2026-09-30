@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3fa3726a of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 400192ac of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3138,6 +3138,9 @@ typedef struct mi_page_s {
 // ... and whether a bin with abandoned pages (typically an exited thread's) reclaims those first
 // (the arena path) instead. With short-lived threads, re-carving our own retired pages instead
 // left those stranded and cost the chart build's ephemeral row +3.4% CPU (1: -0.5%).
+#ifndef MI_LARGE_AGE_ON_HEARTBEAT
+#define MI_LARGE_AGE_ON_HEARTBEAT         (1)
+#endif
 #ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
 #define MI_LARGE_REPURPOSE_ABANDONED_FIRST (1)
 #endif
@@ -6246,6 +6249,9 @@ typedef enum mi_event_e {
   MI_EVENT_LARGE_SPAN_SHRINK,       // ... stepped down
   MI_EVENT_ARENA_PAGE_ALLOC,        // a page was allocated from the arenas
   MI_EVENT_ARENA_PAGE_FREE,         // a page went back to the arenas
+  MI_EVENT_LARGE_REPURPOSE_NONE,    // a large bin's page request found no retired page of another bin to take (#575)
+  MI_EVENT_LARGE_RETIRE_EXPIRED,    // a retired large page aged out and was freed to the arena (#575)
+  MI_EVENT_LARGE_EMPTY_FREED,       // an emptied large page was freed at once, because its bin has other pages (#575)
   MI_EVENT_COUNT
 } mi_event_t;
 uint64_t      _mi_event_get(mi_event_t event);           // 0 when not compiled in
@@ -25749,7 +25755,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
     if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
     best_pq = q; best_size = size;   // best fit: the smallest that is large enough
   }
-  if (best_pq == NULL) return NULL;
+  if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;
   theap->tld->large_repurpose_left--;
@@ -25822,6 +25828,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
     }
   }
   #endif
+  MI_EVENT_IF(mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && mi_page_block_size(page) <= MI_LARGE_MAX_OBJ_SIZE, MI_EVENT_LARGE_EMPTY_FREED);   // (#575)
   _mi_page_free(page, pq);
 }
 
@@ -25859,6 +25866,7 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
       if (mi_page_all_free(page)) {
         page->retire_expire--;
         if (page->retire_expire == 0 || force) {
+          MI_EVENT_IF(mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE, MI_EVENT_LARGE_RETIRE_EXPIRED);   // (#575)
           _mi_page_free(page, pq);
         }
         else {
@@ -26260,7 +26268,13 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   }
 
   if (page == NULL) {
-    _mi_theap_collect_retired(theap, false); // perhaps make a page available
+    #if MI_LARGE_REPURPOSE && MI_LARGE_AGE_ON_HEARTBEAT
+    // #575: a large bin's miss does not age the retired pages: they are the stock the repurpose below draws on, and
+    // ageing them per miss (4 misses = expired) freed 66K pages to the arena, each re-requested at once (persistent/8).
+    // The heartbeat still ages them.
+    if (pq->block_size <= MI_MEDIUM_MAX_OBJ_SIZE || pq->block_size > MI_LARGE_MAX_OBJ_SIZE || !mi_option_is_enabled(mi_option_large_span))
+    #endif
+    { _mi_theap_collect_retired(theap, false); } // perhaps make a page available
     page = mi_page_fresh(theap, pq);         
     mi_assert_internal(page == NULL || mi_page_immediate_available(page));
     if (page == NULL && first_try) {
@@ -30091,7 +30105,8 @@ static const char* const mi_event_names[MI_EVENT_COUNT] = {
   "retired_publish", "retired_unpublish",
   "page_map_register", "page_map_reextend",
   "large_span_grow", "large_span_shrink",
-  "arena_page_alloc", "arena_page_free"
+  "arena_page_alloc", "arena_page_free",
+  "large_repurpose_none", "large_retire_expired", "large_empty_freed"
 };
 
 void _mi_event_count(mi_event_t event) {
