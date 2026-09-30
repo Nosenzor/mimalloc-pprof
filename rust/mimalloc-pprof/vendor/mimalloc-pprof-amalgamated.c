@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 8606e132 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 2c9557be of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -3145,7 +3145,7 @@ typedef struct mi_page_s {
 // #575 CPU cost); never ageing them on a miss (the heartbeat only) kept 12% more resident on random-large/8, where a
 // bin is used every ~100 operations and its retired page is idle stock. 0 = every miss ages, as upstream.
 #ifndef MI_LARGE_AGE_STEP
-#define MI_LARGE_AGE_STEP                 (8)
+#define MI_LARGE_AGE_STEP                 (4)
 #endif
 #ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
 #define MI_LARGE_REPURPOSE_ABANDONED_FIRST (1)
