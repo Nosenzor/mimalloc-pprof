@@ -128,7 +128,9 @@ confirm it, not to explore. The safety nets that make that cheap:
   `1.5 x base + 8 MiB` fails the job at once (`SANITY_FACTOR`, `SANITY_SLACK_MIB` in
   `ci/perf_ab.py`). A dispatch that is meant to trade memory away sets `sanity_gate: false`.
 - **One live run per PR.** `perf-ab` cancels its older run on a new push, and only the
-  `perf-ab` label itself starts a run. `head_sha` dispatches a commit other than the ref the
+  `perf-ab` label itself starts a run. Trap (#575): pushing to a PR branch (even a docs or
+  regenerated-amalgamation commit) cancels an in-flight 15-rep run, so do not push until the
+  ledger is in; dispatch against a `head_sha` instead. A guard is on #585. `head_sha` dispatches a commit other than the ref the
   workflow runs from.
 - **Page-map check.** At `MI_DEBUG>=2`, `_mi_page_init` asserts that the page map resolves the
   first byte and the last byte of a page's blocks to that page. A re-carve that changes a page's
@@ -138,6 +140,64 @@ confirm it, not to explore. The safety nets that make that cheap:
 - **`mi_theap_t` size budget.** `MI_THEAP_META_MAX_SIZE` (types.h) is a compile-time budget on
   `sizeof(mi_theap_t) + MI_PADDING_SIZE`: the meta-allocator size class it sits in is the edge
   that made CI ASan `test-resident-first-churn` flaky. Put new per-thread state in `mi_tld_t`.
+
+## Perf campaign method (#575 retrospective)
+
+The #575 campaign took `large-class-persistent/8` from 2.3-2.5x to about 1.0x jemalloc peak RSS
+in two rounds; the method below is what worked. Data lives on #575 and PRs #582-#584; do not
+copy it here.
+
+1. **Step 0 is attribution, and earlier claims are hypotheses.** #575's issue text said
+   `persistent` "has few retired pages"; the probe showed 43% of its peak RSS was resident,
+   empty, retired large pages. Run `uv run ci/attribution_probe.py --reps 5` before designing
+   anything. (Pending: the tool is only on PR #582's branch `perf/575-step0-attribution`, draft
+   and diagnostics-only; #582 must be made mergeable before this section is reachable from
+   `main`.) It builds `MI_DIAGNOSTICS=ON MI_STAT=1`, runs `ci/perf_ab.c` rows `large-class/8`
+   and the `sparse-large-buffers/8` twin with `PERF_AB_HOLES_REPORT=1`, and, with every worker
+   still holding its live slots, has each print `mi_purge_holes_report()`, which `mincore`-walks
+   every page. It is untimed, so it may run locally. Buckets (they sum to the snapshot RSS;
+   peak equals snapshot within ~0.3 MiB):
+   - *live requested* and *block rounding*: bytes the application asked for, and the rest of
+     its blocks;
+   - *formed free blocks*: carved, free, resident blocks in pages with a live block or in empty
+     pages;
+   - *empty (retired) pages, resident*: retired pages reset to `capacity = 0` whose old bytes
+     are still resident (reported as "unformed");
+   - *unformed tail*: resident bytes past `capacity` in pages that still have a live block
+     (re-carved over dirty slices);
+   - *page-geometry slack*: bytes past `reserved*block_size`, plus the header;
+   - *free slices queued for purge* and *aged/dirty/fresh*: arena free-slice states (arena walk);
+   - *outside the arena*: meta, stacks, binary (`smaps_rollup` for kernel RSS and
+     AnonHugePages). Varies 27-33 MiB run to run for the queued bucket; the rest is stable to
+     about 1 MiB. Compare ratios across hosts, not absolute MiB.
+2. **Hotness predicts refault cost.** Round 1 returned retired pages to the OS and lost up to
+   10x CPU (+107% to +1080%, refault ~190 us against a ~1 us op) because those bytes were the hot
+   working set, reused within ~10 operations. Before any discard, decommit or purge policy,
+   measure the reuse distance of the target bucket. Prefer zero-refault designs that make
+   resident bytes fungible across bins, spans and sizes (#584: repurpose budget, 1 MiB span cap,
+   `MI_LARGE_AGE_STEP`).
+3. **Rejected, do not retry** (details on #575): discarding retired-page bodies at retire or at
+   a heartbeat, with any keep count or age gate (#583, `mi_option_retired_keep`, default-off);
+   raising the repurpose budget alone (saved 26%, CPU +17.1% against 8.6% allowed); a 2 MiB
+   span cap; budget 256; aging on every large miss; never aging on a large miss
+   (random-large/8 peak +12.3%); aging once per 8 generic mallocs (random-large/1 drain RSS
+   +3.9%). Queued-slice reuse (H1) was already 98% resident-first; THP off saves only ~6%.
+4. **Step 2, "CPU-model noise or real?" is settled by a same-host paired run.** Dispatch
+   `benchmark-scaling` with `mode=diagnostic`, 15 blocks, the cells in question, and read the
+   fork/upstream ratio-of-medians with a 95% block bootstrap. Fork, pinned upstream, jemalloc,
+   TCMalloc and Bun run the same blocks on one VM, so the CPU model cancels. Result (#575
+   comment 5913744857, run 36701407919): fork/upstream throughput 0.925 [0.878, 0.968] at
+   persistent/8 and 0.89-0.96 across the large and larson cells, control 0.99; a real regression
+   in the large/retire/purge paths. Follow-up on #585.
+5. **Tooling traps.**
+   - `benchmark-scaling` above 15 blocks blows the 1500 s shard budget on the 8-worker shard.
+   - Pushing to a PR branch cancels an in-flight `perf-ab` run (see above).
+   - `perf-ab` has no p99 column, although rule 12 demands p99. Until #585 adds one, the PR
+     ledger must say "p99: not measured" instead of omitting it.
+   - The 8-worker cells run on a 4-vCPU EPYC 7763 VM (2 physical cores), 2:1 oversubscribed:
+     they measure contention under oversubscription, not core scaling.
+   - A local untimed residency probe is allowed; timing is CI-only (see the memory gate loop
+     below).
 
 ### The perf-ab pipeline (#573 B3-B8)
 
@@ -205,9 +265,13 @@ first; use perf-ab to confirm, not to explore.
 
 ### Benchmark scaling: diagnostics, caches and alerts (#573 B7, B9)
 
-- **Diagnostic sweeps take 15 to 40 blocks per cell** (`MIN_DISPATCH_BLOCKS` in
-  `ci/scaling_diagnostic.py`, checked before anything is built). A 5-block sweep left a 30-45 MiB
-  spread per cell and produced a false +6-12% RSS regression; 15 resolved single cells.
+- **Diagnostic sweeps take 15 blocks per cell in practice** (`MIN_DISPATCH_BLOCKS` in
+  `ci/scaling_diagnostic.py` enforces only the floor of 15, before anything is built). A 5-block
+  sweep left a 30-45 MiB spread per cell and produced a false +6-12% RSS regression; 15 resolved
+  single cells. More than 15 blocks over the 8-worker shard exceeds the runner's 1500 s projected
+  budget (#575: 30 blocks projected 2150 s, 40 blocks 1503 s, both failed before measuring); the
+  workflow's "15-40" input text is wrong until #585 fixes the cap. Use 15, or narrow
+  `diagnostic_patterns` / `diagnostic_threads` and pool runs.
 - **Two allocator caches.** `benchmark-scaling.yml` restores the four reference allocators (TCMalloc,
   jemalloc, upstream and Bun mimalloc) keyed on their pins, patches and the builder only, and the
   fork's tree keyed on its own sources and the diagnostic defines, so a C change no longer rebuilds
