@@ -902,6 +902,14 @@ def run_lint(ctx: RunCtx) -> bool:
         # -Werror=unused-function when clang is available.
         ["uv", "run", "ci/check_no_diagnostic_suppression.py", "--selftest"],
         ["uv", "run", "ci/check_no_diagnostic_suppression.py"],
+        # #573: page geometry has one writer; the size-class-edge structs stay in budget.
+        ["uv", "run", "ci/check_page_geometry_writes.py", "--selftest"],
+        ["uv", "run", "ci/check_page_geometry_writes.py"],
+        ["uv", "run", "ci/check_struct_sizes.py", "--selftest"],
+        ["uv", "run", "ci/check_struct_sizes.py"],
+        # #573 A5: needs <sys/sdt.h>; without it the check says so and passes (CI requires it).
+        ["uv", "run", "ci/check_usdt_probes.py", "--selftest"],
+        ["uv", "run", "ci/check_usdt_probes.py"],
         ["uv", "run", "ci/check_macro_case.py", "--selftest"],
         ["uv", "run", "ci/check_macro_case.py"],
         ["uv", "run", "ci/check_release_ratchet.py", "--selftest"],
