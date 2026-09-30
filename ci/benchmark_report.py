@@ -4858,8 +4858,6 @@ SCALING_DISPLAY_SIZE = 28
 SCALING_DISPLAY_SPACING = 6
 SCALING_TITLE_SIZE = 22
 SCALING_SUBTITLE_SIZE = 12
-# Thin dark halo under the white mimalloc-pprof line so it stays legible on any panel.
-SCALING_HALO_EXTRA = 3.0
 SCALING_LEGEND_SWATCH = 22
 SCALING_LEGEND_PITCH = 34
 SCALING_LEGEND_CHAR_WIDTH = 7.4
@@ -5063,7 +5061,7 @@ def _scaling_plot_parts(
             svg_text(
                 left + plot_width - 10,
                 top + plot_height - 12,
-                f"OVERSUBSCRIBED (> {allowed} vCPU)",
+                f"oversubscribed (> {allowed} vCPU)",
                 fill=SCALING_INK["oversubscribed_label"],
                 size=12,
                 weight="700",
@@ -5127,12 +5125,6 @@ def _scaling_plot_parts(
             f"{scaling_y_of(value, ceiling, top, plot_height):.1f}"
             for index, (threads, value) in enumerate(points)
         )
-        if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR:
-            parts.append(
-                f'<path d="{path}" fill="none" stroke="{SCALING_INK["plot"]}" '
-                f'stroke-width="{2.5 + SCALING_HALO_EXTRA:g}" stroke-linejoin="round" '
-                'stroke-linecap="round" opacity="0.7"/>'
-            )
         parts.append(
             f'<path d="{path}" fill="none" stroke="{color}" stroke-width="2.5" '
             'stroke-linejoin="round" stroke-linecap="round"/>'
@@ -5472,7 +5464,7 @@ def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> b
             svg_text(
                 left + plot_width - 10,
                 top + plot_height - 12,
-                f"OVERSUBSCRIBED (> {allowed} vCPU)",
+                f"oversubscribed (> {allowed} vCPU)",
                 fill=SCALING_INK["oversubscribed_label"],
                 size=12,
                 weight="700",
@@ -5548,12 +5540,6 @@ def distribution_stack_svg(scaling: ScalingView, pattern: str, metric: str) -> b
             f"{'M' if index == 0 else 'L'} {scaling_x_of(threads, left, plot_width, points):.1f} {scaling_y_of(median, ceiling, top, plot_height):.1f}"
             for index, (threads, median) in enumerate(values)
         )
-        if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR:
-            parts.append(
-                f'<path d="{path}" fill="none" stroke="{SCALING_INK["plot"]}" '
-                f'stroke-width="{stroke_width + SCALING_HALO_EXTRA:g}" stroke-linejoin="round" '
-                'stroke-linecap="round" opacity="0.7"/>'
-            )
         parts.append(
             f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{stroke_width:g}" '
             'stroke-linejoin="round" stroke-linecap="round"/>'
@@ -5755,12 +5741,6 @@ def thread_churn_svg(scaling: ScalingView, bound_ms: int) -> bytes:
             f"{'M' if index == 0 else 'L'} {x_of(milliseconds):.1f} {y_of(rss):.1f}"
             for index, (milliseconds, rss) in enumerate(points)
         )
-        if allocator == DISTRIBUTION_EMPHASIS_ALLOCATOR:
-            parts.append(
-                f'<path d="{path}" fill="none" stroke="{SCALING_INK["plot"]}" '
-                f'stroke-width="{stroke_width + SCALING_HALO_EXTRA:g}" stroke-linejoin="round" '
-                'stroke-linecap="round" opacity="0.7"/>'
-            )
         parts.append(
             f'<path d="{path}" fill="none" stroke="{color}" stroke-width="{stroke_width:g}" '
             'stroke-linejoin="round" stroke-linecap="round"/>'
