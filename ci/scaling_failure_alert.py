@@ -23,7 +23,8 @@ import argparse
 import json
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import cast
 
 TITLE = "benchmark-scaling: the scheduled run is failing"
 LABEL = "benchmark-failure"
@@ -42,9 +43,13 @@ def failed_jobs(view: dict[str, object]) -> list[str]:
     if not isinstance(jobs, list):
         return []
     names: list[str] = []
-    for job in jobs:
-        if isinstance(job, dict) and job.get("conclusion") in ("failure", "timed_out", "cancelled"):
-            names.append(f"{job.get('name', '?')} ({job['conclusion']})")
+    for item in cast(list[object], jobs):
+        if not isinstance(item, dict):
+            continue
+        job = cast(dict[str, object], item)
+        conclusion = job.get("conclusion")
+        if conclusion in ("failure", "timed_out", "cancelled"):
+            names.append(f"{job.get('name', '?')} ({conclusion})")
     return names
 
 
@@ -99,7 +104,7 @@ def selftest() -> int:
         }
     )
 
-    def make(listing: list[dict[str, object]]) -> Runner:
+    def make(listing: Sequence[Mapping[str, object]]) -> Runner:
         def runner(cmd: Sequence[str]) -> str:
             calls.append(list(cmd))
             if cmd[0] == "run":

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import pytest
 
@@ -11,7 +11,7 @@ import scaling_failure_alert as alert
 
 
 def runner_with(
-    listing: list[dict[str, object]], calls: list[list[str]], jobs: list[dict[str, object]]
+    listing: Sequence[Mapping[str, object]], calls: list[list[str]], jobs: list[dict[str, object]]
 ) -> alert.Runner:
     def runner(cmd: Sequence[str]) -> str:
         calls.append(list(cmd))
