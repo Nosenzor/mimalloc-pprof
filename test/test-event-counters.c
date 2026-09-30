@@ -3,8 +3,10 @@
    #572's "retire cascade" -- a large bin stealing another bin's retired page, which then steals in
    turn -- was 548K page requests where main made 292. Only hand-patched counters showed it. The
    counters are permanent now (MI_DIAGNOSTICS=1, src/event-counters.c), so the cascade has a
-   deterministic test: within one heartbeat a thread may repurpose at most MI_LARGE_REPURPOSE_FRESH
-   retired pages, and the requests beyond that are counted as denied instead of stolen.
+   deterministic test: within one heartbeat a thread may repurpose at most its budget of retired
+   pages, and the requests beyond that are counted as denied instead of stolen. The budget is
+   MI_LARGE_REPURPOSE_PER_TICK, 1024 since #575 -- more than the fewer-than-1000 mallocs that fit
+   in a heartbeat -- so the test lowers this thread's budget to CASCADE_BUDGET first.
 
    The thread alternates two large bins (160 KiB and 300 KiB), each cycle freeing one block so its
    page retires, ageing it one tick with mi_collect(false) and then requesting the other bin's
@@ -23,6 +25,7 @@
 
 #define SIZE_A       (160 * 1024)
 #define SIZE_B       (300 * 1024)
+#define CASCADE_BUDGET (8)             // the thread's repurpose budget for the test (#575: the default outruns one heartbeat)
 #define CYCLES       (200)             // 2 requests each: well under the 1000 that make a heartbeat
 
 #if MI_DIAGNOSTICS
@@ -49,6 +52,14 @@ static void test_names_and_reset(void) {
 
 static void test_retire_cascade_budget(void) {
   _mi_event_reset();
+  #if MI_LARGE_REPURPOSE
+  {
+    void* const probe = mi_malloc(SIZE_A);   // this thread's tld, through its page's theap
+    assert(probe != NULL);
+    _mi_ptr_page(probe)->theap->tld->large_repurpose_left = CASCADE_BUDGET;
+    mi_free(probe);
+  }
+  #endif
   for (int i = 0; i < CYCLES; i++) {
     void* a = mi_malloc(SIZE_A);
     assert(a != NULL);
@@ -70,7 +81,7 @@ static void test_retire_cascade_budget(void) {
   assert(arena_allocs <= requests);
   #if MI_LARGE_REPURPOSE
   assert(repurposed >= 1);                                     // the mechanism ran
-  assert(repurposed <= (uint64_t)MI_LARGE_REPURPOSE_FRESH);    // ... and the heartbeat budget bounded it
+  assert(repurposed <= (uint64_t)CASCADE_BUDGET);              // ... and the heartbeat budget bounded it
   assert(denied >= 1);                                         // the requests beyond it were counted, not stolen
   assert(repurposed + denied <= requests);
   #endif
