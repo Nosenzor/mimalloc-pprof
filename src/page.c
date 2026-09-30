@@ -1105,8 +1105,8 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
     // #575: a large bin's miss ages the retired pages at most once per MI_LARGE_AGE_STEP generic mallocs (see there)
     if (pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE && pq->block_size <= MI_LARGE_MAX_OBJ_SIZE) {
       mi_tld_t* const tld = theap->tld;
-      if ((size_t)(theap->generic_count - tld->large_age_mark) >= (size_t)MI_LARGE_AGE_STEP) {   // (a heartbeat reset of the count wraps: ages once)
-        tld->large_age_mark = theap->generic_count;
+      if ((uint32_t)((uint32_t)theap->generic_count - tld->large_age_mark) >= (uint32_t)MI_LARGE_AGE_STEP) {   // (a heartbeat reset of the count wraps: ages once)
+        tld->large_age_mark = (uint32_t)theap->generic_count;
         _mi_theap_collect_retired(theap, false);
       }
     }
@@ -1316,7 +1316,7 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
     #if MI_LARGE_REPURPOSE
-    theap->tld->large_repurpose_left = MI_LARGE_REPURPOSE_PER_TICK;   // #530
+    theap->tld->large_repurpose_left = (uint32_t)MI_LARGE_REPURPOSE_PER_TICK;   // #530
     #endif
     _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }

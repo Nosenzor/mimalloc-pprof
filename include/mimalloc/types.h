@@ -1130,8 +1130,8 @@ struct mi_tld_s {
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
   size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
-  long                  large_age_mark;       // #575: `generic_count` when a large bin's page miss last aged the retired pages
-  size_t                large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
+  uint32_t              large_age_mark;       // #575: `generic_count` (mod 2^32) when a large bin's page miss last aged the retired pages (two 32-bit fields: `mi_tld_t` sits at its 512-byte size class, ci/check_struct_sizes.py)
+  uint32_t              large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
