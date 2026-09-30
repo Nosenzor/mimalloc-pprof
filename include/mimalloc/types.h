@@ -409,8 +409,9 @@ terms of the MIT license. A copy of the license can be found in the file
 // bits 0-2 the level (the span is MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT),
 // capped at MI_LARGE_PAGE_SIZE), bit 3 "a page of the bin filled up since the last page request",
 // bits 4-7 the pressure count, 4-bit two's complement (see MI_LARGE_SPAN_GROW_REQUESTS; 0 = none). One byte because
-// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes
-// keep it there, 64 would not.
+// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8168 bytes in the largest
+// configuration, checked by `MI_THEAP_META_MAX_SIZE` below): 16 more bytes keep it there, 64
+// would not.
 typedef uint8_t mi_large_span_bin_t;
 #endif
 
@@ -865,6 +866,19 @@ struct mi_theap_s {
   mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
   #endif
 };
+
+// #573: `mi_theap_t` (plus the block padding) is allocated from the meta-allocator and sits at the
+// edge of its 8 KiB size class. Eight more bytes made CI ASan `test-resident-first-churn` flaky
+// (8168 -> 8176 bytes), and nothing said so at compile time. This is the largest size any
+// configuration has today (MI_PADDING on, the profiler, memory events, diagnostics and DHAT all
+// in); a field that does not fit goes into `mi_tld_t` instead, or the budget is raised here,
+// deliberately, after checking the size class. (A negative array size is the portable static
+// assert: MSVC's C mode has none in every supported version.)
+#ifndef MI_THEAP_META_MAX_SIZE
+#define MI_THEAP_META_MAX_SIZE            (8176)
+#endif
+#define MI_STATIC_ASSERT(name,cond)       typedef char mi_static_assert_##name[(cond) ? 1 : -1]
+MI_STATIC_ASSERT(theap_meta_size, sizeof(struct mi_theap_s) + MI_PADDING_SIZE <= MI_THEAP_META_MAX_SIZE);
 
 
 

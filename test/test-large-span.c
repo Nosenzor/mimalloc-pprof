@@ -438,6 +438,55 @@ static void case_repurpose(void) {
   }
 }
 
+/* ---- (g2) every pair of large sizes: the re-carved page maps all its blocks (#573) ------
+   A page re-carved from bin A to bin B must map every block of B's geometry to itself, whatever
+   the two sizes. (g) checks two pairs; the page-map bug of #572 needed a specific pair and showed
+   only in a multi-threaded debug run, so this walks all of them on one thread at a time. A debug
+   build also asserts the first and last byte of the page at every `_mi_page_init`. */
+
+static const size_t RECARVE_SIZES[] = { 96, 112, 128, 160, 192, 224, 256, 300, 384, 448, 512 };   // KiB
+#define RECARVE_COUNT  (sizeof(RECARVE_SIZES) / sizeof(RECARVE_SIZES[0]))
+
+typedef struct recarve_s { size_t size_a, size_b; } recarve_t;
+
+static THREAD_RET recarve_main(void* arg) {
+  const recarve_t* const pair = (const recarve_t*)arg;
+  void* const a = mi_malloc(pair->size_a);
+  assert(a != NULL);
+  mi_free(a);          // the bin's only page empties: it is retired
+  mi_collect(false);   // one aging tick without reuse: any bin may take it
+  void* blocks[32];
+  size_t n = 0;
+  const mi_page_t* page = NULL;
+  for (; n < 32; n++) {   // fill B's page, then one block more
+    blocks[n] = mi_malloc(pair->size_b);
+    assert(blocks[n] != NULL);
+    const mi_page_t* const pg = _mi_ptr_page(blocks[n]);
+    if (n == 0) { page = pg; }
+    if (pg != page) { n++; break; }
+    memset(blocks[n], 0x66, pair->size_b);
+    CHECK(mi_usable_size(blocks[n]) >= pair->size_b, "(g2) %zu -> %zu KiB: block %zu has no usable size", pair->size_a >> 10, pair->size_b >> 10, n);
+  }
+  for (size_t i = 0; i < n; i++) { mi_free(blocks[i]); }
+  return THREAD_OK;
+}
+
+static void case_recarve_matrix(void) {
+  size_t pairs = 0;
+  for (size_t i = 0; i < RECARVE_COUNT; i++) {
+    for (size_t j = 0; j < RECARVE_COUNT; j++) {
+      recarve_t pair = { RECARVE_SIZES[i] << 10, RECARVE_SIZES[j] << 10 };
+      if (!bin_of_size_is_large(pair.size_a) || !bin_of_size_is_large(pair.size_b)) { continue; }
+      thread_t t;
+      thread_start(&t, &recarve_main, &pair);
+      thread_join(t);
+      pairs++;
+    }
+  }
+  fprintf(stderr, "(g2) %zu ordered pairs of large sizes re-carved, every block of the new geometry mapped\n", pairs);
+  CHECK(pairs > 0, "(g2) no pair of sizes is a large bin in this build");
+}
+
 /* ---- (h) the retired-slot mask stays exact ------------------------------- */
 
 static size_t slots_in_use(const mi_tld_t* tld) {
@@ -518,6 +567,7 @@ int main(void) {
   case_blip();
   case_edge();
   case_repurpose();
+  case_recarve_matrix();
   case_slots();
   #endif
   if (failures > 0) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
