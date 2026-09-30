@@ -162,6 +162,10 @@ See
    - **Regressions in the baseline are debts, not allowances.** The previous PR's measured costs
      (for example #538's exact-128-KiB +4.6% CPU, `random-large-bursty/8` +55% minor faults,
      `larson/8` +3.7% CPU) are the floor to improve, not a budget to spend.
+   - **p99:** perf-ab has no p99 column yet (#585); until it does, state "p99: not measured"
+     in the ledger rather than omitting it.
+   - **Attribute before designing, and measure reuse distance before any discard policy:** hot
+     bytes refault at ~10x CPU (#575). See "Perf campaign method" in `docs/dev-loop.md`.
    - After the memory win lands, spend dedicated rounds cutting its CPU cost; reaching the 1/3
      ceiling is a limit, not a target. Put the ledger table in the PR and on the parent issue.
 

@@ -1,5 +1,7 @@
 """ci/scaling_failure_alert.py: one issue for a streak of failed scheduled runs (#573 B9)."""
 
+# pyright: reportMissingTypeStubs=false
+
 from __future__ import annotations
 
 import json
