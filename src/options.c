@@ -197,6 +197,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(large_span) }             // #532: demand-sized large-page spans (MIMALLOC_LARGE_SPAN); 0 = every large page is MI_LARGE_PAGE_SIZE
+  ,{ MI_LARGE_SPAN_MAX_KIB, MI_OPTION_UNINIT, MI_OPTION(large_span_max) }   // #575: largest demand-grown span in KiB (MIMALLOC_LARGE_SPAN_MAX); 0 = MI_LARGE_PAGE_SIZE
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -648,8 +649,31 @@ void _mi_warning_message(const char* fmt, ...) {
 
 
 #if MI_DEBUG
+// #573 A4: a failed assertion prints the stack of the failing thread, so a race that shows only in
+// a multi-threaded debug run (and never under gdb) names its site without a core dump. glibc and
+// macOS have `backtrace`; symbols resolve with -rdynamic, otherwise `addr2line -e <binary>` does.
+// `backtrace` may itself allocate the first time (it loads libgcc): the flag makes that a plain
+// abort instead of a loop through the allocator's own assertion.
+#ifndef MI_ASSERT_BACKTRACE_FRAMES
+#define MI_ASSERT_BACKTRACE_FRAMES  (32)
+#endif
+#if defined(__GLIBC__) || defined(__APPLE__)
+#include <execinfo.h>
+#define MI_ASSERT_BACKTRACE  1
+static _Atomic(int) mi_assert_backtracing;
+#else
+#define MI_ASSERT_BACKTRACE  0
+#endif
+
 mi_decl_noreturn mi_decl_cold void _mi_assert_fail(const char* assertion, const char* fname, unsigned line, const char* func ) mi_attr_noexcept {
   _mi_fprintf(NULL, NULL, "mimalloc: assertion failed: at \"%s\":%u, %s\n  assertion: \"%s\"\n", fname, line, (func==NULL?"":func), assertion);
+  #if MI_ASSERT_BACKTRACE
+  if (mi_atomic_exchange_acq_rel(&mi_assert_backtracing, 1) == 0) {
+    void* frames[MI_ASSERT_BACKTRACE_FRAMES];
+    const int n = backtrace(frames, MI_ASSERT_BACKTRACE_FRAMES);
+    backtrace_symbols_fd(frames, n, 2);   // (writes straight to stderr: no allocation)
+  }
+  #endif
   abort();
 }
 #endif

@@ -539,6 +539,7 @@ void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, 
 
 void mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_noexcept {
   mi_subproc_stats_print_out(mi_subproc_current(),out, arg);
+  _mi_event_print();   // #573 A2: the slow-path event counters (MI_DIAGNOSTICS)
 }
 
 // deprecated

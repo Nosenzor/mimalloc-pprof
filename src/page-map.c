@@ -140,12 +140,13 @@ static size_t mi_page_map_get_idx(mi_page_t* page, uint8_t** page_start, size_t*
   size_t page_size;
   *page_start = mi_page_area(page, &page_size);
   if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }  // furthest interior pointer
-  *slice_count = mi_slice_count_of_size(page_size) + ((*page_start - mi_page_slice_start(page))/MI_ARENA_SLICE_SIZE); // add for large aligned blocks
+  *slice_count = mi_slice_count_of_size(page_size + (size_t)(*page_start - mi_page_slice_start(page))); // (#573) the blocks start after the page header and large alignment padding: count the slices they end in
   return _mi_page_map_index(page);
 }
 
 bool _mi_page_map_register(mi_page_t* page) {
   mi_assert_internal(page != NULL);
+  MI_EVENT(MI_EVENT_PAGE_MAP_REGISTER);   // (#573)
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(mi_atomic_load_ptr_relaxed(uint8_t,&_mi_page_map) != NULL);  // should be initialized before multi-thread access!
   uint8_t* page_map = mi_atomic_load_ptr_relaxed(uint8_t,&_mi_page_map);
@@ -493,16 +494,25 @@ static bool mi_page_map_set_range(mi_page_map_t* pmap, mi_page_t* page, size_t i
 //
 // Re-open with a repro that actually corrupts -- most likely on a platform or path
 // where the os_align allocation has NO trailing slack.
+//
+// (#573) A different arithmetic slip in the same line WAS reproducible, by the page-map check that
+// `_mi_page_init` runs in a debug build (`mi_page_map_check_page`, page.c): with the term
+// `floor(offset / SLICE)` a page whose blocks start part-way into a slice (an OS-backed singleton:
+// offset 4096, 851968 bytes) registered one slice too few, so the last 4 KiB of its only block
+// mapped to no page (`test-diagnostic-walks-os`, MIMALLOC_DISALLOW_ARENA_ALLOC=1). The count is
+// now `ceil((offset + size) / SLICE)`: exact for the flat map, and for this map never lower than
+// before (the over-count above is unchanged in kind).
 static size_t mi_page_map_get_idx(mi_page_t* page, size_t* sub_idx, size_t* slice_count) {
   size_t page_size;
   uint8_t* page_start = mi_page_area(page, &page_size);
   if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }  // furthest interior pointer
-  *slice_count = mi_slice_count_of_size(page_size) + ((page_start - mi_page_slice_start(page))/MI_ARENA_SLICE_SIZE); // add for large aligned blocks
+  *slice_count = mi_slice_count_of_size(page_size + (size_t)(page_start - mi_page_slice_start(page))); // (#573) as above: the sub-slice part of the start offset can push the last block into one more slice
   return _mi_page_map_index(page_start, sub_idx);
 }
 
 bool _mi_page_map_register(mi_page_t* page) {
   mi_assert_internal(page != NULL);
+  MI_EVENT(MI_EVENT_PAGE_MAP_REGISTER);   // (#573)
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_page_map_t* pmap = _mi_page_map();
   mi_assert_internal(pmap != NULL);  // should be initialized before multi-thread access!

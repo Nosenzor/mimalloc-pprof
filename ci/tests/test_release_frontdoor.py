@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import struct
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -21,6 +23,72 @@ PARENT = "c" * 40
 
 
 class ReleaseFrontdoorTests(unittest.TestCase):
+    def test_resume_restores_only_the_artifact_matching_the_freeze(self) -> None:
+        # #564: rebuilt archives never match a freeze, so resume reuses frozen bytes.
+        value = release.directive(444, "1.0.1", SHA)
+        frozen_info: dict[str, object] = {"frozen": True}
+        frozen = {"info_sha256": release.canonical_info_sha256(frozen_info)}
+
+        def bundle(info: dict[str, object], extra: str | None = None) -> bytes:
+            data = BytesIO()
+            with zipfile.ZipFile(data, "w") as archive:
+                archive.writestr("info.json", json.dumps(info))
+                for name in value["assets"]:
+                    archive.writestr(name, f"{name}:{info}")
+                if extra:
+                    archive.writestr(extra, "x")
+            return data.getvalue()
+
+        artifacts = {
+            7: bundle({"frozen": True}, extra="../escape"),
+            8: bundle({"dry": True}),
+            9: bundle(frozen_info),
+        }
+
+        def download(artifact_id: int, path: Path) -> None:
+            path.write_bytes(artifacts[artifact_id])
+
+        with tempfile.TemporaryDirectory() as scratch:
+            dist = Path(scratch)
+            (dist / "rebuilt.zip").write_text("rebuilt")
+            with patch.object(release, "command", return_value="7\n8\n9\n"):
+                chosen = release.restore_frozen_artifacts(dist, value, frozen, download=download)
+            self.assertEqual(chosen, 9)
+            self.assertEqual(
+                sorted(path.name for path in dist.iterdir()),
+                sorted([*value["assets"], "info.json"]),
+            )
+            self.assertEqual(json.loads((dist / "info.json").read_text()), frozen_info)
+
+            with (
+                patch.object(release, "command", return_value="8\n"),
+                self.assertRaisesRegex(release.ReleaseError, "matches the frozen info.json"),
+            ):
+                release.restore_frozen_artifacts(dist, value, frozen, download=download)
+
+    def test_command_runs_without_color_forcing_from_setup_soldr(self) -> None:
+        # setup-soldr exports these to every later step; gh then emits ANSI JSON.
+        forced = {"CLICOLOR_FORCE": "1", "FORCE_COLOR": "1", "GH_FORCE_TTY": "1"}
+        probe = (
+            "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+            "('CLICOLOR_FORCE', 'FORCE_COLOR', 'GH_FORCE_TTY', 'NO_COLOR')}))"
+        )
+        with patch.dict(os.environ, forced):
+            seen = json.loads(release.command(sys.executable, "-c", probe))
+        self.assertEqual(
+            seen,
+            {"CLICOLOR_FORCE": None, "FORCE_COLOR": None, "GH_FORCE_TTY": None, "NO_COLOR": "1"},
+        )
+
+    def test_github_json_rejects_ansi_pretty_printed_output(self) -> None:
+        # Shape gh printed under CLICOLOR_FORCE=1 in run 36390586755.
+        colored = '\x1b[1;37m{\x1b[m\n  \x1b[1;34m"state"\x1b[m\x1b[1;37m:\x1b[m \x1b[32m"OPEN"\x1b[m\n\x1b[1;37m}\x1b[m'
+        self.assertIsNone(
+            release.validated_json_document(
+                colored, lambda result: release.json_object_with_string_fields(result, ("state",))
+            )
+        )
+
     def test_github_json_retries_empty_and_schema_invalid_success(self) -> None:
         sleeps: list[float] = []
         with patch.object(
@@ -219,7 +287,7 @@ class ReleaseFrontdoorTests(unittest.TestCase):
         self.assertEqual(sleeps, [])
 
     def test_source_version_requires_matching_lockfile(self) -> None:
-        self.assertEqual(release.source_version(), "1.0.1")
+        self.assertEqual(release.source_version(), "1.1.0")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             crate = root / "rust/mimalloc-pprof"

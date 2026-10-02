@@ -100,3 +100,20 @@ missing native row prevents every publication step. The older full CI bundles
 still exercise their own configurations, including DHAT, and are not claimed
 to have byte-identical libraries. The real publisher stays behind the explicit
 failing fleet gate until the remaining release state machine is implemented.
+
+## Resuming after a freeze (#564)
+
+The five binary archives are not byte-reproducible, so a resumed attempt that
+rebuilds them can never match the `fleet-release-freeze/v1` record. On every
+attempt `preflight-assets` runs `ci/release.py restore-frozen-artifacts` before it
+records `info.json`. Without a freeze, that step does nothing. With a freeze, it
+pages the repository's unexpired `release-preflight-<candidate SHA>` artifacts,
+picks the one whose `info.json` hashes to the frozen `info_sha256`, and replaces
+the rebuilt `dist/` with those exact bytes. The smoke rows and the publisher then
+handle the frozen bytes. The crate needs no restore: `cargo package` is
+deterministic, and the publisher already compares two packagings byte for byte.
+A resume therefore has to happen within the artifact retention window. After
+that, verify the destinations against the freeze by hand, as was done for v1.0.1.
+
+To resume, re-dispatch `auto-release.yml` with the same `candidate_sha` and the
+same five full-CI run IDs.

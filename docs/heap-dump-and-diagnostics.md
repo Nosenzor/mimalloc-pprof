@@ -78,6 +78,7 @@ Declared in `include/mimalloc-stats.h`. The Rust wrappers are at the crate root 
   not a capture in progress, the serialization, or the final allocation. `0` means one
   attempt. `SIZE_MAX` is valid, because the elapsed-time test never adds to it. A call made
   while the caller already holds its own gate (`tld->gate_depth != 0`) makes one attempt.
+  So does an attempt whose only misses are fork orphans (§5.4), whatever `wait_ms` is.
 - **`mi_heap_get_seq`** returns the per-sub-process creation number from `src/heap.c` (the
   pre-increment value of `mi_atomic_increment_relaxed(&subproc->heap_total_count)`). The main
   heap is 0, the same value that `NULL` and the stub return. Rust leaves it sys-only
@@ -134,8 +135,8 @@ numbers; heaps are separated by `",\n"`; without blocks each heap ends `    ] }`
 | `blocks[i][0]` | the walker's block pointer | block base in the page (not the user pointer in a guarded build), through `mi_dump_id` |
 | `blocks[i][1]` | the walker's `block_size` | the usable size; always equal to its page's `block_size` |
 | `complete` | `mi_dump_complete` | `skipped_pages == 0 && busy_theaps == 0` in the final attempt |
-| `skipped_pages` | `mi_diag_coverage_t` | pages found but not owned (§5.3) |
-| `busy_theaps` | `mi_diag_coverage_t` | theaps whose owner could not be claimed for the live-OS pass |
+| `skipped_pages` | `mi_diag_coverage_t` | pages found but not owned (§5.3), including the pages of a fork orphan |
+| `busy_theaps` | `mi_diag_coverage_t` | theaps whose owner could not be claimed for the live-OS pass, including a fork orphan's |
 
 **`used` has two meanings.** Without blocks it is `page->used`, read under ownership but
 *before* the walker collects pending cross-thread frees, so those blocks still count. With
@@ -164,7 +165,7 @@ graph TD
   F --> I["abandoned OS pages: mi_diag_abandoned_os"]
   G & H & I --> J["mi_dump_capture_block: records in raw-OS chunks"]
   J --> K["MI_GATE_LEAVE; captured and complete?"]
-  K -- "incomplete, gated, not nested, time left" --> L["mi_dump_dispose; pause or yield"]
+  K -- "incomplete, a non-orphan miss, gated, not nested, time left" --> L["mi_dump_dispose; pause or yield"]
   L --> C
   K -- "otherwise" --> M["mi_dump_serialize, mi_malloc + copy, mi_dump_dispose"]
 ```
@@ -211,16 +212,21 @@ alive, and makes three passes:
 
 | pass | pages | how exclusive access is proven | counted as missed |
 |---|---|---|---|
-| arena: `_mi_bitmap_forall_set` over `arena_pages->pages`, calling `mi_diag_arena_page` | every arena page of the heap | **pin** (`mi_bitmap_clear` of the page's bit). Abandoned (`tid <= MI_THREADID_ABANDONED_MAPPED`): `mi_page_claim_ownership`. Owned: find the tld on `heap->theaps`, `mi_diag_try_tld`, then re-read `mi_page_thread_id`, which must be unchanged | bit already clear, owner unclaimable, no tld, or owner changed → `skipped_pages` |
-| live OS: `_mi_theap_visit_pages(theap, &mi_diag_owned_os_page, true, ..)` per theap | queue pages whose `memid.memkind` is not `MI_MEM_ARENA`; no bitmap or abandoned list holds them | `mi_diag_try_tld` on the theap's tld, held for the whole queue walk | claim fails → `busy_theaps` |
-| abandoned OS: `mi_diag_abandoned_os` | `heap->os_abandoned_pages` | `mi_page_claim_ownership` under `os_abandoned_pages_lock`. Owned pages are stashed in batches, then visited and unowned after the lock is released | claim fails → `skipped_pages` |
+| arena: `_mi_bitmap_forall_set` over `arena_pages->pages`, calling `mi_diag_arena_page` | every arena page of the heap | **pin** (`mi_bitmap_clear` of the page's bit). Abandoned (`tid <= MI_THREADID_ABANDONED_MAPPED`): `mi_page_claim_ownership`. Owned: find the tld on `heap->theaps`, `mi_diag_try_tld`, then re-read `mi_page_thread_id`, which must be unchanged | bit already clear, owner unclaimable or a fork orphan, abandoned page already owned, no tld, or owner changed → `skipped_pages` |
+| live OS: `_mi_theap_visit_pages(theap, &mi_diag_owned_os_page, true, ..)` per theap | queue pages whose `memid.memkind` is not `MI_MEM_ARENA`; no bitmap or abandoned list holds them | `mi_diag_try_tld` on the theap's tld, held for the whole queue walk | claim fails, or a fork orphan → `busy_theaps` |
+| abandoned OS: `mi_diag_abandoned_os` | `heap->os_abandoned_pages` | `mi_page_claim_ownership` under `os_abandoned_pages_lock`. Owned pages are stashed in batches, then visited and unowned after the lock is released | claim fails → `skipped_pages` (`mi_diag_claim_failed`) |
 
 **The claim.** `mi_diag_try_tld` never waits. For the detached tld (`MI_THREADID_DETACHED`,
-which backs `theap_meta`) it is `mi_lock_try_acquire(&subproc->theap_meta_lock)`. The
-caller's own tld always succeeds, since the caller is the owner (and in a gated build holds
-its gate). For any other tld it CASes `park_state` from `MI_PARK_PARKED` to
-`MI_PARK_SWEEPING` (acq_rel) and then release-stores the caller's id into `tld->sweeper`.
-`mi_diag_release_tld` release-stores `sweeper = 0`, then `park_state = MI_PARK_PARKED`.
+which backs `theap_meta`) it is `mi_lock_try_acquire(&subproc->theap_meta_lock)`. A tld with
+`MI_GATE_FLAG_ORPHAN` in `gate_flags` fails without a CAS and adds one to
+`mi_diag_coverage_t::orphaned` (see §7, forked child), the same test `mi_purge_walk_claim`
+makes before it counts an orphan. That test comes before the thread-id match, because a
+thread started in the child can reuse a dead thread's TLS block and so its id. The caller's
+own tld then always succeeds, since the caller is the owner (and in a gated build holds its
+gate). For any other tld it CASes
+`park_state` from `MI_PARK_PARKED` to `MI_PARK_SWEEPING` (acq_rel) and then release-stores
+the caller's id into `tld->sweeper`. `mi_diag_release_tld` release-stores `sweeper = 0`,
+then `park_state = MI_PARK_PARKED`.
 
 **Visiting a page.** `mi_diag_visit_page` fills a `mi_heap_area_t` (`_mi_heap_area_init`),
 calls the visitor with `block == NULL` for the page record, and, for block dumps, calls
@@ -235,7 +241,9 @@ reports purged hole blocks as free, so a dump never names discarded memory
 
 Each attempt runs `mi_dump_ctx_init`, `MI_GATE_ENTER(self)`, `mi_subproc_visit_heaps`, and
 `MI_GATE_LEAVE`. The loop stops if the capture failed (the call then returns `NULL` without
-serializing) or is complete. **With `MI_OWNER_GATE`** it also stops when the call is nested
+serializing), is complete, or missed only fork orphans: `mi_dump_retry_can_help` is false
+when `skipped_pages + busy_theaps` equals `coverage.orphaned`, since no retry can claim an
+orphan. **With `MI_OWNER_GATE`** it also stops when the call is nested
 (`can_retry` is false) or when `elapsed >= wait_ms`. Otherwise it calls `mi_dump_dispose`, increments
 `mi_debug_dump_retrying` (debug builds), and waits once: a single `mi_atomic_pause` on each of
 the call's first 256 retries, one `_mi_prim_thread_yield` on every later retry. Then it
@@ -315,14 +323,21 @@ of its builds enables `MI_DIAGNOSTICS`.
 - **`skipped_pages` is conservative.** A page freed between the bitmap scan and the pin, or
   whose owner has no theap on this heap's list, still counts as skipped.
 - **Unbounded wait.** `SIZE_MAX` in a gated build retries until every owner is claimable, so
-  a thread that stays inside the allocator keeps it waiting.
-- **Possible defect (static trace, untested): an owner-gated forked child with live orphan
-  theaps never returns from `mi_heap_dump_json_ex(.., SIZE_MAX)`.** `src/fork.c` resets
-  every tld to `MI_PARK_RUNNING` and marks all but the forking thread's
-  `MI_GATE_FLAG_ORPHAN`. `mi_diag_try_tld` never reads `gate_flags` (unlike
-  `mi_purge_all_ex`, which counts orphans and never waits on them). So every orphan theap
-  still linked to a heap adds to `busy_theaps` on every attempt, and the loop never exits.
-  With the 100 ms default, each call burns the budget and returns `complete: false`.
+  a thread that stays inside the allocator keeps it waiting. A fork orphan does not.
+- **Forked child.** `src/fork.c` resets every tld to `MI_PARK_RUNNING` and marks all but the
+  forking thread's `MI_GATE_FLAG_ORPHAN`. Those threads do not exist in the child, so no
+  orphan ever parks. The walk never claims an orphan and never waits for one, as
+  `mi_purge_all_ex` counts orphans and returns: an orphan's pages count in `skipped_pages`,
+  its theaps in `busy_theaps`, the result says `"complete": false`, and an attempt that missed
+  only orphans is the last one, even with `SIZE_MAX`. The same holds for an abandoned page of
+  a heap that existed at the fork (`heap->prefork_theaps`) whose ownership claim fails: a
+  thread caught mid cross-thread free by `fork()` can leave it owned for good.
+  `mi_heap_visit_page_claim` seizes such a page, but the capture never takes a page it
+  cannot claim, so `mi_diag_claim_failed` counts the miss as orphaned too. The cost: in a
+  forked child, a live thread that owns such a page only briefly is not waited for either. The JSON has no separate orphan count
+  (`mi_purge_all_report_t` has `theaps_orphaned`). Before the fix `mi_diag_try_tld` did not
+  read `gate_flags`, so a gated child never returned from `mi_heap_dump_json_ex(.., SIZE_MAX)`
+  and every default call spent its whole 100 ms.
 - **Scope.** Only the current sub-process; every sub-process's first heap is `seq` 0.
 - **Guarded builds.** Block ids are block bases, and `MIMALLOC_GUARDED_SAMPLE_RATE=1` gives
   each allocation its own page. The tests therefore sum `used` per heap.
@@ -395,15 +410,19 @@ The `MI_TEST_TLS_CONTROL` controls (`_mi_test_tls_control_set`, `_mi_test_tls_co
 |---|---|
 | `test_report_gate` (gated, debug) | a holes reporter held at `mi_debug_stall_in_holes_report` is RUNNING, so `mi_purge_all_ex` reports it pending; after it leaves, the purge reaches it |
 | `test_dump_waits_from_clean_boundary` (gated, debug) | a nested call is one-shot (`"complete": false`); `SIZE_MAX` retries to completion, and the owner attaches to a new heap mid-wait, proving `theaps_lock` was dropped |
+| `test_dump_fork_orphan` (gated, POSIX) | fork while a second thread holds live blocks; in the child, `SIZE_MAX` returns within a 20 s `alarm` with `"complete": false`, `busy_theaps` ≥ 1 and (with arenas) `skipped_pages` ≥ 1, and with `MI_DEBUG > 0` after zero retries |
+| `test_dump_fork_owned_page` (gated, POSIX) | fork while a second thread holds the ownership bit of an abandoned page of a pre-fork heap; in the child, `SIZE_MAX` returns within the `alarm` with `"complete": false` |
 | `test_dump_coverage` | RUNNING owner → incomplete; synthetic PARKED → complete, exactly 32 blocks |
 | `test_dump_growth` | more than 500,000 bytes of JSON; with `MI_MEMEVT`, zero `MI_MEMORY_RESIZE` callbacks |
 | `test_dump_abandoned` | 70 abandoned single-block pages captured; `mi_debug_dump_fail_after` = 1..12 or `UINTPTR_MAX` returns `NULL` and leaks no claim |
 | `test_many_owners` | 70 parked owners captured: no fixed cap |
 | `test_retirement_churn` | 100 one-shot dumps against page-retiring churn |
 
-**Where each part runs.** The two gated scenarios need `MI_OWNER_GATE && MI_DEBUG > 0`. In CI
-only the owner-gate row of `.github/workflows/asan.yml` (Debug, `MI_DEBUG_FULL`) builds that;
-every other gated row is Release. The fault-injection loop needs `MI_DEBUG > 0`.
+**Where each part runs.** `test_report_gate` and `test_dump_waits_from_clean_boundary` need
+`MI_OWNER_GATE && MI_DEBUG > 0`. In CI only the owner-gate row of `.github/workflows/asan.yml`
+(Debug, `MI_DEBUG_FULL`) builds that; every other gated row is Release. The two fork scenarios
+run in every gated POSIX build (the Windows gated bundles have no `fork`), and the orphan
+scenario's zero-retry assertion only with `MI_DEBUG > 0`. The fault-injection loop needs `MI_DEBUG > 0`.
 
 **Rust.** Two `lib.rs` unit tests (`heap_dump_json_reports_well_formed_json_with_current_heap`,
 `heap_dump_and_snapshot_are_inert_when_compiled_out`) and `rust/mimalloc-pprof/tests/feature_contract.rs` pin both shapes.
@@ -433,13 +452,14 @@ ran, so it cannot see tests that were never registered. `ci/check_rust_surface.p
 
 | file | function / type | role |
 |---|---|---|
-| `src/heap-dump.c` | `mi_heap_dump_json_ex` | retry loop, gate, serialization, final `mi_malloc` |
+| `src/heap-dump.c` | `mi_heap_dump_json_ex`, `mi_dump_retry_can_help` | retry loop and its orphan stop, gate, serialization, final `mi_malloc` |
 | `src/heap-dump.c` | `mi_dump_alloc`, `mi_dump_dispose` | raw-OS bump scratch; sticky failure; fault injection |
 | `src/heap-dump.c` | `mi_dump_capture_heap`, `mi_dump_capture_block` | heap, page and block records; both meanings of `used` |
 | `src/heap-dump.c` | `mi_dump_serialize`, `mi_dump_print`, `mi_dump_id` | JSON text chunks; address hashing |
 | `src/diagnostic-walk.h` | `_mi_heap_visit_capture`, `mi_diag_coverage_t` | internal entry point and coverage counters |
 | `src/diagnostic-walk.c` | `mi_diag_arena_page` | pin, claim, re-check, visit, restore the pin, unown |
-| `src/diagnostic-walk.c` | `mi_diag_try_tld`, `mi_diag_release_tld` | non-blocking SWEEPING or `theap_meta_lock` claim |
+| `src/diagnostic-walk.c` | `mi_diag_try_tld`, `mi_diag_release_tld` | non-blocking SWEEPING or `theap_meta_lock` claim; refuses fork orphans |
+| `src/diagnostic-walk.c` | `mi_diag_claim_failed` | a failed abandoned-page claim; orphaned in a forked child's pre-fork heap |
 | `src/diagnostic-walk.c` | `mi_diag_abandoned_os`, `mi_diag_owned_os_page` | OS-page passes; batches claimed under the list lock |
 | `src/arena.c` | `mi_heap_visit_blocks`, `_mi_heap_visit_blocks` | upstream visitor and contract; hosts the include |
 | `src/theap.c` | `_mi_heap_area_init`, `_mi_theap_area_visit_blocks` | area fields; block walk with collect and purged-block marking |

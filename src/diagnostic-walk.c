@@ -14,12 +14,21 @@ typedef struct mi_diag_walk_s {
 
 // heap->theaps_lock pins the tld. Never wait while holding a page pin: the owner
 // or an in-flight sweeper might be retiring that page and waiting for our bit.
-static bool mi_diag_try_tld(mi_subproc_t* subproc, mi_tld_t* tld, bool* claimed) {
+// A fork orphan (src/fork.c: the pre-fork tld of a thread that did not survive) is RUNNING
+// forever. Like `mi_purge_walk_claim`, never claim one and never wait for it: the miss it
+// causes is counted in `coverage->orphaned` so the dump's retry loop stops. Tested before the
+// thread-id match: a thread started in the child can reuse a dead thread's TLS block, and so
+// its thread id; the caller's own tld is never an orphan.
+static bool mi_diag_try_tld(mi_subproc_t* subproc, mi_tld_t* tld, mi_diag_coverage_t* coverage, bool* claimed) {
   *claimed = false;
   if (tld == NULL) return false;
   if (tld->thread_id == MI_THREADID_DETACHED) {
     *claimed = mi_lock_try_acquire(&subproc->theap_meta_lock);
     return *claimed;
+  }
+  if ((mi_atomic_load_relaxed(&tld->gate_flags) & (size_t)MI_GATE_FLAG_ORPHAN) != 0) {
+    coverage->orphaned++;
+    return false;
   }
   if (tld->thread_id == _mi_thread_id()) return true; // caller already gated
   size_t expected = MI_PARK_PARKED;
@@ -37,6 +46,17 @@ static void mi_diag_release_tld(mi_subproc_t* subproc, mi_tld_t* tld, bool claim
   }
   mi_atomic_store_release(&tld->sweeper, (uintptr_t)0);
   mi_atomic_store_release(&tld->park_state, (size_t)MI_PARK_PARKED);
+}
+
+// In a forked child, a heap that existed at the fork (`prefork_theaps`, src/fork.c) can hold an
+// abandoned page that stays OWNED for good: a thread caught mid cross-thread free when fork() ran
+// held its ownership bit and does not exist in the child. `mi_heap_visit_page_claim` (arena.c)
+// seizes such a page; the capture never takes a page it cannot claim, so a failed claim there
+// is treated as permanent and counts in `coverage->orphaned` as well (a live thread that owns
+// the page only briefly is then not waited for either).
+static void mi_diag_claim_failed(const mi_heap_t* heap, mi_diag_coverage_t* coverage) {
+  coverage->skipped_pages++;
+  if (_mi_process_is_forked_child && heap->prefork_theaps) { coverage->orphaned++; }
 }
 
 static bool mi_diag_visit_page(mi_page_t* page, mi_diag_walk_t* walk) {
@@ -62,7 +82,9 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
   bool claimed = false;
   bool owned = false;
   bool ready = false;
+  bool abandoned = false;
   if (tid <= MI_THREADID_ABANDONED_MAPPED) {
+    abandoned = true;
     owned = mi_page_claim_ownership(page);
     ready = owned;
   }
@@ -70,7 +92,7 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
     for (mi_theap_t* theap = walk->heap->theaps; theap != NULL; theap = theap->hnext) {
       if (theap->tld != NULL && theap->tld->thread_id == tid) { tld = theap->tld; break; }
     }
-    if (mi_diag_try_tld(walk->heap->subproc, tld, &claimed)) {
+    if (mi_diag_try_tld(walk->heap->subproc, tld, walk->coverage, &claimed)) {
       // The page could have been abandoned/reclaimed between our atomic tid read
       // and the owner claim. Never use the earlier observation as ownership proof.
       ready = (mi_page_thread_id(page) == tid);
@@ -78,6 +100,7 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
   }
   bool ok = true;
   if (ready) { ok = mi_diag_visit_page(page, walk); }
+  else if (abandoned) { mi_diag_claim_failed(walk->heap, walk->coverage); }
   else { walk->coverage->skipped_pages++; }
   mi_bitmap_set(bitmap, index); // before unown, which may retire the page
   if (owned) { mi_abandoned_page_unown(page, NULL); }
@@ -112,7 +135,7 @@ static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
         batches = batch;
       }
       if (mi_page_claim_ownership(page)) { batches->pages[batches->used++] = page; }
-      else { walk->coverage->skipped_pages++; }
+      else { mi_diag_claim_failed(walk->heap, walk->coverage); }
     }
   }
   while (batches != NULL) {
@@ -147,7 +170,7 @@ bool _mi_heap_visit_capture(mi_heap_t* heap, bool blocks, mi_block_visit_fun* vi
     // Live OS pages are absent from the arena bitmap and abandoned OS list.
     for (mi_theap_t* theap = heap->theaps; theap != NULL && ok; theap = theap->hnext) {
       bool claimed;
-      if (!mi_diag_try_tld(heap->subproc, theap->tld, &claimed)) { coverage->busy_theaps++; continue; }
+      if (!mi_diag_try_tld(heap->subproc, theap->tld, coverage, &claimed)) { coverage->busy_theaps++; continue; }
       ok = _mi_theap_visit_pages(theap, &mi_diag_owned_os_page, true, &walk, NULL);
       mi_diag_release_tld(heap->subproc, theap->tld, claimed);
     }

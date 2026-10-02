@@ -44,6 +44,12 @@ uv run examples/heap-snapshot/heapview.py a.bin diff b.bin                   # w
 page that no live block covers. `sizes` ranks by committed bytes, `frag` by waste,
 `diff` by |Δcommitted|.
 
+A snapshot covers every sub-process (`mi_subproc_new`), as one flat list: format version 1
+does not say which sub-process an arena or heap belongs to. An arena's `idx` is its slot in
+its own sub-process, and every sub-process's main heap has `heap_seq` 0, so with more than
+one sub-process both repeat, and `sizes --by-heap` merges the main heaps. A page belongs to
+the arena whose `[base, base + size)` holds its `slice_start`.
+
 The C tool (`mi-heapview`, built with the library) has one more command, `peek`, which
 reads block contents out of a core file; it is deliberately not mirrored here.
 

@@ -25,7 +25,7 @@ jobs:
   pr-test-gate:
     name: PR test gate (asan)
     if: ${{ always() && github.event_name == 'pull_request' }}
-    needs: [pr-ci-mode, asan]
+    needs: [pr-ci-mode, asan, stress]
     uses: ./.github/workflows/pr-ci-gate.yml
     with:
       workflow: asan
@@ -148,3 +148,24 @@ jobs:
             exit 1
           fi
           echo "positive control fired: ASan caught the use-after-free (rc=$rc)"
+
+  # #573 D: the multi-threaded perf_ab workloads (large sizes, thread generations, bursty idle
+  # drain, larson) at small operation counts against a MI_DEBUG_FULL build and against a clang
+  # TSAN build. They exposed #572's page-map extent and retired-slot mask bugs, which only the
+  # label-gated release-build perf-ab job ran; the inherited TSAN row of test.yaml runs only on
+  # `dev*` pushes and tags, so it never sees this fork's PRs. The same command runs locally:
+  # `uv run ci/verify_local.py --only stress,tsan`.
+  stress:
+    needs: pr-ci-mode
+    if: github.event_name == 'pull_request' && (contains(github.event.pull_request.labels.*.name, 'ci-test') || contains(github.event.pull_request.labels.*.name, 'ci-full') || needs.pr-ci-mode.outputs.external == 'true')
+    name: multi-threaded stress (debug-full, tsan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # verify_local SKIPS the tsan config without clang: a skipped sanitizer is a green job that
+      # sanitized nothing, so fail here instead.
+      - name: clang is present
+        run: clang --version
+      - name: perf_ab rows under MI_DEBUG_FULL and under TSAN
+        run: python3 ci/verify_local.py --only stress,tsan

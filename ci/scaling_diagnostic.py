@@ -42,6 +42,11 @@ ENV_PAIR = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>[A-Za-z0-9_.+-
 MIB = 1 << 20
 DIAGNOSTIC_STATUS = "diagnostic"
 MAX_BLOCKS = 40  # rust/benchmark-suite MAX_DIAGNOSTIC_BLOCKS (= DISTRIBUTION_BLOCKS)
+# #573 B7: a diagnostic DISPATCH takes at least this many paired blocks per cell. A 5-block sweep
+# produced a false +6-12% RSS "regression" in #572 (the spread of a cell is 30-45 MiB at 5 blocks);
+# 15 is what resolved single cells. (The runner itself still accepts 1..MAX_BLOCKS: the large-span
+# diagnostic workflow and the tests call it directly.)
+MIN_DISPATCH_BLOCKS = 15
 
 
 class DiagnosticInputError(ValueError):
@@ -126,8 +131,11 @@ def validate_inputs(
     parse_cppdefs(cppdefs)
     parse_patterns(patterns)
     parse_threads(threads)
-    if not 1 <= blocks <= MAX_BLOCKS:
-        raise DiagnosticInputError(f"blocks: a diagnostic run takes 1..{MAX_BLOCKS}")
+    if not MIN_DISPATCH_BLOCKS <= blocks <= MAX_BLOCKS:
+        raise DiagnosticInputError(
+            f"blocks: a diagnostic run takes {MIN_DISPATCH_BLOCKS}..{MAX_BLOCKS} "
+            "(fewer blocks left a 30-45 MiB spread per cell and a false +6-12% RSS regression, #573)"
+        )
 
 
 def _mib(value: float) -> str:

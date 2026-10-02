@@ -245,7 +245,8 @@ pub fn heap_dump_json(include_blocks: bool, hash_addresses: bool) -> Option<Stri
 /// existing owner-gated allocator operation is one-shot because it cannot
 /// release its caller's outer gate. Without `owner-gate`, waiting cannot make
 /// an ordinary foreign owner claimable, so this always performs one attempt
-/// regardless of `wait_ms`.
+/// regardless of `wait_ms`. In a forked child, owners that did not survive the
+/// fork are counted as missed and never waited for.
 ///
 /// Top-level `complete`, `skipped_pages`, and `busy_theaps` describe the final
 /// attempt. `complete: true` is not a process-wide atomic snapshot: pages are
@@ -278,14 +279,15 @@ pub const HEAP_DUMP_JSON_DEFAULT_WAIT_MS: usize = 100;
 
 /// Write a binary heap snapshot to `path` (issue #338, Bun parity).
 ///
-/// A compact description of every arena and page -- and, with `blocks`, per-block free
-/// maps for the pages this thread owns -- in a format byte-identical to oven-sh/mimalloc's
-/// (version 1). Read it with `mi-heapview` (built with the C library) or the Python
-/// reference reader in `examples/heap-snapshot/`. Point-in-time and best-effort: other
-/// threads keep allocating while it is written, so their pages' counts may be slightly
-/// stale. The C writer allocates nothing, but this wrapper allocates a `CString` for the
-/// path, and the writer takes `heaps_lock` and each heap's `os_abandoned_pages_lock`: do
-/// not call it from code that may run under those locks (such as an allocator callback).
+/// A compact description of every arena and page of every sub-process -- and, with
+/// `blocks`, per-block free maps for the pages this thread owns -- in a format
+/// byte-identical to oven-sh/mimalloc's (version 1). Read it with `mi-heapview` (built
+/// with the C library) or the Python reference reader in `examples/heap-snapshot/`.
+/// Point-in-time and best-effort: other threads keep allocating while it is written, so
+/// their pages' counts may be slightly stale. The C writer allocates nothing, but this
+/// wrapper allocates a `CString` for the path, and the writer takes `heaps_lock` and each
+/// heap's `os_abandoned_pages_lock`: do not call it from code that may run under those
+/// locks (such as an allocator callback).
 ///
 /// Requires the `diagnostics` feature (#414): without it the writer is compiled out of the
 /// C library and this always returns `Err`.
@@ -1320,6 +1322,9 @@ pub mod options {
         /// **Fork addition (#532).** Size a new large page (blocks of ~84-512 KiB) from its size
         /// class's demand on the thread: compact first, growing to 4 MiB; 0 = always 4 MiB.
         pub const LARGE_SPAN: Self = Self(sys::mi_option_large_span);
+        /// **Fork addition (#575).** The largest span in KiB a demand-grown large page reaches
+        /// (=1024); 0 = 4 MiB, the #532 policy.
+        pub const LARGE_SPAN_MAX: Self = Self(sys::mi_option_large_span_max);
 
         /// Upstream: milliseconds to delay purging, which the scavenger also honours.
         pub const PURGE_DELAY: Self = Self(sys::mi_option_purge_delay);

@@ -434,7 +434,10 @@ static inline mi_theap_t* _mi_heap_theap_peek(const mi_heap_t* heap) {
   // instead of asserting, so callers stop reclaiming into / abandoning through it.
   if (theap==NULL) return NULL;
   mi_assert_internal(!_mi_is_empty_theap(theap));
-  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL);
+  // #554: every sub-process's main heap shares the fast key, so while one sub-process's
+  // thread destroys another's main heap this slot holds its OWN main theap -- a foreign
+  // heap, not a bug. Any other key must name this heap's theap or a detached one.
+  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL || heap->theap==mi_thread_local_key_fast);
   if (_mi_theap_heap_peek(theap) != heap) return NULL;
   return theap;
 }

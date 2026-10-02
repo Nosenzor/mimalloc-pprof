@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 179880b7 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 3f2e6c80 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -504,8 +504,11 @@ mi_decl_export void   mi_debug_show_arenas(void) mi_attr_noexcept;
 mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
 
 // Write a binary heap snapshot to `fd` for offline analysis (see tools/mi-heapview.c and
-// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Bun parity (#338):
-// format version 1 is byte-identical to oven-sh/mimalloc's.
+// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Covers the arenas and
+// heaps of every sub-process, holding the sub-process registry lock for the whole write: a
+// call from inside a gated allocator operation (a callback) holds up a concurrent
+// mi_purge_all_ex until that purge's deadline. Bun parity (#338): format version 1 is
+// byte-identical to oven-sh/mimalloc's.
 // #414: compiled in only with MI_DIAGNOSTICS=1 (CMake -DMI_DIAGNOSTICS=ON, cargo feature
 // `diagnostics`; default OFF). Without it both entry points link and return -1, and
 // `mi_option_snapshot_on_exit` below still exists but has nothing to run.
@@ -717,6 +720,7 @@ typedef enum mi_option_e {
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
+  mi_option_large_span_max,             // the largest span (KiB) a demand-grown large page grows to (=1024: 1 MiB, two blocks of every large bin). 0 = 4 MiB (the #532 policy); a page always holds at least two blocks (#575)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -2797,6 +2801,16 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 #ifndef MI_LARGE_SPAN_COMPACT_SLICES
 #define MI_LARGE_SPAN_COMPACT_SLICES      (16)
 #endif
+// #575: the largest span a bin's page grows to (KiB; `mi_option_large_span_max`, MIMALLOC_LARGE_SPAN_MAX).
+// Every thread keeps one page per large bin it uses and each is resident in full once it has held its
+// blocks (a page carved over resident slices keeps the old tenant's bytes), so 4 MiB spans made a
+// thread that cycles 96-512 KiB blocks hold ~19 MiB for 1.3 MiB live (large-class/8: 154 MiB against
+// jemalloc's 61). 1 MiB keeps two blocks of every large bin; a bin that needs more blocks uses more
+// pages, and repurposing (MI_LARGE_REPURPOSE_PER_TICK) moves them between bins. 0 = MI_LARGE_PAGE_SIZE
+// (the #532 behaviour); `-DMI_LARGE_SPAN_MAX_KIB=0` builds that in.
+#ifndef MI_LARGE_SPAN_MAX_KIB
+#define MI_LARGE_SPAN_MAX_KIB             (1024)
+#endif
 // each demand step multiplies the span by 2^MI_LARGE_SPAN_GROW_SHIFT (1: 1 -> 2 -> 4 MiB)
 #ifndef MI_LARGE_SPAN_GROW_SHIFT
 #define MI_LARGE_SPAN_GROW_SHIFT          (1)
@@ -2829,8 +2843,9 @@ void _mi_atomic_once_fork_child_reset(mi_atomic_once_t* once);
 // bits 0-2 the level (the span is MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT),
 // capped at MI_LARGE_PAGE_SIZE), bit 3 "a page of the bin filled up since the last page request",
 // bits 4-7 the pressure count, 4-bit two's complement (see MI_LARGE_SPAN_GROW_REQUESTS; 0 = none). One byte because
-// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8144 bytes): 16 more bytes
-// keep it there, 64 would not.
+// `mi_theap_t` sits just under the 8 KiB meta-allocator size class (8168 bytes in the largest
+// configuration, checked by `MI_THEAP_META_MAX_SIZE` below): 16 more bytes keep it there, 64
+// would not.
 typedef uint8_t mi_large_span_bin_t;
 #endif
 
@@ -3070,7 +3085,8 @@ typedef struct mi_page_s {
   uint64_t                  swept_state;
 
   // #483: a retired large page published for the scavenger (`_mi_page_retire`): the owner's tld
-  // slot holding it (NULL when not published) and when it was retired. Whoever clears the slot
+  // slot holding it (NULL when not published) and when the scavenger first saw it published (0 until
+  // then, #544: the owner does not read the clock to publish). Whoever clears the slot
   // owns the page's memory until it puts it back.
   // #493: `retired_at` doubles as the reserve stamp. It is cleared when a page is unpublished,
   // so on an abandoned page (never published) a non-zero value means "reserved at that time"
@@ -3103,6 +3119,67 @@ typedef struct mi_page_s {
 #define MI_LARGE_MAX_OBJ_SIZE             MI_MEDIUM_MAX_OBJ_SIZE    // note: this must be a nice power of 2 or we get rounding issues with `_mi_bin`
 #endif
 #define MI_LARGE_MAX_OBJ_WSIZE            (MI_LARGE_MAX_OBJ_SIZE/MI_SIZE_SIZE)
+
+// The largest block size whose abandoned page a free may reclaim (src/free.c). Upstream stops at
+// medium pages. With demand-sized spans (#532) a compact large page can be exactly filled by a
+// bin's live set: filling it abandons it, and at 7 of 8 blocks used it is still "mostly used", so
+// neither the owner's free nor its next allocation found it again. The bin opened a second page
+// and grew, which cost +48% peak RSS and +72% faults for 8 live 128 KiB blocks (#544). Large pages
+// are reclaimed only by their originating theap (see `mi_abandoned_page_try_reclaim`).
+// #544: the transparent-huge-page size the arena purge assumes (src/arena.c,
+// `mi_arena_purge_thp_neighbours`): purging a run also purges the never-used free slices of its
+// region, which a THP fault made resident. 0 turns that off.
+#ifndef MI_ARENA_PURGE_THP_REGION
+#define MI_ARENA_PURGE_THP_REGION         (2*MI_MiB)
+#endif
+// ... and only while the theap holds at most this many pages of the page's bin (0: none, so its
+// next allocation of the bin would open a new page)
+// #530: a large bin that needs a new page takes another large bin's retired (empty) page of the
+// same theap and re-carves it (src/page.c, `mi_page_repurpose_retired`) before asking the arena.
+// 0 turns it off.
+#ifndef MI_LARGE_REPURPOSE
+#define MI_LARGE_REPURPOSE                (MI_LARGE_SPAN && MI_SECURE < 5)
+#endif
+// #530: how many retired large pages a thread may repurpose per heartbeat (every 1000 generic
+// mallocs). Each take can make the donor bin take another's in turn (a cascade of re-carves: a page
+// re-init, no fault and no purge, so it costs no resident byte). #530 bounded it at 64 after a hot
+// large-class workload re-carved 469K pages (+16% CPU); #575 measured what the bound costs in
+// memory: a bin without a page then opens a fresh 1-4 MiB one while every other bin's retired page
+// stays resident, so large-class/8 kept ~10 pages per worker for ~8 live blocks. Raised to 1024, at
+// which large-class/8 and sparse-large-buffers/8 lose 18% and 29% of their peak (untimed probe).
+// `-DMI_LARGE_REPURPOSE_PER_TICK=64` restores the #530 bound.
+#ifndef MI_LARGE_REPURPOSE_PER_TICK
+#define MI_LARGE_REPURPOSE_PER_TICK       (1024)
+#endif
+// ... and the budget a new thread starts with, before its first heartbeat
+// ... and whether a bin with abandoned pages (typically an exited thread's) reclaims those first
+// (the arena path) instead. With short-lived threads, re-carving our own retired pages instead
+// left those stranded and cost the chart build's ephemeral row +3.4% CPU (1: -0.5%).
+// #575: a page miss of a large bin ages this thread's retired pages (`_mi_theap_collect_retired`: a page idle for
+// MI_RETIRE_CYCLES/4 = 4 agings is freed) at most once per this many generic mallocs. Every miss aged them before: on
+// large-class/8 a bin needs a page every ~5 operations, so a retired page died after ~20 of them and 66K pages went
+// back to the arena, each one re-requested at once (1100 instructions per round trip, the largest part of the
+// #575 CPU cost); never ageing them on a miss (the heartbeat only) kept 12% more resident on random-large/8, where a
+// bin is used every ~100 operations and its retired page is idle stock. 0 = every miss ages, as upstream.
+#ifndef MI_LARGE_AGE_STEP
+#define MI_LARGE_AGE_STEP                 (4)
+#endif
+#ifndef MI_LARGE_REPURPOSE_ABANDONED_FIRST
+#define MI_LARGE_REPURPOSE_ABANDONED_FIRST (1)
+#endif
+#ifndef MI_LARGE_REPURPOSE_FRESH
+#define MI_LARGE_REPURPOSE_FRESH          (MI_LARGE_REPURPOSE_PER_TICK)
+#endif
+#ifndef MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES
+#define MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES  (0)
+#endif
+#ifndef MI_RECLAIM_ON_FREE_MAX_SIZE
+#if MI_LARGE_SPAN
+#define MI_RECLAIM_ON_FREE_MAX_SIZE       MI_LARGE_MAX_OBJ_SIZE
+#else
+#define MI_RECLAIM_ON_FREE_MAX_SIZE       MI_MEDIUM_MAX_OBJ_SIZE
+#endif
+#endif
 
 #if (MI_LARGE_MAX_OBJ_WSIZE >= 655360)
 #error "mimalloc internal: define more bins"
@@ -3236,6 +3313,19 @@ struct mi_theap_s {
   mi_large_span_bin_t   large_span[MI_LARGE_SPAN_BINS];      // #532: per large bin demand accounting (src/large-span.c); last, so no fast-path offset moves
   #endif
 };
+
+// #573: `mi_theap_t` (plus the block padding) is allocated from the meta-allocator and sits at the
+// edge of its 8 KiB size class. Eight more bytes made CI ASan `test-resident-first-churn` flaky
+// (8168 -> 8176 bytes), and nothing said so at compile time. This is the largest size any
+// configuration has today (MI_PADDING on, the profiler, memory events, diagnostics and DHAT all
+// in); a field that does not fit goes into `mi_tld_t` instead, or the budget is raised here,
+// deliberately, after checking the size class. (A negative array size is the portable static
+// assert: MSVC's C mode has none in every supported version.)
+#ifndef MI_THEAP_META_MAX_SIZE
+#define MI_THEAP_META_MAX_SIZE            (8176)
+#endif
+#define MI_STATIC_ASSERT(name,cond)       typedef char mi_static_assert_##name[(cond) ? 1 : -1]
+MI_STATIC_ASSERT(theap_meta_size, sizeof(struct mi_theap_s) + MI_PADDING_SIZE <= MI_THEAP_META_MAX_SIZE);
 
 
 
@@ -3468,6 +3558,9 @@ struct mi_tld_s {
   _Atomic(size_t)       gate_flags;           // MI_GATE_FLAG_*
   size_t                fork_gen;             // #293: value of `_mi_fork_generation` when this tld was created (restamped for the thread that survives a fork, src/fork.c); a tld whose stamp is older belongs to a thread that did not survive a fork()
   _Atomic(struct mi_page_s*) retired_pages[MI_RETIRED_PAGE_SLOTS];  // #483: this thread's retired large pages, for the scavenger
+  size_t                retired_used;         // #530: owner-private bitmask of the occupied `retired_pages` slots (only the owner fills or empties one)
+  uint32_t              large_age_mark;       // #575: `generic_count` (mod 2^32) when a large bin's page miss last aged the retired pages (two 32-bit fields: `mi_tld_t` sits at its 512-byte size class, ci/check_struct_sizes.py)
+  uint32_t              large_repurpose_left; // #530: retired large pages this thread may still repurpose until its next heartbeat (here, not in `mi_theap_t`, which sits at the edge of its 8 KiB meta size class)
 };
 
 #define MI_GATE_FLAG_ORPHAN          (1)   // pre-fork tld of a thread that did not survive the fork: never waited on, never swept
@@ -5078,6 +5171,7 @@ void          _mi_arena_pages_free(mi_arena_pages_t* arena_pages);  // Bun parit
 // "large-span.c" (#532): demand-sized large-page spans (stubs when MI_LARGE_SPAN=0)
 size_t        _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead);  // the span of the theap's next page of this large bin (a page request)
 void          _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page);             // a page of the theap filled up
+size_t        _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t overhead);  // #530: that span, without accounting the request
 
 // "page-map.c"
 bool          _mi_page_map_init(void);
@@ -5807,6 +5901,60 @@ static inline bool _mi_gate_held_theap(const mi_theap_t* theap) {
 
 #endif // MI_OWNER_GATE_H
 /* ---- end inlined: include/mimalloc/owner-gate.h ---- */
+/* ---- begin inlined: include/mimalloc/usdt.h ---- */
+/* ----------------------------------------------------------------------------
+Copyright (c) 2026, the mimalloc-pprof contributors
+This is free software; you can redistribute it and/or modify it under the
+terms of the MIT license. A copy of the license can be found in the file
+"LICENSE" at the root of this distribution.
+-----------------------------------------------------------------------------*/
+#ifndef MI_USDT_H
+#define MI_USDT_H
+
+/* #573 A5: USDT probes (static tracepoints) at the slow paths.
+
+   Which question does this answer? "How often, and with what arguments, does the allocator do X
+   in this process?" -- without rebuilding or patching it. With a build that has the probes,
+   `perf stat -e 'sdt_mimalloc:*'` counts them and a bpftrace one-liner prints their arguments:
+
+     bpftrace -e 'usdt:./app:mimalloc:page_fresh { @[arg0] = count(); }'
+
+   A probe is a single NOP until a tracer attaches, survives inlining and LTO, and is put only in
+   OUT-OF-LINE slow paths (a fresh page, a repurpose, an arena page allocation or free, a retired
+   page's publish and release), never on the allocation or free fast paths, so
+   `ci/check_fastpath_identity.py` is unaffected.
+
+   Opt-in and OFF by default (CMake -DMI_USDT=ON, which needs <sys/sdt.h>: systemtap-sdt-dev on
+   Debian and Ubuntu). Without it every MI_PROBE* is nothing. The arguments must be plain values
+   that are cheap to compute and have no side effects: they are not evaluated when the probes are
+   compiled out. */
+
+#if defined(MI_USDT) && MI_USDT && defined(__linux__)
+  #if defined(__has_include)
+    #if __has_include(<sys/sdt.h>)
+      #include <sys/sdt.h>
+      #define MI_USDT_ENABLED  1
+    #endif
+  #endif
+#endif
+#ifndef MI_USDT_ENABLED
+#define MI_USDT_ENABLED  0
+#endif
+
+#if MI_USDT_ENABLED
+#define MI_PROBE0(name)                     DTRACE_PROBE(mimalloc, name)
+#define MI_PROBE1(name, a)                  DTRACE_PROBE1(mimalloc, name, a)
+#define MI_PROBE2(name, a, b)               DTRACE_PROBE2(mimalloc, name, a, b)
+#define MI_PROBE3(name, a, b, c)            DTRACE_PROBE3(mimalloc, name, a, b, c)
+#else
+#define MI_PROBE0(name)                     ((void)0)
+#define MI_PROBE1(name, a)                  ((void)0)
+#define MI_PROBE2(name, a, b)               ((void)0)
+#define MI_PROBE3(name, a, b, c)            ((void)0)
+#endif
+
+#endif  // MI_USDT_H
+/* ---- end inlined: include/mimalloc/usdt.h ---- */
 
 static inline mi_page_t* _mi_theap_get_free_small_page(mi_theap_t* theap, size_t size) {
   MI_GATE_ASSERT_HELD(theap);   // #366 leaf assert (docs/purge-all-implementation.md §5.2)
@@ -6097,7 +6245,7 @@ size_t        _mi_page_purged_count(const mi_page_t* page);
 void          _mi_page_unpurge_unformed_upto(mi_page_t* page, uintptr_t end);   // hand the discarded unformed tail back below `end` (an absolute address)
 size_t        _mi_page_unformed_purged_bytes(const mi_page_t* page);            // the bytes of this page's unformed tail that are discarded right now
 void          _mi_page_publish_retired(mi_page_t* page);     // #483: owner resets a retired large page and publishes it for the scavenger
-void          _mi_page_unpublish_retired(mi_page_t* page);   // #483: take it back before forming a block in it or freeing it
+void          _mi_page_unpublish_retired(mi_page_t* page, mi_tld_t* owner_tld);   // #483: take it back before forming a block in it or freeing it; the owner's tld when the caller has it (#573: `_mi_page_free` clears `page->theap` first), else NULL
 bool          _mi_pages_release_retired(mi_subproc_t* subproc);   // #483: scavenger; true while a published page is not old enough yet
 long          _mi_release_bound_ms(void);                                       // #491: idle memory is back with the OS within this many ms
 
@@ -6114,6 +6262,45 @@ typedef struct mi_arena_claim_counters_s {
 } mi_arena_claim_counters_t;
 bool          _mi_arena_claim_counters(mi_arena_claim_counters_t* out);   // false (and *out zeroed) when not compiled in (MI_DIAGNOSTICS=0)
 void          _mi_arena_claim_counters_reset(void);
+
+// #573 A2: event counters -- how often each slow-path mechanism ran, process-wide, so a cost is
+// explained by counts before it is timed (the "retire cascade" of #572 was 548K page requests
+// against 292, invisible to timing). Compiled in with MI_DIAGNOSTICS=1, slow paths only, no
+// allocation; everywhere else `MI_EVENT` is nothing and the query functions are stubs. Printed by
+// `mi_stats_print` and by `mi_purge_holes_report`. Internal API only: no Rust surface, no layout.
+typedef enum mi_event_e {
+  MI_EVENT_LARGE_PAGE_REQUEST,      // a large bin asked for a page (before repurposing or the arena)
+  MI_EVENT_LARGE_REPURPOSE,         // ... and got another bin's retired page, re-carved in place
+  MI_EVENT_LARGE_REPURPOSE_DENIED,  // ... could not, for lack of this heartbeat's budget
+  MI_EVENT_RETIRED_PUBLISH,         // a retired large page was published for the scavenger
+  MI_EVENT_RETIRED_UNPUBLISH,       // ... and taken back
+  MI_EVENT_PAGE_MAP_REGISTER,       // a page was registered in the page map
+  MI_EVENT_PAGE_MAP_REEXTEND,       // a re-carve changed a page's mapped extent
+  MI_EVENT_LARGE_SPAN_GROW,         // a large bin's demand-sized span stepped up (#532)
+  MI_EVENT_LARGE_SPAN_SHRINK,       // ... stepped down
+  MI_EVENT_ARENA_PAGE_ALLOC,        // a page was allocated from the arenas
+  MI_EVENT_ARENA_PAGE_FREE,         // a page went back to the arenas
+  MI_EVENT_LARGE_REPURPOSE_NONE,    // a large bin's page request found no retired page of another bin to take (#575)
+  MI_EVENT_LARGE_RETIRE_EXPIRED,    // a retired large page aged out and was freed to the arena (#575)
+  MI_EVENT_LARGE_EMPTY_FREED,       // an emptied large page was freed at once, because its bin has other pages (#575)
+  MI_EVENT_COUNT
+} mi_event_t;
+uint64_t      _mi_event_get(mi_event_t event);           // 0 when not compiled in
+const char*   _mi_event_name(mi_event_t event);
+void          _mi_event_reset(void);
+void          _mi_event_print(void);                      // the nonzero counters, one line; nothing when not compiled in
+#if MI_DIAGNOSTICS
+void          _mi_event_count(mi_event_t event);
+#define MI_EVENT(event)             _mi_event_count(event)
+#define MI_EVENT_IF(cond, event)    do { if (cond) { _mi_event_count(event); } } while (0)
+#else
+#define MI_EVENT(event)             ((void)0)
+#define MI_EVENT_IF(cond, event)    ((void)0)
+#endif
+
+#if MI_DEBUG>=1
+void          _mi_page_debug_print(const mi_page_t* page);   // #573 A4: one line of a page's state, malloc-free
+#endif
 
 void          _mi_theap_unpublish_retired(mi_theap_t* theap);     // #483: a theap detached from its tld takes its published pages back
 void          _mi_pages_release_schedule(mi_subproc_t* subproc);  // #483/#493: a retired or reserved page waits for the scavenger's release
@@ -6170,14 +6357,23 @@ typedef struct mi_arena_layout_class_s {
   size_t runs[MI_ARENA_LAYOUT_KIND_COUNT];                // maximal runs of each kind inside a chunk
   size_t max_run[MI_ARENA_LAYOUT_KIND_COUNT];             // the longest such run, in slices
   size_t run_hist[MI_ARENA_LAYOUT_KIND_COUNT][MI_ARENA_LAYOUT_RUN_BUCKETS];   // runs by floor(log2(length))
+  size_t resident_bytes[MI_ARENA_LAYOUT_KIND_COUNT];      // #573 A3: of those, resident in RAM now (`mincore`); 0 unless `resident_known`
 } mi_arena_layout_class_t;
 
 typedef struct mi_arena_layout_s {
   size_t arenas;                                  // arenas walked
   size_t chunks;                                  // chunks walked (all classes)
   size_t meta_slices;                             // the arenas' own info slices: not classified
+  bool   resident_known;                          // #573 A3: `resident_bytes` were measured (`mincore`: not on Windows)
   mi_arena_layout_class_t cls[MI_CBIN_COUNT];     // by the chunk's size class, `mi_chunkbin_t` order
 } mi_arena_layout_t;
+
+// #573 A3: the bytes of [start, start+size) resident in RAM now, or SIZE_MAX when the platform
+// cannot say. Diagnostics only (a syscall per call): the layout walk and the holes report.
+size_t        _mi_diag_resident_bytes(const void* start, size_t size);
+bool          _mi_diag_resident_map(const void* start, size_t npages, unsigned char* vec);   // #575
+uint8_t*      mi_arena_slice_start(mi_arena_t* arena, size_t slice_index);   // src/arena.c: the slice must exist
+uint8_t*      mi_arena_slice_end(mi_arena_t* arena, size_t slice_end);       // src/arena.c: one past a range; may be the arena's end (#573)
 
 // Walk every arena of `subproc` (or only `arena`, when not NULL) into `*out` (zeroed first).
 // Returns false when not compiled in (MI_DIAGNOSTICS=0). The caller must keep the arenas alive:
@@ -6189,9 +6385,19 @@ void          _mi_arena_layout_print(const mi_arena_layout_t* layout);
 #define MI_HOLES_HIST_BUCKETS  (5)    // live blocks per pinned OS page: 1, 2, 3-4, 5-8, 9+
 #define MI_HOLES_GRAN_COUNT    (5)    // the hypothetical OS page sizes of the granularity curve
 
+// #575: what a resident byte of a page is
+#define MI_HOLES_RES_LIVE      (0)   // inside an allocated block
+#define MI_HOLES_RES_FREE      (1)   // inside a formed free block (free-listed)
+#define MI_HOLES_RES_UNFORMED  (2)   // inside a block not formed yet (`capacity <= idx < reserved`)
+#define MI_HOLES_RES_SLACK     (3)   // in the page's slices but outside `reserved * block_size` (header, geometry slack)
+#define MI_HOLES_RES_COUNT     (4)
+
 typedef struct mi_holes_bin_s {
   size_t block_size;           // the largest block size seen in this bin
   size_t pages;
+  size_t empty_pages;          // #573 A3: pages with no live block (`used == 0`)
+  size_t retired_pages;        // ... of which retired (#483): kept for reuse, empty
+  size_t retired_resident_bytes;   // resident RAM of those retired pages (`mincore`; 0 when unknown)
   size_t ineligible_pages;     // pages `mi_page_can_purge_holes` rejects (nothing in them is discardable)
   size_t live_bytes;           // bytes of allocated blocks
   size_t free_bytes;           // bytes of free blocks (free-listed *and* already discarded)
@@ -6204,6 +6410,12 @@ typedef struct mi_holes_bin_s {
   size_t pinned_free_bytes;    // free bytes trapped inside those pinned OS pages
   size_t pinned_live_bytes;    // live bytes inside those pinned OS pages
   size_t hist[MI_HOLES_HIST_BUCKETS];
+  // #575: RESIDENT bytes of this bin's pages (`mincore`, whole page extent), split by what the bytes
+  // are. Index 0: pages with a live block; 1: empty pages (retired or not).
+  size_t res[2][MI_HOLES_RES_COUNT];
+  size_t res_extent;           // #575: the bytes of address space the bin's pages span
+  size_t res_formed[2];        // #575: bytes of formed blocks (`capacity * block_size`), [0] used pages, [1] empty ones
+  size_t res_reserved[2];      // #575: bytes of the block area (`reserved * block_size`), same split
 } mi_holes_bin_t;
 
 typedef struct mi_holes_report_s {
@@ -7454,7 +7666,10 @@ static inline mi_theap_t* _mi_heap_theap_peek(const mi_heap_t* heap) {
   // instead of asserting, so callers stop reclaiming into / abandoning through it.
   if (theap==NULL) return NULL;
   mi_assert_internal(!_mi_is_empty_theap(theap));
-  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL);
+  // #554: every sub-process's main heap shares the fast key, so while one sub-process's
+  // thread destroys another's main heap this slot holds its OWN main theap -- a foreign
+  // heap, not a bug. Any other key must name this heap's theap or a detached one.
+  mi_assert_internal(_mi_theap_heap_peek(theap)==heap || _mi_theap_heap_peek(theap)==NULL || heap->theap==mi_thread_local_key_fast);
   if (_mi_theap_heap_peek(theap) != heap) return NULL;
   return theap;
 }
@@ -8301,7 +8516,7 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
   mi_assert_internal(mi_page_is_owned(page));
   mi_assert_internal(mi_page_is_abandoned(page));
   mi_assert_internal(!mi_page_all_free(page));
-  mi_assert_internal(page->block_size <= MI_MEDIUM_MAX_OBJ_SIZE);
+  mi_assert_internal(page->block_size <= MI_RECLAIM_ON_FREE_MAX_SIZE);
   mi_assert_internal(reclaim_on_free >= 0);
   
   // dont reclaim if we just have terminated this thread and we should
@@ -8318,6 +8533,13 @@ static mi_decl_noinline bool mi_abandoned_page_try_reclaim(mi_page_t* page, long
   if mi_likely(theap == page->theap) {  // did this page originate from the current theap? (and thus allocated from this thread)
     // originating theap
     max_reclaim = _mi_option_get_fast(theap->tld->is_in_threadpool ? mi_option_page_cross_thread_max_reclaim : mi_option_page_max_reclaim);
+    // #544: a large page only when the bin has no page left on the theap -- the case where the
+    // next allocation would open a new page. Reclaiming more (a drain freeing every block) keeps
+    // pages owned that would otherwise go back to the arena (+9% peak RSS, random-large-bursty/8).
+    if (page->block_size > MI_MEDIUM_MAX_OBJ_SIZE && (max_reclaim < 0 || max_reclaim > MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES)) { max_reclaim = MI_RECLAIM_ON_FREE_LARGE_MAX_PAGES; }   // (< 0 is "no limit")
+  }
+  else if (page->block_size > MI_MEDIUM_MAX_OBJ_SIZE) {
+    return false;   // #544: a large page is reclaimed on free only by the theap it came from
   }
   else if (reclaim_on_free == 1 &&               // if cross-thread is allowed
             !theap->tld->is_in_threadpool &&      // and we are not part of a threadpool
@@ -8370,7 +8592,7 @@ static void mi_decl_noinline mi_free_try_collect_mt(mi_page_t* page, mi_block_t*
 
   // try to: 1. free it, 2. reclaim it, or 3. reabandon it to be mapped
   if (mi_abandoned_page_try_free(page)) return;
-  if (page->block_size <= MI_MEDIUM_MAX_OBJ_SIZE && reclaim_on_free >= 0) {  // early test for better codegen
+  if (page->block_size <= MI_RECLAIM_ON_FREE_MAX_SIZE && reclaim_on_free >= 0) {  // early test for better codegen
     if (mi_abandoned_page_try_reclaim(page, reclaim_on_free)) return;
   }
   if (mi_abandoned_page_try_reabandon_to_mapped(page)) return;
@@ -11254,6 +11476,13 @@ uint8_t* mi_arena_slice_start(mi_arena_t* arena, size_t slice_index) {
   return (mi_arena_start(arena) + mi_size_of_slices(slice_index));
 }
 
+// #573: one PAST a slice range: `slice_end` may be `slice_count`, which `mi_arena_slice_start`
+// (rightly) refuses. #569 computed an end with the start helper and asserted on the last run.
+uint8_t* mi_arena_slice_end(mi_arena_t* arena, size_t slice_end) {
+  mi_assert_internal(slice_end <= arena->slice_count);
+  return (mi_arena_start(arena) + mi_size_of_slices(slice_end));
+}
+
 mi_page_t* mi_arena_page_at_slice(mi_arena_t* arena, size_t slice_index) {
   mi_assert_internal(slice_index < arena->slice_count);
   if (arena->pages_meta != NULL) {
@@ -12231,8 +12460,8 @@ static mi_page_t* mi_arenas_page_alloc_fresh(mi_theap_t* theap, size_t slice_cou
   page->page_ma_offset = (uint32_t)(offset / MI_MAX_ALIGN_SIZE);
 
   // initialize page meta-data
-  page->reserved = (uint16_t)reserved;  
-  page->block_size = block_size;
+  page->reserved = (uint16_t)reserved;   // page-geometry: a new page, registered right after
+  page->block_size = block_size;         // page-geometry
   page->memid = memid;
   page->free_is_zero = memid.initially_zero;
 
@@ -12361,6 +12590,8 @@ mi_page_t* _mi_arenas_page_alloc(mi_theap_t* theap, size_t block_size, size_t bl
   if mi_unlikely(page == NULL) {
     return NULL;
   }
+  MI_EVENT(MI_EVENT_ARENA_PAGE_ALLOC);   // (#573)
+  MI_PROBE2(arena_page_alloc, block_size, mi_page_block_size(page));
   // mi_assert_internal(page == NULL || _mi_page_segment(page)->subproc == tld->subproc);
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
@@ -12444,7 +12675,7 @@ static void mi_arenas_page_free_prim(mi_page_t* page, mi_subproc_t* subproc, mi_
       mi_assert_internal(mi_bitmap_is_setN(arena->slices_committed, slice_index, slice_count));
     }
   }
-  if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // for assertion checking
+  if (mi_page_meta_is_separated(page)) { page->block_size = 0; }  // page-geometry: for assertion checking (the page is being freed)
   mi_arenas_free_ex( subproc, mi_page_slice_start(page), mi_page_full_size(page), page->memid, retain_short);
 }
 
@@ -12485,6 +12716,8 @@ void _mi_realloc_free_old(const mi_page_t* page, void* p, bool grown) {
 }
 
 static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, bool unabandon) {
+  MI_EVENT(MI_EVENT_ARENA_PAGE_FREE);   // (#573)
+  MI_PROBE1(arena_page_free, page->block_size);
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(_mi_ptr_page(mi_page_start(page))==page);
   mi_assert_internal(mi_page_is_owned(page));
@@ -12510,7 +12743,7 @@ static void mi_arenas_page_free_ex(mi_page_t* page, mi_theap_t* current_theapx, 
   // any further `reuse` call, and on macOS a discarded page stays reclaimable by the kernel
   // until it is MADV_FREE_REUSE'd. This function is the single choke point for a page going
   // back to the arena (`_mi_page_free` and the abandoned-page free in `free.c` both land here).
-  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: first, so the scavenger cannot discard it meanwhile
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page, (current_theapx != NULL ? current_theapx->tld : NULL)); }   // #483: first, so the scavenger cannot discard it meanwhile; the calling thread is the owner
   _mi_page_unpurge_all(page);
 
   // all we need from the heap, before the page is unpublished from it (see
@@ -12662,7 +12895,7 @@ bool _mi_arenas_page_reserve(mi_page_t* page, mi_theap_t* current_theap) {
 
   // #483: a retired page published in its (exiting) thread's tld slots must be taken back before
   // the tld goes -- this also clears `retired_at`, which we then set to the reserve stamp
-  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page, NULL); }
   const mi_msecs_t now = _mi_clock_now();
   page->retired_at = (now != 0 ? now : 1);   // non-zero: this marks the page as reserved
 
@@ -14137,12 +14370,60 @@ static bool mi_arena_try_purge_visitor(size_t slice_index, size_t slice_count, m
   return true; // continue
 }
 
+#if MI_ARENA_PURGE_THP_REGION > 0
+// #544: a slice we never used can still be resident. On the first touch of an aligned huge-page
+// region, THP faults in the whole region, including arena slices around the page being touched
+// that are free and were never allocated. Purging that page later splits the huge page and
+// releases only the page's own range. The free neighbours stay resident, and nothing ever queues
+// them: a slice is queued when a page on it is freed. So when a run is purged, also purge the
+// slices of its huge-page region(s) that are free, still committed (never used since the arena
+// was committed, or since their last purge) and in no purge queue. perf-ab left 1.2 to 3.8 MiB
+// of such slices resident after the release bound (random-large/1).
+static bool mi_arena_slice_is_untracked_free(mi_arena_t* arena, size_t i) {
+  return (mi_bbitmap_is_setN(arena->slices_free, i, 1) && mi_bitmap_is_set(arena->slices_committed, i) &&
+          !mi_bitmap_is_set(arena->slices_purge, i) && !mi_bitmap_is_set(arena->slices_purge_aged, i) &&
+          !mi_bitmap_is_set(arena->slices_purge_short, i) && !mi_bitmap_is_set(arena->slices_purge_short_aged, i));
+}
+
+static void mi_arena_purge_thp_neighbours(mi_arena_t* arena, size_t slice_index, size_t slice_count) {
+  const uintptr_t base = (uintptr_t)mi_arena_slice_start(arena, 0);
+  const uintptr_t lo = _mi_align_down(base + mi_size_of_slices(slice_index), MI_ARENA_PURGE_THP_REGION);
+  const uintptr_t hi = _mi_align_up(base + mi_size_of_slices(slice_index + slice_count), MI_ARENA_PURGE_THP_REGION);   // (the end may be the arena's)
+  const size_t rlo = (lo <= base ? 0 : (lo - base) / MI_ARENA_SLICE_SIZE);
+  size_t rhi = (hi - base) / MI_ARENA_SLICE_SIZE;
+  if (rhi > arena->slice_count) { rhi = arena->slice_count; }
+  size_t i = rlo;
+  while (i < rhi) {
+    if (i >= slice_index && i < slice_index + slice_count) { i = slice_index + slice_count; continue; }   // (just purged)
+    if (!mi_arena_slice_is_untracked_free(arena, i)) { i++; continue; }
+    size_t n = 1;   // a run within the region, outside the purged range, and within one bitmap chunk
+    while (i + n < rhi && !(i + n >= slice_index && i + n < slice_index + slice_count) &&
+           (i + n) % MI_BCHUNK_BITS != 0 && mi_arena_slice_is_untracked_free(arena, i + n)) { n++; }
+    if (mi_bbitmap_try_clearNC(arena->slices_free, i, n)) {   // claim the run
+      // A slice never touched (dirty bit clear) was never credited to the `committed` stat: with
+      // overcommit, `mi_arena_try_alloc_at` credits an eagerly committed slice on first use. Drop
+      // its commit bit first so the purge does not debit it; the next allocation commits and
+      // credits it as usual.
+      for (size_t k = i; k < i + n; k++) {
+        if (!mi_bitmap_is_set(arena->slices_dirty, k)) { mi_bitmap_clearN(arena->slices_committed, k, 1); }
+      }
+      mi_arena_purge(arena, i, n);
+      mi_bbitmap_setN(arena->slices_free, i, n);
+    }
+    i += n;
+  }
+}
+#endif
+
 // Purge `[slice_index, slice_index + slice_count)` where its slices are free.
 static void mi_arena_try_purge_run(mi_arena_t* arena, size_t slice_index, size_t slice_count, mi_purge_visit_info_t* vinfo) {
   // try to purge: first claim the free blocks
   if (mi_arena_try_purge_range(arena, slice_index, slice_count)) {
     vinfo->any_purged = true;
     vinfo->all_purged = true;
+    #if MI_ARENA_PURGE_THP_REGION > 0
+    if (mi_option_is_enabled(mi_option_allow_thp)) { mi_arena_purge_thp_neighbours(arena, slice_index, slice_count); }
+    #endif
   }
   else if (slice_count > 1)
   {
@@ -14675,6 +14956,7 @@ bool mi_heap_visit_abandoned_blocks(mi_heap_t* heap, bool visit_blocks, mi_block
 typedef struct mi_diag_coverage_s {
   size_t skipped_pages;
   size_t busy_theaps;
+  size_t orphaned;      // misses among the two above that no retry can fix: a fork orphan's, or a pre-fork page left owned
 } mi_diag_coverage_t;
 typedef void* (mi_diag_alloc_fun)(void* arg, size_t size);
 
@@ -14696,12 +14978,21 @@ typedef struct mi_diag_walk_s {
 
 // heap->theaps_lock pins the tld. Never wait while holding a page pin: the owner
 // or an in-flight sweeper might be retiring that page and waiting for our bit.
-static bool mi_diag_try_tld(mi_subproc_t* subproc, mi_tld_t* tld, bool* claimed) {
+// A fork orphan (src/fork.c: the pre-fork tld of a thread that did not survive) is RUNNING
+// forever. Like `mi_purge_walk_claim`, never claim one and never wait for it: the miss it
+// causes is counted in `coverage->orphaned` so the dump's retry loop stops. Tested before the
+// thread-id match: a thread started in the child can reuse a dead thread's TLS block, and so
+// its thread id; the caller's own tld is never an orphan.
+static bool mi_diag_try_tld(mi_subproc_t* subproc, mi_tld_t* tld, mi_diag_coverage_t* coverage, bool* claimed) {
   *claimed = false;
   if (tld == NULL) return false;
   if (tld->thread_id == MI_THREADID_DETACHED) {
     *claimed = mi_lock_try_acquire(&subproc->theap_meta_lock);
     return *claimed;
+  }
+  if ((mi_atomic_load_relaxed(&tld->gate_flags) & (size_t)MI_GATE_FLAG_ORPHAN) != 0) {
+    coverage->orphaned++;
+    return false;
   }
   if (tld->thread_id == _mi_thread_id()) return true; // caller already gated
   size_t expected = MI_PARK_PARKED;
@@ -14719,6 +15010,17 @@ static void mi_diag_release_tld(mi_subproc_t* subproc, mi_tld_t* tld, bool claim
   }
   mi_atomic_store_release(&tld->sweeper, (uintptr_t)0);
   mi_atomic_store_release(&tld->park_state, (size_t)MI_PARK_PARKED);
+}
+
+// In a forked child, a heap that existed at the fork (`prefork_theaps`, src/fork.c) can hold an
+// abandoned page that stays OWNED for good: a thread caught mid cross-thread free when fork() ran
+// held its ownership bit and does not exist in the child. `mi_heap_visit_page_claim` (arena.c)
+// seizes such a page; the capture never takes a page it cannot claim, so a failed claim there
+// is treated as permanent and counts in `coverage->orphaned` as well (a live thread that owns
+// the page only briefly is then not waited for either).
+static void mi_diag_claim_failed(const mi_heap_t* heap, mi_diag_coverage_t* coverage) {
+  coverage->skipped_pages++;
+  if (_mi_process_is_forked_child && heap->prefork_theaps) { coverage->orphaned++; }
 }
 
 static bool mi_diag_visit_page(mi_page_t* page, mi_diag_walk_t* walk) {
@@ -14744,7 +15046,9 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
   bool claimed = false;
   bool owned = false;
   bool ready = false;
+  bool abandoned = false;
   if (tid <= MI_THREADID_ABANDONED_MAPPED) {
+    abandoned = true;
     owned = mi_page_claim_ownership(page);
     ready = owned;
   }
@@ -14752,7 +15056,7 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
     for (mi_theap_t* theap = walk->heap->theaps; theap != NULL; theap = theap->hnext) {
       if (theap->tld != NULL && theap->tld->thread_id == tid) { tld = theap->tld; break; }
     }
-    if (mi_diag_try_tld(walk->heap->subproc, tld, &claimed)) {
+    if (mi_diag_try_tld(walk->heap->subproc, tld, walk->coverage, &claimed)) {
       // The page could have been abandoned/reclaimed between our atomic tid read
       // and the owner claim. Never use the earlier observation as ownership proof.
       ready = (mi_page_thread_id(page) == tid);
@@ -14760,6 +15064,7 @@ static bool mi_diag_arena_page(size_t index, size_t count, mi_arena_t* arena, vo
   }
   bool ok = true;
   if (ready) { ok = mi_diag_visit_page(page, walk); }
+  else if (abandoned) { mi_diag_claim_failed(walk->heap, walk->coverage); }
   else { walk->coverage->skipped_pages++; }
   mi_bitmap_set(bitmap, index); // before unown, which may retire the page
   if (owned) { mi_abandoned_page_unown(page, NULL); }
@@ -14794,7 +15099,7 @@ static bool mi_diag_abandoned_os(mi_diag_walk_t* walk) {
         batches = batch;
       }
       if (mi_page_claim_ownership(page)) { batches->pages[batches->used++] = page; }
-      else { walk->coverage->skipped_pages++; }
+      else { mi_diag_claim_failed(walk->heap, walk->coverage); }
     }
   }
   while (batches != NULL) {
@@ -14829,7 +15134,7 @@ bool _mi_heap_visit_capture(mi_heap_t* heap, bool blocks, mi_block_visit_fun* vi
     // Live OS pages are absent from the arena bitmap and abandoned OS list.
     for (mi_theap_t* theap = heap->theaps; theap != NULL && ok; theap = theap->hnext) {
       bool claimed;
-      if (!mi_diag_try_tld(heap->subproc, theap->tld, &claimed)) { coverage->busy_theaps++; continue; }
+      if (!mi_diag_try_tld(heap->subproc, theap->tld, coverage, &claimed)) { coverage->busy_theaps++; continue; }
       ok = _mi_theap_visit_pages(theap, &mi_diag_owned_os_page, true, &walk, NULL);
       mi_diag_release_tld(heap->subproc, theap->tld, claimed);
     }
@@ -19003,6 +19308,15 @@ static bool mi_dump_complete(const mi_dump_ctx_t* ctx) {
   return (ctx->coverage.skipped_pages == 0 && ctx->coverage.busy_theaps == 0);
 }
 
+// Did the attempt miss anything a retry could still capture? A miss whose owner is a fork
+// orphan cannot be: in a forked child that tld stays RUNNING for good (src/fork.c), and a
+// pre-fork page it left owned stays owned (`coverage.orphaned`, src/diagnostic-walk.c). So an
+// attempt that missed only those is final, and it stays `complete: false`, just as
+// `mi_purge_all_ex` reports orphans without waiting on them.
+static bool mi_dump_retry_can_help(const mi_dump_ctx_t* ctx) {
+  return (ctx->coverage.skipped_pages + ctx->coverage.busy_theaps > ctx->coverage.orphaned);
+}
+
 char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait_ms) mi_attr_noexcept {
   mi_theap_t* self = _mi_theap_default();
   if (!mi_theap_is_initialized(self)) { self = _mi_thread_init(); }
@@ -19023,7 +19337,7 @@ char* mi_heap_dump_json_ex(bool include_blocks, bool hash_addresses, size_t wait
     MI_GATE_ENTER(self);
     captured = mi_subproc_visit_heaps(mi_subproc_current(), &mi_dump_capture_heap, &ctx);
     MI_GATE_LEAVE(self->tld);
-    if (!captured || mi_dump_complete(&ctx)) break;
+    if (!captured || mi_dump_complete(&ctx) || !mi_dump_retry_can_help(&ctx)) break;
     #if MI_OWNER_GATE
     const mi_msecs_t now = _mi_clock_now();
     const uintmax_t elapsed = (now > started ? (uintmax_t)now - (uintmax_t)started : 0);
@@ -19096,13 +19410,15 @@ terms of the MIT license. A copy of the license can be found in the file
 // mimalloc-pprof: imported verbatim from oven-sh/mimalloc @ b20b60d9 (MIT), issue #338
 // (Bun parity). Format version 1 is a parity contract -- a snapshot from either allocator
 // must open in either viewer -- so this file carries no fork extensions; the reference
-// reader in examples/heap-snapshot/mi_snapshot.py is the executable format spec. Five
-// local deviations, none of which changes the format: the two arena.c helpers below
-// are declared here because this tree's internal.h does not export them; the exit message
-// goes through `_mi_verbose_message` (this tree has no ungated `_mi_message`); the #414
-// `MI_DIAGNOSTICS` guard and its stubs; the #366 owner-gate enter/leave around
-// `mi_heap_snapshot`; and the inverted `_mi_getenv` test in `_mi_heap_snapshot_on_exit`
-// (this tree's returns an errno-style code, Bun's a bool).
+// reader in examples/heap-snapshot/mi_snapshot.py is the executable format spec. Local
+// deviations, none of which changes the format: the two arena.c helpers below are declared
+// here because this tree's internal.h does not export them; the exit message goes through
+// `_mi_verbose_message` (this tree has no ungated `_mi_message`); the #414 `MI_DIAGNOSTICS`
+// guard and its stubs; the #366 owner-gate enter/leave around `mi_heap_snapshot`; the
+// inverted `_mi_getenv` test in `_mi_heap_snapshot_on_exit` (this tree's returns an
+// errno-style code, Bun's a bool); and the walk in `mi_heap_snapshot_inner`, which covers
+// every sub-process and declares only the arenas it writes (both writer fixes, see the
+// comments there).
 //
 // Allocation discipline (CLAUDE.md rule 4 spirit): the writer allocates nothing -- a
 // 16 KiB stack buffer and a 512-byte stack free-map -- so it is safe to run from
@@ -19381,6 +19697,9 @@ static void mi_snap_walk_arena_pages(mi_snap_ctx_t* ctx, mi_arena_t* arena, int3
   size_t slice = arena->info_slices;
   const size_t end = arena->slice_count;
   while (slice < end) {
+    // A free slice has no page to emit. Avoid looking up a page for memory that
+    // may have been decommitted after a reclaim pass.
+    if (mi_bbitmap_is_setN(arena->slices_free, slice, 1)) { slice++; continue; }
     void* start = mi_arena_slice_start(arena, slice);
     mi_page_t* page = _mi_safe_ptr_page(start);
     if (page != NULL && start == mi_page_slice_start(page)) {
@@ -19416,6 +19735,19 @@ static void mi_snap_walk_heap_os_pages(mi_snap_ctx_t* ctx, mi_heap_t* heap) {
   }
 }
 
+// Every heap of one sub-process, each followed by its OS-backed abandoned pages. The caller
+// holds `mi_subprocs_lock`, which keeps `sp` alive.
+static void mi_snap_walk_subproc_heaps(mi_snap_ctx_t* ctx, mi_subproc_t* sp) {
+  mi_lock(&sp->heaps_lock) {
+    for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
+      mi_snap_emit_heap(ctx->out, h);
+      mi_snap_u32(ctx->out, MI_SNAP_SEC_PAGE);
+      mi_snap_walk_heap_os_pages(ctx, h);
+      mi_snap_u64(ctx->out, 0);  // sentinel
+    }
+  }
+}
+
 // Walk page queues of theaps owned by the calling thread and emit any
 // non-arena pages. (Arena pages are already covered by the arena walk.)
 // This catches OS-direct pages created during preloading when no arena
@@ -19447,7 +19779,7 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags);
 // in a gated build a caller between allocator calls is PARKED and could be swept under the
 // walk. Other threads' pages are read as they are (see `_mi_page_free_collect_no_unpurge`).
 // A thread with no theap (process exit on some platforms) has nothing of its own to protect.
-int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
+static int mi_heap_snapshot_gated(int fd, unsigned flags) {
   mi_theap_t* self = _mi_theap_default();
   #if MI_OWNER_GATE
   if (!mi_theap_is_initialized(self)) { return mi_heap_snapshot_inner(fd, flags); }
@@ -19461,14 +19793,40 @@ int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
   return rc;
 }
 
-static int mi_heap_snapshot_inner(int fd, unsigned flags) {
+// mimalloc-pprof (#338): the walk holds `mi_subprocs_lock` (see `mi_heap_snapshot_inner`), taken
+// here BEFORE the gate. `mi_purge_all_ex` holds the registry while it waits for RUNNING owners to
+// park (src/purge-all.c): a caller that entered its gate first would be an owner the purge waits
+// for, itself waiting for the purge, until the purge's deadline. Registry-then-gate cannot
+// deadlock: nothing that can hold a SWEEPING claim on this thread's tld waits for the registry
+// (the scavenger and the dump capture never take it; the purge and the reclaim claim only while
+// they hold it). A call nested inside a gated allocator operation already holds its gate, so a
+// concurrent purge reports it pending, like any owner that stays inside the allocator.
+int mi_heap_snapshot(int fd, unsigned flags) mi_attr_noexcept {
   if (fd < 0) return -1;
-  // Use the main subproc (and walk siblings) rather than `_mi_subproc()`: at
-  // process-exit time on some platforms TLS may already point at an empty theap,
-  // making `_mi_subproc()` return a subproc with no arenas.
-  mi_subproc_t* subproc = _mi_subproc_main();
-  if (subproc == NULL) return -1;
+  int rc = -1;
+  mi_lock(_mi_subprocs_lock()) {
+    rc = mi_heap_snapshot_gated(fd, flags);
+  }
+  return rc;
+}
 
+// mimalloc-pprof (#338): the arenas the arena pass writes -- the non-NULL slots below each
+// sub-process's `arena_count`. A slot can be NULL inside that count: `MI_PURGE_RECLAIM` clears a
+// released arena's slot and shrinks the count only when it was the last one, and `mi_arenas_add`
+// raises the count before it stores the pointer. The caller holds `mi_subprocs_lock`.
+static size_t mi_snap_count_arenas(void) {
+  size_t total = 0;
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
+    const size_t arena_count = mi_arenas_get_count(sp);
+    for (size_t i = 0; i < arena_count; i++) {
+      if (mi_atomic_load_ptr_acquire(mi_arena_t, &sp->arenas[i]) != NULL) { total++; }
+    }
+  }
+  return total;
+}
+
+// The caller holds `mi_subprocs_lock` (`mi_heap_snapshot`).
+static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_out_t out;
   _mi_memzero(&out, sizeof(out));
   out.fd = fd;
@@ -19489,23 +19847,38 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_u64(&out, (uint64_t)_mi_clock_now());
   mi_snap_u64(&out, (uint64_t)ctx.self_tid);
 
-  // --- arenas + their pages (across all subprocs) ---
-  size_t total_arenas = 0;
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
-    total_arenas += mi_arenas_get_count(sp);
-  }
+  // mimalloc-pprof (#338): every sub-process, in registry order, under the `mi_subprocs_lock` the
+  // caller holds for all three passes -- and across the file writes, so a slow descriptor delays
+  // `fork()`, `mi_subproc_new`/`_destroy` and `mi_purge_all_ex` as long. (The imported walk started
+  // at `_mi_subproc_main()` and followed `next`, which is always NULL for it: `mi_subproc_init`
+  // pushes at the head and main registers first.) The lock keeps each listed sub-process alive,
+  // since `mi_subproc_destroy` unlinks under it before freeing anything, and it excludes
+  // `MI_PURGE_RECLAIM`, which holds it for its whole pass (src/arena-reclaim.c). While it is held
+  // an arena slot can go from NULL to an arena (`mi_arenas_add`) but never back (`mi_arena_unload`
+  // is compiled out). So the header declares the non-NULL slots counted first, and the arena pass
+  // stops once it has written that many: an arena added in between may replace a counted one in
+  // the file, but the count always matches the records. Format v1 has no sub-process field: `idx`
+  // is a per-sub-process slot and every main heap has `heap_seq` 0, so both repeat across
+  // sub-processes. Lock order as in src/fork.c: the registry, `heaps_lock`,
+  // `os_abandoned_pages_lock`.
+
+  // --- arenas + their pages ---
+  const size_t total_arenas = mi_snap_count_arenas();
+  size_t arenas_written = 0;
   mi_snap_u32(&out, (uint32_t)total_arenas);
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL && arenas_written < total_arenas; sp = sp->next) {
     const size_t arena_count = mi_arenas_get_count(sp);
-    for (size_t i = 0; i < arena_count; i++) {
+    for (size_t i = 0; i < arena_count && arenas_written < total_arenas; i++) {
       mi_arena_t* arena = mi_atomic_load_ptr_acquire(mi_arena_t, &sp->arenas[i]);
       if (arena == NULL) continue;
       mi_snap_emit_arena_header(&out, arena, i);
       mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
       mi_snap_walk_arena_pages(&ctx, arena, (int32_t)i);
       mi_snap_u64(&out, 0);  // sentinel page_start == 0 ends this arena's page list
+      arenas_written++;
     }
   }
+  mi_assert_internal(arenas_written == total_arenas);
 
   // --- own-thread non-arena pages (covers preload-time OS-direct pages) ---
   mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
@@ -19513,15 +19886,8 @@ static int mi_heap_snapshot_inner(int fd, unsigned flags) {
   mi_snap_u64(&out, 0);  // sentinel
 
   // --- heaps + os-backed abandoned pages ---
-  for (mi_subproc_t* sp = subproc; sp != NULL; sp = sp->next) {
-    mi_lock(&sp->heaps_lock) {
-      for (mi_heap_t* h = sp->heaps; h != NULL; h = h->next) {
-        mi_snap_emit_heap(&out, h);
-        mi_snap_u32(&out, MI_SNAP_SEC_PAGE);
-        mi_snap_walk_heap_os_pages(&ctx, h);
-        mi_snap_u64(&out, 0);  // sentinel
-      }
-    }
+  for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
+    mi_snap_walk_subproc_heaps(&ctx, sp);
   }
 
   // --- footer ---
@@ -19698,7 +20064,9 @@ static mi_decl_cache_align mi_tld_t mi_tld_detached = {
   MI_ATOMIC_VAR_INIT(0),  // purge_epoch
   MI_ATOMIC_VAR_INIT(0),  // gate_flags
   0,                      // fork_gen (#293)
-  { 0 }                   // retired_pages (#483)
+  { 0 },                  // retired_pages (#483)
+  0,                      // retired_used (#530)
+  0, 0                    // large_age_mark (#575) / large_repurpose_left (#530)
 };
 
 mi_decl_hidden mi_decl_cache_align const mi_theap_t _mi_theap_empty = {
@@ -19847,6 +20215,7 @@ static mi_tld_t* mi_tld_init(mi_tld_t* tld, size_t tseq, mi_subproc_t* subproc) 
   mi_atomic_store_relaxed(&tld->sweeper, (uintptr_t)0);
   mi_atomic_store_relaxed(&tld->gate_flags, (size_t)0);
   tld->fork_gen = _mi_fork_generation;   // #293: every tld, detached included, starts current
+  tld->large_repurpose_left = (uint32_t)MI_LARGE_REPURPOSE_FRESH;   // #530: a new thread's budget until its first heartbeat
   if (tld->thread_id == MI_THREADID_DETACHED) {
     tld->numa_node = -1;
   }
@@ -22754,6 +23123,7 @@ static mi_option_desc_t mi_options[_mi_option_last] =
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(page_reserve) }           // #493: reserve an exiting thread's empty large pages for the next thread (MIMALLOC_PAGE_RESERVE); 0 frees them as upstream
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(resident_first) }         // #493: claim free-but-resident (queued for purge) arena slices first (MIMALLOC_RESIDENT_FIRST); 0 = the plain search only
   ,{ 1,      MI_OPTION_UNINIT, MI_OPTION(large_span) }             // #532: demand-sized large-page spans (MIMALLOC_LARGE_SPAN); 0 = every large page is MI_LARGE_PAGE_SIZE
+  ,{ MI_LARGE_SPAN_MAX_KIB, MI_OPTION_UNINIT, MI_OPTION(large_span_max) }   // #575: largest demand-grown span in KiB (MIMALLOC_LARGE_SPAN_MAX); 0 = MI_LARGE_PAGE_SIZE
 };
 
 static void mi_option_init(mi_option_desc_t* desc);
@@ -23205,8 +23575,31 @@ void _mi_warning_message(const char* fmt, ...) {
 
 
 #if MI_DEBUG
+// #573 A4: a failed assertion prints the stack of the failing thread, so a race that shows only in
+// a multi-threaded debug run (and never under gdb) names its site without a core dump. glibc and
+// macOS have `backtrace`; symbols resolve with -rdynamic, otherwise `addr2line -e <binary>` does.
+// `backtrace` may itself allocate the first time (it loads libgcc): the flag makes that a plain
+// abort instead of a loop through the allocator's own assertion.
+#ifndef MI_ASSERT_BACKTRACE_FRAMES
+#define MI_ASSERT_BACKTRACE_FRAMES  (32)
+#endif
+#if defined(__GLIBC__) || defined(__APPLE__)
+#include <execinfo.h>
+#define MI_ASSERT_BACKTRACE  1
+static _Atomic(int) mi_assert_backtracing;
+#else
+#define MI_ASSERT_BACKTRACE  0
+#endif
+
 mi_decl_noreturn mi_decl_cold void _mi_assert_fail(const char* assertion, const char* fname, unsigned line, const char* func ) mi_attr_noexcept {
   _mi_fprintf(NULL, NULL, "mimalloc: assertion failed: at \"%s\":%u, %s\n  assertion: \"%s\"\n", fname, line, (func==NULL?"":func), assertion);
+  #if MI_ASSERT_BACKTRACE
+  if (mi_atomic_exchange_acq_rel(&mi_assert_backtracing, 1) == 0) {
+    void* frames[MI_ASSERT_BACKTRACE_FRAMES];
+    const int n = backtrace(frames, MI_ASSERT_BACKTRACE_FRAMES);
+    backtrace_symbols_fd(frames, n, 2);   // (writes straight to stderr: no allocation)
+  }
+  #endif
   abort();
 }
 #endif
@@ -25232,11 +25625,24 @@ void _mi_page_free_or_reserve(mi_page_t* page, mi_page_queue_t* pq) {
 
 
 // allocate a fresh page from an arena
+#if MI_LARGE_REPURPOSE
+static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size);
+#endif
+
+
 static mi_page_t* mi_page_fresh_alloc(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size, size_t page_alignment) {
   #if !MI_HUGE_PAGE_ABANDON
   mi_assert_internal(pq != NULL);
   mi_assert_internal(mi_theap_contains_queue(theap, pq));
   mi_assert_internal(page_alignment > 0 || block_size > MI_LARGE_MAX_OBJ_SIZE || block_size == pq->block_size);
+  #endif
+  MI_EVENT_IF(page_alignment == 0 && block_size > MI_MEDIUM_MAX_OBJ_SIZE && block_size <= MI_LARGE_MAX_OBJ_SIZE, MI_EVENT_LARGE_PAGE_REQUEST);   // #573
+  MI_PROBE2(page_fresh, block_size, page_alignment);
+  #if MI_LARGE_REPURPOSE
+  if (page_alignment == 0 && pq != NULL) {
+    mi_page_t* const repurposed = mi_page_repurpose_retired(theap, pq, block_size);
+    if (repurposed != NULL) return repurposed;
+  }
   #endif
   mi_page_t* page = _mi_arenas_page_alloc(theap, block_size, page_alignment);
   if (page == NULL) {
@@ -25354,6 +25760,104 @@ void _mi_page_free(mi_page_t* page, mi_page_queue_t* pq) {
 
 #define MI_RETIRE_CYCLES      (16)
 
+#if MI_LARGE_REPURPOSE
+// #573: the ONLY place the geometry (`block_size`, `reserved`) of an existing page changes. The page
+// map covers only `block_size * reserved` of a page (`mi_page_map_get_idx`), so the new geometry
+// must be registered over its own extent: a block past the old extent otherwise maps to no page
+// (a debug build asserts in `_mi_ptr_page`; a release build loses the free). #572 shipped that bug
+// because the two writes and the re-registration were three separate statements in a caller;
+// `ci/check_page_geometry_writes.py` now rejects any other write to these fields of a page.
+// (Only when the extent changes: it covers whole slices, and most re-carves keep them; the extent
+// is `ceil((start offset + size) / slice)`, as `mi_page_map_get_idx` counts it.)
+// Also accounts the page in its new bin. Returns false, with the page already given back to the
+// arena, when the page map cannot be committed.
+static bool mi_page_set_geometry(mi_theap_t* theap, mi_page_t* page, size_t block_size, size_t reserved) {
+  const size_t start_offset = (size_t)(mi_page_start(page) - mi_page_slice_start(page));
+  const size_t old_extent = mi_slice_count_of_size(start_offset + mi_page_size(page));
+  const bool remap = (mi_slice_count_of_size(start_offset + reserved * block_size) != old_extent);
+  if (remap) { MI_EVENT(MI_EVENT_PAGE_MAP_REEXTEND); _mi_page_map_unregister(page); }
+  page->block_size = block_size;       // page-geometry
+  page->reserved = (uint16_t)reserved; // page-geometry
+  mi_assert_internal(!mi_page_has_interior_pointers(page));   // (`_mi_page_retire` cleared it)
+  mi_theap_stat_increase(theap, page_bins[_mi_page_stats_bin(page)], 1);   // (before any free below: it debits this bin)
+  if (remap && mi_unlikely(!_mi_page_map_register(page))) {   // (cannot commit page-map memory)
+    _mi_arenas_page_free(page, theap);
+    return false;
+  }
+  return true;
+}
+
+// #530: a new page of a large bin, from another large bin's retired page of this theap.
+//
+// Every large bin a thread uses keeps its only page when it empties (`_mi_page_retire`), and
+// with a few live large blocks spread over ~11 bins most of those pages are empty at any moment
+// yet resident: large-class/8 held ~16 MiB of such pages per worker for 1.3 MiB of live blocks.
+// Freeing them to the arena instead (so any bin or thread reuses their resident slices) halved
+// peak RSS in perf-ab, but the arena round trip (bitmaps, page map, purge scheduling) cost +76%
+// CPU. Re-carving the empty page for the bin that needs one keeps both: the slices, the page map
+// entries and the ownership stay as they are, only the block geometry changes.
+static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size) {
+  if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
+  // Within this heartbeat's budget only. A repurposed page's own bin may need a page again soon and
+  // take another's in turn: unbounded, that cascade was 548K page requests (and 79K arena round
+  // trips as the misses aged retired pages out) instead of 292 on large-class/8, +16% CPU.
+  if (theap->tld->large_repurpose_left == 0) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_DENIED); return NULL; }   // (#573)
+  #if MI_LARGE_REPURPOSE_ABANDONED_FIRST
+  // an abandoned page of the bin (typically an exited thread's) comes first: the arena path
+  // reclaims it, and it is resident and partly used
+  if (mi_atomic_load_relaxed(&_mi_theap_heap(theap)->abandoned_count[_mi_bin(block_size)]) != 0) return NULL;
+  #endif
+  const size_t bin_lo = mi_bin(MI_MEDIUM_MAX_OBJ_SIZE + 1);
+  const size_t bin_hi = mi_bin(MI_LARGE_MAX_OBJ_SIZE);
+  // at least the span the bin's own demand accounting (#532) would give a new page: a smaller one
+  // fills and is abandoned at once, and a busy bin then churns through pages
+  const size_t want = mi_size_of_slices(_mi_large_span_peek_slices(theap, block_size, 0));
+  mi_page_queue_t* best_pq = NULL;
+  size_t best_size = SIZE_MAX;
+  for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
+    mi_page_queue_t* const q = &theap->pages[bin];
+    mi_page_t* const page = q->first;
+    // only a retired page (the bin's only one, empty) whose meta lives outside its slices, so the
+    // block area starts at the slice start whatever the block size
+    if (q == pq || page == NULL || page != q->last || page->retire_expire == 0 || page->used != 0) continue;
+    if (page->memid.memkind != MI_MEM_ARENA || !mi_page_meta_is_separated(page)) continue;
+    #if MI_PPROF
+    if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
+    #endif
+    const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
+    if (size < want || size / block_size < MI_LARGE_SPAN_MIN_BLOCKS || size >= best_size) continue;
+    best_pq = q; best_size = size;   // best fit: the smallest that is large enough
+  }
+  if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
+  (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
+  mi_page_t* const page = best_pq->first;
+  theap->tld->large_repurpose_left--;
+  MI_EVENT(MI_EVENT_LARGE_REPURPOSE);   // (#573)
+  MI_PROBE2(page_repurpose, block_size, mi_page_block_size(page));   // (the page's old block size)
+  _mi_page_unpublish_retired(page, theap->tld);   // (#483) ours again before we touch its blocks
+  mi_assert_internal(mi_page_all_free(page) && mi_page_is_owned(page) && !mi_page_is_abandoned(page));
+  mi_assert_internal(mi_tf_block(mi_atomic_load_relaxed(&page->xthread_free)) == NULL);
+  mi_assert_internal(mi_page_theap(page) == theap);
+  mi_page_queue_remove(best_pq, page);
+  mi_theap_stat_decrease(theap, page_bins[_mi_page_stats_bin(page)], 1);
+  page->retire_expire = 0;
+  page->retired_at = 0;
+  page->free = NULL;
+  page->local_free = NULL;
+  page->capacity = 0;
+  page->free_is_zero = false;
+  page->memid.initially_zero = false;   // its blocks were handed out before
+  if (!mi_page_set_geometry(theap, page, block_size, best_size / block_size)) return NULL;   // (the page is gone then)
+  mi_page_queue_push(theap, pq, page);
+  if (!_mi_page_init(theap, page)) {   // (cannot commit its first block: give it back)
+    mi_page_queue_remove(pq, page);
+    _mi_arenas_page_free(page, theap);
+    return NULL;
+  }
+  return page;
+}
+#endif
+
 // Retire a page with no more used blocks
 // Important to not retire too quickly though as new
 // allocations might coming.
@@ -25397,6 +25901,7 @@ void _mi_page_retire(mi_page_t* page) mi_attr_noexcept {
     }
   }
   #endif
+  MI_EVENT_IF(mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE && mi_page_block_size(page) <= MI_LARGE_MAX_OBJ_SIZE, MI_EVENT_LARGE_EMPTY_FREED);   // (#575)
   _mi_page_free(page, pq);
 }
 
@@ -25434,6 +25939,7 @@ void _mi_theap_collect_retired(mi_theap_t* theap, bool force) {
       if (mi_page_all_free(page)) {
         page->retire_expire--;
         if (page->retire_expire == 0 || force) {
+          MI_EVENT_IF(mi_page_block_size(page) > MI_MEDIUM_MAX_OBJ_SIZE, MI_EVENT_LARGE_RETIRE_EXPIRED);   // (#575)
           _mi_page_free(page, pq);
         }
         else {
@@ -25572,7 +26078,7 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   if (page->free != NULL) return true;
   #endif
   if (page->capacity >= page->reserved) return true;
-  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }   // #483: before forming blocks in it
+  if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page, theap->tld); }   // #483: before forming blocks in it
 
   size_t page_size;
   //uint8_t* page_start =
@@ -25649,6 +26155,44 @@ static bool mi_page_extend_free(mi_theap_t* theap, mi_page_t* page) {
   return true;
 }
 
+#if MI_DEBUG>=1
+// #573 A4: a page's state on one line, for the message of an assertion that is about to abort
+// (`_mi_fprintf` does not allocate). Reads only fields, follows no pointer.
+void _mi_page_debug_print(const mi_page_t* page) {
+  if (page == NULL) { _mi_fprintf(NULL, NULL, "  page: NULL\n"); return; }
+  _mi_fprintf(NULL, NULL,
+              "  page %p: block_size %zu reserved %u capacity %u used %u memkind %d start %p slice_start %p\n"
+              "    retire_expire %u retired_slot %p retired_at %zu theap %p heap %p flags: abandoned %d full %d owned %d\n",
+              (const void*)page, page->block_size, (unsigned)page->reserved, (unsigned)page->capacity, (unsigned)page->used,
+              (int)page->memid.memkind, (const void*)mi_page_start(page), (const void*)mi_page_slice_start(page),
+              (unsigned)page->retire_expire, (const void*)page->retired_slot, (size_t)page->retired_at,
+              (const void*)page->theap, (const void*)page->heap,
+              (int)mi_page_is_abandoned(page), (int)mi_page_is_full(page), (int)mi_page_is_owned(page));
+}
+#endif
+
+#if MI_DEBUG>=2
+// #573: the page map covers `block_size * reserved` of a page (`mi_page_map_get_idx`), so it must
+// resolve the first byte of the first block and the last byte of the last block to the page. A
+// re-carve (`mi_page_repurpose_retired`) that changes the geometry without re-registering left
+// blocks past the old extent mapped to no page: found only by a multi-threaded debug run, and
+// never under gdb. Checked whenever a page is (re)initialized.
+static bool mi_page_map_check_page(mi_page_t* page) {
+  size_t page_size;
+  const uint8_t* const start = mi_page_area(page, &page_size);
+  // (a huge page is mapped only up to its furthest interior pointer: as in `mi_page_map_get_idx`)
+  if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }
+  mi_assert_internal(page_size > 0);
+  if (_mi_unchecked_ptr_page(start) != page || _mi_unchecked_ptr_page(start + page_size - 1) != page) {
+    _mi_page_debug_print(page);   // (the assertions below abort)
+  }
+  mi_assert_internal(_mi_unchecked_ptr_page(start) == page);
+  mi_assert_internal(_mi_unchecked_ptr_page(start + page_size - 1) == page);
+  MI_UNUSED(start);
+  return true;
+}
+#endif
+
 // Initialize a fresh page (that is already partially initialized)
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_assert(page != NULL);
@@ -25664,6 +26208,7 @@ mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page) {
   mi_track_mem_noaccess(page_start,page_size);
   mi_assert_internal(page_size / mi_page_block_size(page) < (1L<<16));
   mi_assert_internal(page->reserved > 0);
+  mi_assert_internal(mi_page_map_check_page(page));
   #if (MI_PADDING || MI_ENCODE_FREELIST)
   page->keys[0] = _mi_theap_random_next(theap);
   page->keys[1] = _mi_theap_random_next(theap);
@@ -25796,7 +26341,18 @@ static mi_decl_noinline mi_page_t* mi_page_queue_find_free_ex(mi_theap_t* theap,
   }
 
   if (page == NULL) {
-    _mi_theap_collect_retired(theap, false); // perhaps make a page available
+    #if MI_LARGE_REPURPOSE && MI_LARGE_AGE_STEP > 0
+    // #575: a large bin's miss ages the retired pages at most once per MI_LARGE_AGE_STEP generic mallocs (see there)
+    if (pq->block_size > MI_MEDIUM_MAX_OBJ_SIZE && pq->block_size <= MI_LARGE_MAX_OBJ_SIZE) {
+      mi_tld_t* const tld = theap->tld;
+      if ((uint32_t)((uint32_t)theap->generic_count - tld->large_age_mark) >= (uint32_t)MI_LARGE_AGE_STEP) {   // (a heartbeat reset of the count wraps: ages once)
+        tld->large_age_mark = (uint32_t)theap->generic_count;
+        _mi_theap_collect_retired(theap, false);
+      }
+    }
+    else
+    #endif
+    { _mi_theap_collect_retired(theap, false); } // perhaps make a page available
     page = mi_page_fresh(theap, pq);         
     mi_assert_internal(page == NULL || mi_page_immediate_available(page));
     if (page == NULL && first_try) {
@@ -25999,6 +26555,9 @@ static mi_theap_t* mi_malloc_generic_admin(mi_theap_t* theap)
       _mi_deferred_free(theap, false);         // call potential deferred free routines      
       _mi_theap_collect_retired(theap, false); // free retired pages      
     }
+    #if MI_LARGE_REPURPOSE
+    theap->tld->large_repurpose_left = (uint32_t)MI_LARGE_REPURPOSE_PER_TICK;   // #530
+    #endif
     _mi_theap_purge_large_holes(theap);        // #477: release large-page holes while busy
   }
   return theap;
@@ -26238,12 +26797,13 @@ static size_t mi_page_map_get_idx(mi_page_t* page, uint8_t** page_start, size_t*
   size_t page_size;
   *page_start = mi_page_area(page, &page_size);
   if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }  // furthest interior pointer
-  *slice_count = mi_slice_count_of_size(page_size) + ((*page_start - mi_page_slice_start(page))/MI_ARENA_SLICE_SIZE); // add for large aligned blocks
+  *slice_count = mi_slice_count_of_size(page_size + (size_t)(*page_start - mi_page_slice_start(page))); // (#573) the blocks start after the page header and large alignment padding: count the slices they end in
   return _mi_page_map_index(page);
 }
 
 bool _mi_page_map_register(mi_page_t* page) {
   mi_assert_internal(page != NULL);
+  MI_EVENT(MI_EVENT_PAGE_MAP_REGISTER);   // (#573)
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_assert_internal(mi_atomic_load_ptr_relaxed(uint8_t,&_mi_page_map) != NULL);  // should be initialized before multi-thread access!
   uint8_t* page_map = mi_atomic_load_ptr_relaxed(uint8_t,&_mi_page_map);
@@ -26591,16 +27151,25 @@ static bool mi_page_map_set_range(mi_page_map_t* pmap, mi_page_t* page, size_t i
 //
 // Re-open with a repro that actually corrupts -- most likely on a platform or path
 // where the os_align allocation has NO trailing slack.
+//
+// (#573) A different arithmetic slip in the same line WAS reproducible, by the page-map check that
+// `_mi_page_init` runs in a debug build (`mi_page_map_check_page`, page.c): with the term
+// `floor(offset / SLICE)` a page whose blocks start part-way into a slice (an OS-backed singleton:
+// offset 4096, 851968 bytes) registered one slice too few, so the last 4 KiB of its only block
+// mapped to no page (`test-diagnostic-walks-os`, MIMALLOC_DISALLOW_ARENA_ALLOC=1). The count is
+// now `ceil((offset + size) / SLICE)`: exact for the flat map, and for this map never lower than
+// before (the over-count above is unchanged in kind).
 static size_t mi_page_map_get_idx(mi_page_t* page, size_t* sub_idx, size_t* slice_count) {
   size_t page_size;
   uint8_t* page_start = mi_page_area(page, &page_size);
   if (page_size > MI_LARGE_PAGE_SIZE) { page_size = MI_LARGE_PAGE_SIZE - MI_ARENA_SLICE_SIZE; }  // furthest interior pointer
-  *slice_count = mi_slice_count_of_size(page_size) + ((page_start - mi_page_slice_start(page))/MI_ARENA_SLICE_SIZE); // add for large aligned blocks
+  *slice_count = mi_slice_count_of_size(page_size + (size_t)(page_start - mi_page_slice_start(page))); // (#573) as above: the sub-slice part of the start offset can push the last block into one more slice
   return _mi_page_map_index(page_start, sub_idx);
 }
 
 bool _mi_page_map_register(mi_page_t* page) {
   mi_assert_internal(page != NULL);
+  MI_EVENT(MI_EVENT_PAGE_MAP_REGISTER);   // (#573)
   mi_assert_internal(_mi_is_aligned(mi_page_slice_start(page), MI_PAGE_ALIGN));
   mi_page_map_t* pmap = _mi_page_map();
   mi_assert_internal(pmap != NULL);  // should be initialized before multi-thread access!
@@ -27445,7 +28014,8 @@ void _mi_page_unpurge_all(mi_page_t* page) {
   page retires, the owner resets it to "nothing formed" (`capacity == 0`, `free == NULL`: the
   memory stays resident, so a reuse re-forms blocks without faulting, and the alloc fast path
   can never reach a block of it) and publishes it in a slot of its tld. The scavenger discards
-  the whole block area of a page that stays published for MI_RETIRED_RELEASE_MULT purge delays,
+  the whole block area of a page that stays published for MI_RETIRED_RELEASE_MULT purge delays
+  (counted from the scavenger's first sight of it, #544),
   as an unformed tail -- which `mi_page_extend_free` already hands back before forming a block.
 
   The slot is the lock: whoever takes the page out of the slot owns the page's memory until it
@@ -27456,6 +28026,27 @@ void _mi_page_unpurge_all(mi_page_t* page) {
 ----------------------------------------------------------- */
 
 #define MI_RETIRED_SLOT_BUSY  ((mi_page_t*)1)   // the scavenger holds this slot's page for one discard
+#define MI_RETIRED_SLOTS_MASK ((MI_RETIRED_PAGE_SLOTS >= MI_SIZE_BITS) ? ~(size_t)0 : (((size_t)1 << MI_RETIRED_PAGE_SLOTS) - 1))
+#if MI_RETIRED_PAGE_SLOTS > MI_SIZE_BITS
+#error "MI_RETIRED_PAGE_SLOTS must fit in the owner's slot mask (mi_tld_t.retired_used)"
+#endif
+
+#if MI_DEBUG>=2
+// #573: the owner-private mask never claims fewer slots than the slots hold. A slot the owner
+// filled always has its bit; only a foreign unpublish (a heap delete from another thread) leaves a
+// bit set with the slot empty, which the mask tolerates. The reverse -- a page in a slot whose bit
+// is clear -- is the leak's mirror image and would let a publish overwrite a live slot. (#572's
+// mask leak was the first: `_mi_page_free` cleared `page->theap` before unpublish, no bit was ever
+// cleared, and after 16 publishes nothing was published again -- idle RSS +225% to +1989%.)
+static bool mi_retired_mask_covers_slots(const mi_tld_t* tld) {
+  for (size_t k = 0; k < MI_RETIRED_PAGE_SLOTS; k++) {
+    if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) {
+      mi_assert_internal((tld->retired_used & ((size_t)1 << k)) != 0);
+    }
+  }
+  return true;
+}
+#endif
 
 // Owner only (from `_mi_page_retire`): reset an emptied large page and publish it for the
 // scavenger. When every slot is taken the page simply stays retired as upstream keeps it.
@@ -27464,21 +28055,37 @@ void _mi_page_publish_retired(mi_page_t* page) {
   mi_assert_internal(page->retired_slot == NULL);
   if (page->retired_slot != NULL) return;
   mi_tld_t* const tld = mi_page_theap(page)->tld;
-  // only the owner ever fills an empty slot, so one it sees empty stays empty until it fills it
-  _Atomic(mi_page_t*)* slot = NULL;
-  for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
-    if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[i]) == NULL) { slot = &tld->retired_pages[i]; break; }
+  mi_assert_internal(mi_retired_mask_covers_slots(tld));
+  // Only the owner ever fills or empties a slot (the scavenger borrows one for a discard and puts
+  // the same page back), so an owner-private mask knows which are free without reading the slots
+  // -- cache lines the scavenger also touches: scanning them was ~60% of this function's samples
+  // (#530, large-class-ephemeral/8 short generations).
+  size_t free_mask = ~tld->retired_used & MI_RETIRED_SLOTS_MASK;
+  if mi_unlikely(free_mask == 0) {
+    // the mask says full: rebuild it from the slots once (a bit a foreign unpublish could not clear)
+    size_t used = 0;
+    for (size_t k = 0; k < MI_RETIRED_PAGE_SLOTS; k++) {
+      if (mi_atomic_load_ptr_relaxed(mi_page_t, &tld->retired_pages[k]) != NULL) { used |= ((size_t)1 << k); }
+    }
+    tld->retired_used = used;
+    free_mask = ~used & MI_RETIRED_SLOTS_MASK;
+    if (free_mask == 0) return;   // all slots full: leave it unpublished
   }
-  if (slot == NULL) return;   // all slots full: leave it unpublished
+  const size_t i = mi_ctz(free_mask);
+  _Atomic(mi_page_t*)* const slot = &tld->retired_pages[i];
+  mi_assert_internal(mi_atomic_load_ptr_relaxed(mi_page_t, slot) == NULL);
+  tld->retired_used |= ((size_t)1 << i);
 
   _mi_page_unpurge_all(page);   // holes describe formed blocks, and there will be none
   page->free = NULL;            // nothing formed: every block of the page is unformed tail now
   page->local_free = NULL;
   page->capacity = 0;
   page->free_is_zero = false;
-  page->retired_at = _mi_clock_now();
+  page->retired_at = 0;         // unstamped: the scavenger stamps it when it first sees the page (#544)
   page->retired_slot = slot;
   mi_atomic_store_ptr_release(mi_page_t, slot, page);   // publishes the reset above to the scavenger
+  MI_EVENT(MI_EVENT_RETIRED_PUBLISH);   // (#573)
+  MI_PROBE1(retired_publish, page->block_size);
   _mi_pages_release_schedule(mi_page_subproc(page));
 }
 
@@ -27492,7 +28099,7 @@ void _mi_pages_release_schedule(mi_subproc_t* subproc) {
 
 // Take a published page back from the scavenger for good: before a block is formed in it or it
 // is returned to the arena. If the scavenger holds the slot, that is for one discard only.
-void _mi_page_unpublish_retired(mi_page_t* page) {
+void _mi_page_unpublish_retired(mi_page_t* page, mi_tld_t* owner_tld) {
   _Atomic(mi_page_t*)* const slot = page->retired_slot;
   if (slot == NULL) return;
   mi_page_t* expected = page;
@@ -27502,7 +28109,25 @@ void _mi_page_unpublish_retired(mi_page_t* page) {
     _mi_prim_thread_yield();
   }
   page->retired_slot = NULL;
+  MI_EVENT(MI_EVENT_RETIRED_UNPUBLISH);   // (#573)
   page->retired_at = 0;   // #493: a non-zero stamp on an unpublished page marks a reserved one
+  // Clear the slot's bit in the owner's mask. `_mi_page_free` clears `page->theap` before the page
+  // reaches `_mi_arenas_page_free`, where it is unpublished; unpublishing is owner-side, so the
+  // calling thread's tld is the owner's then. Missing that path leaked every bit: after 16
+  // publishes nothing was published again, and idle RSS rose +225% to +1989% (perf-ab).
+  // (#573: a caller that knows the owner's tld says so; the fallbacks below are the heuristic that
+  // needed the comment above)
+  mi_tld_t* tld = owner_tld;
+  if (tld == NULL) {
+    mi_theap_t* theap = page->theap;   // (raw: `mi_page_theap` asserts on an abandoned page)
+    if (theap == NULL) { theap = _mi_theap_default(); }
+    tld = (theap != NULL ? theap->tld : NULL);
+  }
+  if (tld != NULL && slot >= &tld->retired_pages[0] && slot < &tld->retired_pages[MI_RETIRED_PAGE_SLOTS]) {
+    tld->retired_used &= ~((size_t)1 << (size_t)(slot - &tld->retired_pages[0]));
+  }
+  // (else -- a heap delete from another thread -- the bit stays set until the owner's next publish
+  // finds no free bit and rebuilds the mask from the slots)
 }
 
 // A theap detached from its tld by a heap delete/destroy (`_mi_heap_detach_theaps`) has its pages
@@ -27511,7 +28136,7 @@ void _mi_page_unpublish_retired(mi_page_t* page) {
 void _mi_theap_unpublish_retired(mi_theap_t* theap) {
   for (size_t bin = 0; bin <= MI_BIN_FULL; bin++) {
     for (mi_page_t* page = theap->pages[bin].first; page != NULL; page = page->next) {
-      if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page); }
+      if (page->retired_slot != NULL) { _mi_page_unpublish_retired(page, theap->tld); }
     }
   }
 }
@@ -27544,8 +28169,14 @@ bool _mi_pages_release_retired(mi_subproc_t* subproc) {
         if (!mi_atomic_cas_ptr_strong_acq_rel(mi_page_t, slot, &page, MI_RETIRED_SLOT_BUSY)) continue;   // the owner took it back
         // the page's memory is ours until we put it back
         if (_mi_page_unformed_purged_bytes(page) == 0) {   // (not discarded already)
-          if (now - page->retired_at < min_age) { pending = true; }
-          else { mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
+          // #544: the owner publishes a page without reading the clock. A bin's only page empties
+          // and is taken back again on nearly every allocation cycle of a sparse large bin (1.04M
+          // publishes in 3.2M operations of perf-ab large-class/8, all but 0.3% of the process's
+          // clock reads), and the publish wakes us, so the age counts from our first sight: a
+          // release can come at most one scavenger wake-up later, never earlier.
+          if (page->retired_at == 0) { page->retired_at = (now != 0 ? now : 1); pending = true; }
+          else if (now - page->retired_at < min_age) { pending = true; }
+          else { MI_PROBE1(retired_release, page->block_size); mi_page_purge_unformed_tail(page); mi_page_discard_slack(page); }   // `capacity == 0`: the whole block area, and past it
         }
         mi_atomic_store_ptr_release(mi_page_t, slot, page);
       }
@@ -27832,6 +28463,65 @@ static void mi_page_holes_granularity_curve(const mi_page_t* page, const uint64_
   }
 }
 
+
+// #575 (#422 Step 0): split the RESIDENT bytes of this page's whole slice extent (`mincore`, so a
+// THP fault-around neighbour counts like any other resident byte) by what each byte is: inside a
+// live block, a formed free block, a block not formed yet, or outside `reserved * block_size`
+// (header and geometry slack). Read-only, untimed, diagnostics only. `freelisted` is NULL for a
+// page with no formed block.
+#ifndef MI_HOLES_RES_CHUNK_PAGES
+#define MI_HOLES_RES_CHUNK_PAGES  (1024)
+#endif
+static void mi_page_residency_split(const mi_page_t* page, const uint64_t* freelisted, mi_holes_report_t* rep) {
+  if (page->memid.memkind != MI_MEM_ARENA) return;
+  const size_t bs = page->block_size;
+  const size_t cap = page->capacity;
+  const size_t psize = _mi_os_page_size();
+  const uintptr_t lo = (uintptr_t)mi_page_slice_start(page);
+  const uintptr_t hi = lo + ((size_t)page->memid.mem.arena.slice_count * MI_ARENA_SLICE_SIZE);
+  const uintptr_t pstart = (uintptr_t)mi_page_start(page);
+  const uintptr_t cend = pstart + (cap * bs);                        // end of the formed blocks
+  const uintptr_t rend = pstart + ((size_t)page->reserved * bs);     // end of the block area
+  mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
+  const size_t u = (page->used == 0 ? 1 : 0);
+  r->res_extent += (size_t)(hi - lo);
+  r->res_formed[u] += cap * bs;
+  r->res_reserved[u] += (size_t)page->reserved * bs;
+  unsigned char vec[MI_HOLES_RES_CHUNK_PAGES];
+  for (uintptr_t at = lo; at < hi; ) {
+    size_t n = (size_t)(hi - at) / psize;
+    if (n > MI_HOLES_RES_CHUNK_PAGES) n = MI_HOLES_RES_CHUNK_PAGES;
+    if (n == 0) break;
+    if (!_mi_diag_resident_map((const void*)at, n, vec)) return;
+    for (size_t k = 0; k < n; k++) {
+      if (vec[k] == 0) continue;
+      const uintptr_t olo = at + (k * psize);
+      const uintptr_t ohi = olo + psize;
+      // (1) bytes before the block area or past `reserved`: slack
+      uintptr_t a = olo;
+      if (a < pstart) { const uintptr_t e = (ohi < pstart ? ohi : pstart); r->res[u][MI_HOLES_RES_SLACK] += (size_t)(e - a); a = e; }
+      if (a < ohi && a < cend) {   // (2) formed blocks: live or free, block by block
+        const uintptr_t e = (ohi < cend ? ohi : cend);
+        size_t idx = (size_t)(a - pstart) / bs;
+        while (a < e) {
+          const uintptr_t bend = pstart + ((idx + 1) * bs);
+          const uintptr_t x = (bend < e ? bend : e);
+          const bool is_free = (freelisted != NULL && mi_holes_block_is_free(page, freelisted, idx));
+          r->res[u][is_free ? MI_HOLES_RES_FREE : MI_HOLES_RES_LIVE] += (size_t)(x - a);
+          a = x; idx++;
+        }
+      }
+      if (a < ohi && a < rend) {   // (3) unformed blocks
+        const uintptr_t x = (ohi < rend ? ohi : rend);
+        r->res[u][MI_HOLES_RES_UNFORMED] += (size_t)(x - a);
+        a = x;
+      }
+      if (a < ohi) { r->res[u][MI_HOLES_RES_SLACK] += (size_t)(ohi - a); }   // (4) past the block area
+    }
+    at += n * psize;
+  }
+}
+
 void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   if (page == NULL || rep == NULL) return;
   const size_t bs = page->block_size;
@@ -27839,12 +28529,20 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   if (bs == 0 || cap > MI_HOLES_MAX_CAP) return;
   mi_holes_bin_t* const r = &rep->bin[_mi_bin(bs)];
   r->pages++;
+  if (page->used == 0) { r->empty_pages++; }   // #573 A3
+  if (page->retire_expire != 0 && page->used == 0) {
+    r->retired_pages++;
+    size_t area_size = 0;
+    const uint8_t* const area = mi_page_area(page, &area_size);
+    const size_t resident = _mi_diag_resident_bytes(area, area_size);
+    if (resident != SIZE_MAX) { r->retired_resident_bytes += resident; }
+  }
   if (bs > r->block_size) { r->block_size = bs; }
   rep->total_pages++;
   rep->page_committed_bytes += mi_page_committed(page);
   if (page->reserved > cap) { rep->unformed_bytes += ((size_t)page->reserved - cap) * bs; }
   rep->unformed_discarded_bytes += _mi_page_unformed_purged_bytes(page);
-  if (cap == 0) return;
+  if (cap == 0) { mi_page_residency_split(page, NULL, rep); return; }
 
   uint64_t freelisted[MI_HOLES_MAX_CAP / 64];
   const size_t nwords = _mi_divide_up(cap, 64);
@@ -27853,6 +28551,7 @@ void _mi_page_holes_report_page(const mi_page_t* page, mi_holes_report_t* rep) {
   mi_holes_mark_free_list(page, page->local_free, freelisted);
   mi_holes_mark_free_list(page, mi_page_thread_free((mi_page_t*)page), freelisted);   // a concurrent free can push after this read: that block reads as live (a diagnostic, so this is fine)
 
+  mi_page_residency_split(page, freelisted, rep);   // #575
   if (mi_page_holes_madvisable(page)) { mi_page_holes_granularity_curve(page, freelisted, rep); }
   else { rep->unmadvisable_pages++; }
 
@@ -27944,6 +28643,35 @@ static void mi_holes_print_row(const char* name, const mi_holes_bin_t* r) {
               name, r->pages, slive, sfree, sundisc, sdisc, avg100 / 100, avg100 % 100);
 }
 
+// #575: the resident-byte attribution, per bin and in total (this thread's own pages only)
+static void mi_holes_print_residency(const mi_holes_report_t* rep) {
+  static const char* const names[MI_HOLES_RES_COUNT] = { "live", "free_formed", "unformed", "slack" };
+  size_t tot[2][MI_HOLES_RES_COUNT] = {{0}};
+  size_t extent = 0, pages = 0, pages_used = 0, pages_empty = 0;
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->pages == 0) continue;
+    extent += r->res_extent;
+    pages += r->pages;
+    pages_empty += r->empty_pages;
+    for (size_t u = 0; u < 2; u++) { for (size_t c = 0; c < MI_HOLES_RES_COUNT; c++) { tot[u][c] += r->res[u][c]; } }
+    _mi_fprintf(NULL, NULL, "ATTR bin block_size=%zu pages=%zu empty=%zu extent=%zu"
+                " used_live=%zu used_free=%zu used_unformed=%zu used_slack=%zu"
+                " empty_live=%zu empty_free=%zu empty_unformed=%zu empty_slack=%zu"
+                " formed_used=%zu formed_empty=%zu reserved_used=%zu reserved_empty=%zu\n",
+                r->block_size, r->pages, r->empty_pages, r->res_extent,
+                r->res[0][0], r->res[0][1], r->res[0][2], r->res[0][3],
+                r->res[1][0], r->res[1][1], r->res[1][2], r->res[1][3],
+                r->res_formed[0], r->res_formed[1], r->res_reserved[0], r->res_reserved[1]);
+  }
+  pages_used = pages - pages_empty;
+  _mi_fprintf(NULL, NULL, "ATTR total pages=%zu used_pages=%zu empty_pages=%zu extent=%zu", pages, pages_used, pages_empty, extent);
+  for (size_t u = 0; u < 2; u++) {
+    for (size_t c = 0; c < MI_HOLES_RES_COUNT; c++) { _mi_fprintf(NULL, NULL, " %s_%s=%zu", (u == 0 ? "used" : "empty"), names[c], tot[u][c]); }
+  }
+  _mi_fprintf(NULL, NULL, "\n");
+}
+
 void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
   if (rep == NULL) return;
   static const char* hist_name[MI_HOLES_HIST_BUCKETS] = { "1", "2", "3-4", "5-8", "9+" };
@@ -27979,6 +28707,16 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
   mi_holes_mb(total.pinned_free_bytes, spfree, sizeof(spfree));
   mi_holes_mb(total.pinned_live_bytes, splive, sizeof(splive));
   _mi_fprintf(NULL, NULL, "  live %s MB, free %s MB\n", slive, sfree);
+  // #573 A3: per bin, the pages with no live block, those retired for reuse (#483), and the RAM
+  // those hold (`mincore`) -- the "one retired empty page per large bin" of #572
+  for (size_t bin = 0; bin < MI_BIN_COUNT; bin++) {
+    const mi_holes_bin_t* const r = &rep->bin[bin];
+    if (r->empty_pages == 0 && r->retired_pages == 0) continue;
+    char sres[32];
+    mi_holes_mb(r->retired_resident_bytes, sres, sizeof(sres));
+    _mi_fprintf(NULL, NULL, "  bin %zu (%zu B): %zu pages, %zu empty, %zu retired holding %s MB resident\n",
+                bin, r->block_size, r->pages, r->empty_pages, r->retired_pages, sres);
+  }
   _mi_fprintf(NULL, NULL, "  %zu pinned OS pages (>= 1 live block): %s MB live + %s MB free trapped in them\n",
               total.pinned_ospages, splive, spfree);
 
@@ -28012,6 +28750,7 @@ void _mi_page_holes_report_print(const mi_holes_report_t* rep) {
     _mi_fprintf(NULL, NULL, "      'in pages' misses pages owned by OTHER threads' theaps -- this walk cannot read them.\n");
   }
 
+  mi_holes_print_residency(rep);   // #575
   _mi_arena_layout_print(&rep->arena_layout);   // #519: prints nothing unless MI_DIAGNOSTICS
 
   _mi_fprintf(NULL, NULL, "%10s %8s %10s %10s %18s %13s %13s\n",
@@ -28135,6 +28874,7 @@ void mi_purge_holes_report(void) mi_attr_noexcept {
   mi_holes_report_t rep;
   _mi_purge_holes_report_collect(&rep);
   _mi_page_holes_report_print(&rep);
+  _mi_event_print();   // #573 A2
 }
 /* ---- end inlined: src/page-holes.c ---- */
 /* ---- begin inlined: src/large-span.c ---- */
@@ -28218,6 +28958,18 @@ static mi_large_span_bin_t mi_large_span_pack(size_t level, long pressure) {
   return (mi_large_span_bin_t)((((unsigned long)pressure & 0x0F) << MI_LARGE_SPAN_PRESSURE_SHIFT) | level);   // (the full bit clear)
 }
 
+// #575: the largest span a demand-grown page gets, in slices: `mi_option_large_span_max` (KiB, default
+// MI_LARGE_SPAN_MAX_KIB), never below the compact span, and 0 = MI_LARGE_PAGE_SIZE (the #532 policy).
+// The block-count minimum (MI_LARGE_SPAN_MIN_BLOCKS) still wins over it: a page always holds its blocks.
+static size_t mi_large_span_cap_slices(void) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  const long kib = mi_option_get(mi_option_large_span_max);
+  if (kib <= 0) return full;
+  size_t cap = mi_slice_count_of_size((size_t)kib * MI_KiB);
+  if (cap < MI_LARGE_SPAN_COMPACT_SLICES) { cap = MI_LARGE_SPAN_COMPACT_SLICES; }
+  return (cap < full ? cap : full);
+}
+
 // the span of `level`, uncapped (the shift is bounded: a level only grows while below the full span)
 static size_t mi_large_span_level_slices(size_t level) {
   return ((size_t)MI_LARGE_SPAN_COMPACT_SLICES << (level * MI_LARGE_SPAN_GROW_SHIFT));
@@ -28230,24 +28982,19 @@ void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
   theap->large_span[idx] |= MI_LARGE_SPAN_FULL_BIT;
 }
 
-// A page request of a large bin on `theap`: account it, and return the span (in slices) of the
-// page to create for it if no abandoned page of the bin is reclaimed instead. `overhead` is what a
-// page of `block_size` spends besides its blocks in the worst case (meta in front, guard page).
-size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+// The span (in slices) a page request of `block_size` gets from the bin's state `b` (the state it
+// leaves is stored in `*next`). `overhead` is what a page of `block_size` spends besides its blocks
+// in the worst case (meta in front, guard page).
+static size_t mi_large_span_request(mi_large_span_bin_t b, size_t block_size, size_t overhead, mi_large_span_bin_t* next) {
   const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
-  if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
-  if (!mi_option_is_enabled(mi_option_large_span)) return full;
-  const size_t idx = mi_large_span_index(block_size);
-  if (idx >= MI_LARGE_SPAN_BINS) return full;
-
-  const mi_large_span_bin_t b = theap->large_span[idx];
+  const size_t cap = mi_large_span_cap_slices();   // (#575)
   size_t level = mi_large_span_level(b);
   long pressure = mi_large_span_pressure(b);
   if ((b & MI_LARGE_SPAN_FULL_BIT) != 0) {
     // a page of the bin filled up since its last request: demand beyond what the theap holds
     pressure++;
     if (pressure >= MI_LARGE_SPAN_GROW_REQUESTS) {
-      if (mi_large_span_level_slices(level) < full && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; }
+      if (mi_large_span_level_slices(level) < cap && level < MI_LARGE_SPAN_LEVEL_MASK) { level++; MI_EVENT(MI_EVENT_LARGE_SPAN_GROW); }   // (#573)
       pressure = 0;
     }
   }
@@ -28256,19 +29003,44 @@ size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhe
     pressure--;
     if (pressure <= -MI_LARGE_SPAN_DECAY_REQUESTS) {
       level--;
+      MI_EVENT(MI_EVENT_LARGE_SPAN_SHRINK);   // (#573)
       pressure = 0;
     }
   }
   else if (pressure > 0) {
     pressure--;   // (at the compact span only a pending step up can fade)
   }
-  theap->large_span[idx] = mi_large_span_pack(level, pressure);
+  *next = mi_large_span_pack(level, pressure);
 
   size_t slices = mi_large_span_level_slices(level);
+  if (slices > cap) { slices = cap; }
   const size_t min_slices = mi_slice_count_of_size(MI_LARGE_SPAN_MIN_BLOCKS * block_size + overhead);
   if (slices < min_slices) { slices = min_slices; }
   if (slices > full) { slices = full; }
   return slices;
+}
+
+// A page request of a large bin on `theap`: account it, and return the span (in slices) of the
+// page to create for it if no abandoned page of the bin is reclaimed instead.
+size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
+  if (!mi_option_is_enabled(mi_option_large_span)) return full;
+  const size_t idx = mi_large_span_index(block_size);
+  if (idx >= MI_LARGE_SPAN_BINS) return full;
+  return mi_large_span_request(theap->large_span[idx], block_size, overhead, &theap->large_span[idx]);
+}
+
+// #530: the span `_mi_large_span_slices` would return for this request, without accounting it
+// (a retired page of another bin is repurposed only if it is at least that large)
+size_t _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  const size_t full = mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
+  if (theap == NULL || MI_LARGE_SPAN_COMPACT_SLICES >= full) return full;
+  if (!mi_option_is_enabled(mi_option_large_span)) return full;
+  const size_t idx = mi_large_span_index(block_size);
+  if (idx >= MI_LARGE_SPAN_BINS) return full;
+  mi_large_span_bin_t unused;
+  return mi_large_span_request(theap->large_span[idx], block_size, overhead, &unused);
 }
 
 #else // !MI_LARGE_SPAN: every large page gets MI_LARGE_PAGE_SIZE (and the hook sites compile out)
@@ -28280,6 +29052,11 @@ size_t _mi_large_span_slices(mi_theap_t* theap, size_t block_size, size_t overhe
 
 void _mi_large_span_on_full(mi_theap_t* theap, const mi_page_t* page) {
   MI_UNUSED(theap); MI_UNUSED(page);
+}
+
+size_t _mi_large_span_peek_slices(mi_theap_t* theap, size_t block_size, size_t overhead) {
+  MI_UNUSED(theap); MI_UNUSED(block_size); MI_UNUSED(overhead);
+  return mi_slice_count_of_size(MI_LARGE_PAGE_SIZE);
 }
 
 #endif // MI_LARGE_SPAN
@@ -28544,10 +29321,13 @@ static void mi_purge_walk_subproc(mi_subproc_t* sp, mi_tld_t* my_tld, mi_purge_w
 // (§8, §13): a concurrent `fork()` (`prepare` takes level 1 first), `mi_subproc_new/delete` or
 // `mi_prof_start`'s sync waits for this call, bounded by `wait_ms` plus the claimed sweeps.
 // Nothing an owner does INSIDE an allocator call takes `mi_subprocs_lock`, so an owner we are
-// waiting on is never waiting on us. A claim is taken under `sp->tlds_lock` (level 4) and
-// released before the sweep; the sweep itself takes only the swept tld's locks and the
-// arena/OS layers -- none of which nest `mi_subprocs_lock`. (`_mi_subproc_prof_sync_force_slow` nests `heaps_lock` and
-// `theaps_lock` under it the same way; `tlds_lock` is a sibling of `heaps_lock` there.)
+// waiting on is never waiting on us. (`mi_heap_snapshot` takes it BEFORE its own gate for that
+// reason; only a snapshot nested inside a gated allocator operation waits for it while RUNNING,
+// and it is reported pending at the deadline like any owner that stays inside.) A claim is
+// taken under `sp->tlds_lock` (level 4) and released before the sweep; the sweep itself takes
+// only the swept tld's locks and the arena/OS layers -- none of which nest `mi_subprocs_lock`.
+// (`_mi_subproc_prof_sync_force_slow` nests `heaps_lock` and `theaps_lock` under it the same
+// way; `tlds_lock` is a sibling of `heaps_lock` there.)
 static void mi_purge_all_walk(mi_tld_t* my_tld, mi_purge_walk_t* w, mi_msecs_t deadline) {
   mi_lock(_mi_subprocs_lock()) {
     for (mi_subproc_t* sp = _mi_subprocs_head(); sp != NULL; sp = sp->next) {
@@ -29160,6 +29940,56 @@ void _mi_arenas_reclaim_now(mi_tld_t* my_tld, size_t wait_ms, mi_arena_reclaim_r
    identical in every configuration. */
 
 
+#if !defined(_WIN32) && !defined(__wasi__) && MI_DIAGNOSTICS
+#include <sys/mman.h>   // mincore (#573 A3)
+#define MI_DIAG_RESIDENT  1
+#else
+#define MI_DIAG_RESIDENT  0
+#endif
+
+// #573 A3: the bytes of [start, start+size) resident in RAM now, by `mincore`, or SIZE_MAX when
+// this platform or build cannot say. An unmapped or reserved-only range counts as 0. Untimed
+// diagnostics only: one syscall per MI_DIAG_RESIDENT_PAGES pages, no allocation (a fixed buffer
+// on the stack).
+#ifndef MI_DIAG_RESIDENT_PAGES
+#define MI_DIAG_RESIDENT_PAGES  (256)
+#endif
+
+size_t _mi_diag_resident_bytes(const void* start, size_t size) {
+  #if MI_DIAG_RESIDENT
+  const size_t psize = _mi_os_page_size();
+  const uintptr_t lo = _mi_align_down((uintptr_t)start, psize);
+  const uintptr_t hi = _mi_align_up((uintptr_t)start + size, psize);
+  size_t resident = 0;
+  unsigned char vec[MI_DIAG_RESIDENT_PAGES];
+  for (uintptr_t at = lo; at < hi; ) {
+    const size_t pages = ((hi - at) / psize < MI_DIAG_RESIDENT_PAGES ? (hi - at) / psize : MI_DIAG_RESIDENT_PAGES);
+    if (mincore((void*)at, pages * psize, vec) == 0) {
+      for (size_t i = 0; i < pages; i++) { if ((vec[i] & 1) != 0) { resident += psize; } }
+    }   // (else: not mapped -- ENOMEM -- so nothing of it is resident)
+    at += pages * psize;
+  }
+  return resident;
+  #else
+  MI_UNUSED(start); MI_UNUSED(size);
+  return SIZE_MAX;
+  #endif
+}
+
+// #575: which OS pages of [start, start + npages * page size) are resident (`mincore`): vec[i] is
+// 1 or 0 per OS page. False when this platform or build cannot say (or the range is unmapped).
+bool _mi_diag_resident_map(const void* start, size_t npages, unsigned char* vec) {
+  #if MI_DIAG_RESIDENT
+  const size_t psize = _mi_os_page_size();
+  if (mincore((void*)start, npages * psize, vec) != 0) return false;
+  for (size_t i = 0; i < npages; i++) { vec[i] &= 1; }
+  return true;
+  #else
+  MI_UNUSED(start); MI_UNUSED(npages); MI_UNUSED(vec);
+  return false;
+  #endif
+}
+
 // The `run_hist` bucket of a run of `run_slices` slices: floor(log2(run_slices)), so bucket b
 // holds the lengths [2^b, 2^(b+1)). Needs no build flag: it is pure arithmetic.
 size_t _mi_arena_layout_bucket(size_t run_slices) {
@@ -29178,8 +30008,13 @@ static mi_arena_layout_kind_t mi_arena_layout_kind_at(mi_arena_t* arena, size_t 
   return MI_ARENA_LAYOUT_FRESH;
 }
 
-static void mi_arena_layout_add_run(mi_arena_layout_class_t* cls, mi_arena_layout_kind_t kind, size_t run_slices) {
+static void mi_arena_layout_add_run(mi_arena_t* arena, mi_arena_layout_class_t* cls, mi_arena_layout_kind_t kind, size_t run_start, size_t run_slices) {
   if (run_slices == 0) return;
+  // #573 A3: what is resident in RAM of this run, whatever its bitmap class says -- a "fresh" slice
+  // can be resident (THP faulted its 2 MiB region in), and that is the finding it exists to show
+  const uint8_t* const lo = mi_arena_slice_start(arena, run_start);
+  const size_t resident = _mi_diag_resident_bytes(lo, (size_t)(mi_arena_slice_end(arena, run_start + run_slices) - lo));
+  if (resident != SIZE_MAX) { cls->resident_bytes[kind] += resident; }
   cls->runs[kind]++;
   cls->run_hist[kind][_mi_arena_layout_bucket(run_slices)]++;
   if (run_slices > cls->max_run[kind]) { cls->max_run[kind] = run_slices; }
@@ -29205,6 +30040,7 @@ static void mi_arena_layout_walk_arena(mi_arena_t* arena, mi_arena_layout_t* out
 
     mi_arena_layout_kind_t run_kind = MI_ARENA_LAYOUT_IN_USE;
     size_t run_slices = 0;
+    size_t run_start = start;
     for (size_t i = start; i < end; i++) {
       const mi_arena_layout_kind_t kind = mi_arena_layout_kind_at(arena, i);
       cls->slices[kind]++;
@@ -29213,12 +30049,13 @@ static void mi_arena_layout_walk_arena(mi_arena_t* arena, mi_arena_layout_t* out
         run_slices++;
       }
       else {
-        mi_arena_layout_add_run(cls, run_kind, run_slices);
+        mi_arena_layout_add_run(arena, cls, run_kind, run_start, run_slices);
         run_kind = kind;
         run_slices = 1;
+        run_start = i;
       }
     }
-    mi_arena_layout_add_run(cls, run_kind, run_slices);   // runs never cross a chunk
+    mi_arena_layout_add_run(arena, cls, run_kind, run_start, run_slices);   // runs never cross a chunk
   }
 }
 
@@ -29226,6 +30063,7 @@ bool _mi_arena_layout_walk(mi_subproc_t* subproc, mi_arena_t* arena, mi_arena_la
   if (out == NULL) return false;
   _mi_memzero(out, sizeof(*out));
   if (subproc == NULL) return false;
+  out->resident_known = (MI_DIAG_RESIDENT != 0);
   if (arena != NULL) {
     if (arena->subproc != subproc) return false;
     mi_arena_layout_walk_arena(arena, out);
@@ -29277,6 +30115,20 @@ void _mi_arena_layout_print(const mi_arena_layout_t* layout) {
                 s[MI_ARENA_LAYOUT_IN_USE], s[MI_ARENA_LAYOUT_FRESH], s[MI_ARENA_LAYOUT_FREE_DIRTY],
                 s[MI_ARENA_LAYOUT_QUEUED], s[MI_ARENA_LAYOUT_QUEUED_AGED]);
   }
+  if (layout->resident_known) {
+    // #573 A3: resident RAM (`mincore`) per kind, next to what the bitmaps say
+    char r[MI_ARENA_LAYOUT_KIND_COUNT][32];
+    size_t total[MI_ARENA_LAYOUT_KIND_COUNT] = { 0 };
+    for (size_t c = 0; c < MI_CBIN_COUNT; c++) {
+      for (size_t k = 0; k < MI_ARENA_LAYOUT_KIND_COUNT; k++) { total[k] += layout->cls[c].resident_bytes[k]; }
+    }
+    for (size_t k = 0; k < MI_ARENA_LAYOUT_KIND_COUNT; k++) {
+      _mi_snprintf(r[k], sizeof(r[k]), "%zu.%02zu", total[k] / MI_MiB, ((total[k] % MI_MiB) * 100) / MI_MiB);
+    }
+    _mi_fprintf(NULL, NULL, "    resident (mincore): in use %s MB, fresh %s MB, free_dirty %s MB, queued %s MB, aged %s MB\n",
+                r[MI_ARENA_LAYOUT_IN_USE], r[MI_ARENA_LAYOUT_FRESH], r[MI_ARENA_LAYOUT_FREE_DIRTY],
+                r[MI_ARENA_LAYOUT_QUEUED], r[MI_ARENA_LAYOUT_QUEUED_AGED]);
+  }
   _mi_fprintf(NULL, NULL, "    runs per class and kind (a run never crosses a chunk): count, longest, then length:count by power of two\n");
   for (size_t c = 0; c < MI_CBIN_COUNT; c++) {
     const mi_arena_layout_class_t* const cls = &layout->cls[c];
@@ -29310,6 +30162,87 @@ void _mi_arena_layout_print(const mi_arena_layout_t* layout) {
 
 #endif
 /* ---- end inlined: src/arena-layout.c ---- */
+/* ---- begin inlined: src/event-counters.c ---- */
+/* Event counters (#573 A2): how often each slow-path mechanism ran.
+
+   WHY
+
+   The "retire cascade" of #572 -- a bin stealing another's retired page, which then steals in
+   turn -- was 548K fresh page requests where main made 292. No timing showed it; six throwaway
+   patches to src/page.c, each adding atomic counters and a destructor print, did. This file makes
+   that patch permanent: the counters are always where the next diagnosis needs them, and cost
+   nothing in a build that does not ask.
+
+   WHAT
+
+   A fixed array of relaxed atomic counters indexed by `mi_event_t` (internal.h), bumped by
+   `MI_EVENT(...)` at the sites of the slow paths (fresh large page requests, repurposes and
+   denials, retired publish and unpublish, page-map registration and re-extent, large-span steps,
+   arena page allocation and free). They never sit on the allocation or free fast paths, take no
+   lock, allocate nothing (CLAUDE.md rule 4) and add nothing to any struct (no Rust surface, no
+   layout). Compiled in only with MI_DIAGNOSTICS=1 (#414: every observability subsystem is opt-in);
+   the stubs keep the query functions present in every configuration.
+
+   `_mi_event_print` is called by `mi_stats_print` and by `mi_purge_holes_report`, so any
+   diagnostic run that already prints one of those shows the counts. */
+
+
+#if MI_DIAGNOSTICS
+
+static _Atomic(size_t) mi_event_counts[MI_EVENT_COUNT];
+
+static const char* const mi_event_names[MI_EVENT_COUNT] = {
+  "large_page_request", "large_repurpose", "large_repurpose_denied",
+  "retired_publish", "retired_unpublish",
+  "page_map_register", "page_map_reextend",
+  "large_span_grow", "large_span_shrink",
+  "arena_page_alloc", "arena_page_free",
+  "large_repurpose_none", "large_retire_expired", "large_empty_freed"
+};
+
+void _mi_event_count(mi_event_t event) {
+  mi_assert_internal((size_t)event < (size_t)MI_EVENT_COUNT);
+  mi_atomic_add_relaxed(&mi_event_counts[event], (size_t)1);
+}
+
+uint64_t _mi_event_get(mi_event_t event) {
+  if ((size_t)event >= (size_t)MI_EVENT_COUNT) return 0;
+  return (uint64_t)mi_atomic_load_relaxed(&mi_event_counts[event]);
+}
+
+const char* _mi_event_name(mi_event_t event) {
+  return ((size_t)event < (size_t)MI_EVENT_COUNT ? mi_event_names[event] : "?");
+}
+
+void _mi_event_reset(void) {
+  for (size_t i = 0; i < (size_t)MI_EVENT_COUNT; i++) { mi_atomic_store_relaxed(&mi_event_counts[i], (size_t)0); }
+}
+
+void _mi_event_print(void) {
+  bool any = false;
+  for (size_t i = 0; i < (size_t)MI_EVENT_COUNT; i++) {
+    const size_t n = mi_atomic_load_relaxed(&mi_event_counts[i]);
+    if (n == 0) continue;
+    _mi_fprintf(NULL, NULL, "%s %s=%zu", (any ? "" : "events (#573):"), mi_event_names[i], n);
+    any = true;
+  }
+  if (any) { _mi_fprintf(NULL, NULL, "\n"); }
+  mi_arena_claim_counters_t c;
+  if (_mi_arena_claim_counters(&c)) {
+    _mi_fprintf(NULL, NULL, "arena claims (#517): resident_first=%zu/%zu plain_reused=%zu/%zu plain_fresh=%zu/%zu (claims/slices)\n",
+      c.resident_first_claims, c.resident_first_slices, c.plain_reused_claims, c.plain_reused_slices, c.plain_fresh_claims, c.plain_fresh_slices);
+  }
+}
+
+#else  // !MI_DIAGNOSTICS: the query functions stay, `MI_EVENT` is nothing
+
+uint64_t _mi_event_get(mi_event_t event) { MI_UNUSED(event); return 0; }
+const char* _mi_event_name(mi_event_t event) { MI_UNUSED(event); return "?"; }
+void _mi_event_reset(void) { }
+void _mi_event_print(void) { }
+
+#endif
+/* ---- end inlined: src/event-counters.c ---- */
 /* ---- begin inlined: src/profile.c ---- */
 /* Allocation sampling profiler.  Its records never use mimalloc: the arena
    below is backed directly by _mi_os_alloc so profiler bookkeeping cannot
@@ -29483,9 +30416,11 @@ mi_decl_export size_t  mi_stats_get_bin_size(size_t bin) mi_attr_noexcept;
 // reads mutable state of an unclaimed owner. Top-level complete/skipped_pages/
 // busy_theaps describe observed coverage. In an MI_OWNER_GATE build, an incomplete
 // attempt is discarded and retried from a clean boundary for up to `wait_ms`;
-// otherwise busy owners are omitted immediately. The wait never retains page pins,
-// owner claims, or heap traversal locks. A call nested inside an existing owner-gated
-// allocator operation is one-shot because it cannot release its caller's outer gate.
+// otherwise busy owners are omitted immediately. In a forked child, owners that did
+// not survive the fork are counted as missed and never waited for. The wait never
+// retains page pins, owner claims, or heap traversal locks. A call nested inside an
+// existing owner-gated allocator operation is one-shot because it cannot release its
+// caller's outer gate.
 // A true complete result still does not make independently captured pages one global
 // instant. Ungated foreign owners must cooperatively park for coverage. Use mi_free
 // to free the result.
@@ -32812,6 +33747,7 @@ void mi_subproc_stats_print_out(mi_subproc_id_t subproc_id, mi_output_fun* out, 
 
 void mi_stats_print_out(mi_output_fun* out, void* arg) mi_attr_noexcept {
   mi_subproc_stats_print_out(mi_subproc_current(),out, arg);
+  _mi_event_print();   // #573 A2: the slow-path event counters (MI_DIAGNOSTICS)
 }
 
 // deprecated
@@ -33405,7 +34341,11 @@ static void mi_subproc_unsafe_destroy(mi_subproc_t* subproc, bool acquire_subpro
     }
     mi_assert_internal(subproc->heap_main==NULL || subproc->heaps == subproc->heap_main);
     if (subproc->heap_main!=NULL) {
-      _mi_thread_locals_thread_done(); // release thread locals that may have been allocated (safe as the main heap uses the fast key)
+      // Release this thread's thread locals only when the thread belongs to the sub-process
+      // being destroyed (#554). They hold this thread's theap for every heap of ITS
+      // sub-process; clearing them from another sub-process's destroy leaves live heaps
+      // whose pages still point at the theap the slot no longer names.
+      if (_mi_subproc() == subproc) { _mi_thread_locals_thread_done(); }
       if (_mi_subproc_is_main(subproc)) {
         _mi_thread_locals_done();      
       }

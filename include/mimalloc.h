@@ -486,8 +486,11 @@ mi_decl_export void   mi_debug_show_arenas(void) mi_attr_noexcept;
 mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
 
 // Write a binary heap snapshot to `fd` for offline analysis (see tools/mi-heapview.c and
-// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Bun parity (#338):
-// format version 1 is byte-identical to oven-sh/mimalloc's.
+// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Covers the arenas and
+// heaps of every sub-process, holding the sub-process registry lock for the whole write: a
+// call from inside a gated allocator operation (a callback) holds up a concurrent
+// mi_purge_all_ex until that purge's deadline. Bun parity (#338): format version 1 is
+// byte-identical to oven-sh/mimalloc's.
 // #414: compiled in only with MI_DIAGNOSTICS=1 (CMake -DMI_DIAGNOSTICS=ON, cargo feature
 // `diagnostics`; default OFF). Without it both entry points link and return -1, and
 // `mi_option_snapshot_on_exit` below still exists but has nothing to run.
@@ -699,6 +702,7 @@ typedef enum mi_option_e {
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
+  mi_option_large_span_max,             // the largest span (KiB) a demand-grown large page grows to (=1024: 1 MiB, two blocks of every large bin). 0 = 4 MiB (the #532 policy); a page always holds at least two blocks (#575)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,

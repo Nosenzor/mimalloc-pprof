@@ -15,6 +15,9 @@ use benchmark_suite::scaling::{
     THREAD_CHURN_BLOCKS, THREAD_CHURN_POST_DRAIN_OFFSETS_MS, THREAD_CHURN_THREADS,
 };
 use benchmark_suite::scaling::{merge_scaling_runs, scaling_thread_points_for_shard};
+use benchmark_suite::scaling::{
+    rss_floor_within_slack, ScalingMetricReport, SCALING_RSS_FLOOR_SLACK_PERCENT,
+};
 
 /// Leak-detecting mock allocator. `Drop` asserts every block was released, so
 /// any oracle/executor drift shows up as a failure rather than a leak.
@@ -1030,6 +1033,62 @@ fn validator_rejects_a_floor_that_is_inconsistent_or_above_a_measured_peak() {
     let mut missing = good;
     missing.rss.as_mut().unwrap().floor_summaries.pop();
     assert!(validate_scaling_report(&missing).is_err());
+}
+
+/// Lowers one allocator's measured peaks in the first floored cell so that the
+/// cell's floor sits `percent` of its new lowest RSS (the real-world shape: an
+/// allocator running close to the floor), and rebuilds the report.
+fn report_with_floor_at_percent_of_lowest(percent: u64) -> ScalingMetricReport {
+    let mut raw = sample_run();
+    let good = build_scaling_report(&raw).unwrap();
+    let floor = &good.rss.as_ref().unwrap().floor_summaries[0];
+    let (pattern, threads, floor_bytes) = (
+        floor.pattern.clone(),
+        floor.thread_count,
+        floor.floor_rss_bytes,
+    );
+    let lowered = floor_bytes * 100 / percent;
+    let allocator = raw
+        .samples
+        .iter()
+        .find(|sample| sample.pattern == pattern && sample.thread_count == threads)
+        .unwrap()
+        .allocator_id
+        .clone();
+    for sample in raw.samples.iter_mut().filter(|sample| {
+        sample.pattern == pattern
+            && sample.thread_count == threads
+            && sample.allocator_id == allocator
+    }) {
+        sample.peak_rss_bytes = lowered;
+    }
+    build_scaling_report(&raw).unwrap()
+}
+
+#[test]
+fn validator_tolerates_a_floor_within_the_measurement_slack() {
+    // #534: the floor comes from a separate live-telemetry replay and the peaks are
+    // polled, so an allocator running close to it dips a little under it (jemalloc,
+    // large-class-ephemeral/1: 9.52 MiB against a 9.76 MiB floor failed every full run).
+    assert!(rss_floor_within_slack(100, 100));
+    assert!(rss_floor_within_slack(
+        100 + SCALING_RSS_FLOOR_SLACK_PERCENT,
+        100
+    ));
+    assert!(!rss_floor_within_slack(
+        101 + SCALING_RSS_FLOOR_SLACK_PERCENT,
+        100
+    ));
+    let within = report_with_floor_at_percent_of_lowest(100 + SCALING_RSS_FLOOR_SLACK_PERCENT / 2);
+    assert!(
+        validate_scaling_report(&within).is_ok(),
+        "a floor within the slack is noise"
+    );
+    let beyond = report_with_floor_at_percent_of_lowest(100 + SCALING_RSS_FLOOR_SLACK_PERCENT + 5);
+    assert!(
+        validate_scaling_report(&beyond).is_err(),
+        "a floor beyond the slack is a bug"
+    );
 }
 
 #[test]
