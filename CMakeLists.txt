@@ -75,6 +75,7 @@ option(MI_PPROF             "Enable the allocation sampling profiler (#414: opt-
 option(MI_MEMEVT            "Enable allocation-change accounting and callbacks (#414: opt-in, default OFF)" OFF)
 option(MI_DIAGNOSTICS       "Enable the heap snapshot and the live-heap JSON dump (#414: opt-in, default OFF)" OFF)
 option(MI_DHAT              "Enable the exact DHAT v2 heap observer (#371: hooks cost nothing when OFF; opt-in, default OFF)" OFF)
+option(MI_USDT              "Static tracepoints (USDT probes) at the slow paths, for perf/bpftrace (#573; needs <sys/sdt.h>; opt-in, default OFF)" OFF)
 option(MI_OWNER_GATE        "Take a per-thread owner gate on every allocator call so mi_purge_all can sweep every thread (#366; slower fast path)" OFF)
 option(MI_STRICT_WARNINGS     "Strict diagnostics on the fork's own sources (#373); default ON" ON)
 option(MI_WARNINGS_AS_ERRORS  "Make compiler warnings fatal (-Werror, or /WX on MSVC). OFF for consumers, ON in CI (#373)" OFF)
@@ -91,6 +92,7 @@ set(mi_sources
     src/arena.c
     src/arena-reclaim.c
     src/arena-layout.c
+    src/event-counters.c
     src/bitmap.c
     src/heap.c
     src/heap-dump.c
@@ -489,7 +491,7 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
                       src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
-                      src/arena-layout.c src/large-span.c)
+                      src/arena-layout.c src/event-counters.c src/large-span.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()
@@ -597,6 +599,18 @@ else()
   # no flag load, no instruction -- and dhat.c keeps only stubs for the public API.
   message(STATUS "Compile out the DHAT observer (MI_DHAT=OFF)")
   list(APPEND mi_defines MI_DHAT=0)
+endif()
+
+if(MI_USDT)
+  # #573 A5: static tracepoints in the slow paths (include/mimalloc/usdt.h). Nothing else changes.
+  include(CheckIncludeFile)
+  check_include_file(sys/sdt.h MI_HAVE_SYS_SDT_H)
+  if(MI_HAVE_SYS_SDT_H)
+    message(STATUS "Static tracepoints at the slow paths (MI_USDT=ON)")
+    list(APPEND mi_defines MI_USDT=1)
+  else()
+    message(WARNING "MI_USDT=ON but <sys/sdt.h> was not found (systemtap-sdt-dev): no probes are compiled in")
+  endif()
 endif()
 
 if(MI_DEBUG_TSAN)
@@ -838,7 +852,7 @@ endif()
 # set language for source files now
 if(MI_USE_CXX)
   set_source_files_properties(${mi_sources} PROPERTIES LANGUAGE CXX )
-  set_source_files_properties(test/test-diagnostic-walks.c PROPERTIES LANGUAGE CXX)
+  set_source_files_properties(test/test-diagnostic-walks.c test/test-snapshot-walk.c PROPERTIES LANGUAGE CXX)
   # #272 (P7b): test-purge-holes.c and test-profile-race.c reach `mimalloc/internal.h`
   # (`_mi_ptr_page`, `mi_page_block_is_purged`, `_mi_os_page_size`, ...), which is NOT wrapped
   # in `extern "C"`. With MI_USE_CXX the library's symbols are C++-mangled, so a C test cannot
@@ -857,7 +871,7 @@ if(MI_USE_CXX)
   # test-resident-first-churn.c (#517): calls `_mi_arena_claim_counters` from internal.h, the same case.
   # test-arena-layout.c (#519): calls `_mi_arena_layout_walk` from internal.h, the same case.
   # test-large-span.c (#532): reads `_mi_ptr_page` / `mi_page_t` from internal.h, the same case.
-  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-large-span.c PROPERTIES LANGUAGE CXX )
+  set_source_files_properties(src/static.c test/test-api.c test/test-api-fill.c test/test-stress.c test/test-stress-heaps.c test/test-stress-subprocs.c test/test-lock-reentrancy.c test/test-tls-controls.c test/test-purge-holes.c test/test-profile-race.c test/test-abandoned-lazy.c test/test-arena-purge-rearm.c test/test-resident-first-churn.c test/test-arena-layout.c test/test-event-counters.c test/test-large-span.c test/test-large-fungible.c PROPERTIES LANGUAGE CXX )
 endif()
 
 
@@ -1270,6 +1284,22 @@ if (MI_BUILD_TESTS)
   endif()
   add_test(NAME test-subproc-lifecycle COMMAND mimalloc-test-subproc-lifecycle)
   set_tests_properties(test-subproc-lifecycle PROPERTIES TIMEOUT 600)
+
+  # #554: mi_subproc_destroy released the CALLING thread's thread locals even when that
+  # thread belongs to another sub-process; a heap created afterwards then tripped
+  # mi_page_is_valid_init. The assertion only exists at MI_DEBUG>=3, so the debug-full
+  # rows are the RED check; every row checks heap ownership.
+  add_executable(mimalloc-test-subproc-destroy-tls test/test-subproc-destroy-tls.c)
+  target_compile_definitions(mimalloc-test-subproc-destroy-tls PRIVATE ${mi_defines})
+  target_compile_options(mimalloc-test-subproc-destroy-tls PRIVATE ${mi_cflags})
+  target_include_directories(mimalloc-test-subproc-destroy-tls PRIVATE include)
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    target_link_libraries(mimalloc-test-subproc-destroy-tls PRIVATE mimalloc-static ${mi_libraries})
+  else()
+    target_link_libraries(mimalloc-test-subproc-destroy-tls PRIVATE mimalloc ${mi_libraries})
+  endif()
+  add_test(NAME test-subproc-destroy-tls COMMAND mimalloc-test-subproc-destroy-tls)
+  set_tests_properties(test-subproc-destroy-tls PROPERTIES TIMEOUT 120)
 
   # Commit-fail fault injection (issue #271, Bun parity P6): imported from
   # oven-sh/mimalloc @ 942b8342, MIT. Needs the MI_DEBUG-only mi_debug_fail_os_commit_after
@@ -1884,6 +1914,22 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-snapshot-exit PRIVATE mimalloc ${mi_libraries})
   endif()
   add_test(NAME test-snapshot-exit COMMAND mimalloc-test-snapshot-exit test-snapshot-exit.bin)
+  # The writer against the arena table and the sub-process registry: a released arena's NULL
+  # slot inside `arena_count`, and a second sub-process. White-box (it reads
+  # `subproc->arenas[]`), so static-only, and C++ under MI_USE_CXX, like test-diagnostic-walks.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-snapshot-walk test/test-snapshot-walk.c)
+    target_compile_definitions(mimalloc-test-snapshot-walk PRIVATE ${mi_defines} MI_STATIC_LIB)
+    target_compile_options(mimalloc-test-snapshot-walk PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-snapshot-walk PRIVATE include)
+    target_link_libraries(mimalloc-test-snapshot-walk PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-snapshot-walk PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-snapshot-walk COMMAND mimalloc-test-snapshot-walk test-snapshot-walk.bin)
+    set_tests_properties(test-snapshot-walk PROPERTIES TIMEOUT 120 ENVIRONMENT "MIMALLOC_SCAVENGER=0")
+  endif()
   endif()
 
   # #339: macOS malloc-zone introspection (what `leaks`/`heap`/`vmmap` call). Darwin-only:
@@ -2179,6 +2225,23 @@ if (MI_BUILD_TESTS)
     set_tests_properties(test-large-span PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
   endif()
 
+  # test-large-fungible (#575): large-bin pages are fungible -- a busy bin stops growing at the span
+  # cap (1 MiB), and a thread rotating through the bins repurposes one page instead of keeping one
+  # per bin. Structural checks only; a fresh thread per case.
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-large-fungible test/test-large-fungible.c)
+    target_compile_definitions(mimalloc-test-large-fungible PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-large-fungible PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-large-fungible PRIVATE include)
+    target_link_libraries(mimalloc-test-large-fungible PRIVATE mimalloc-static ${mi_libraries})
+    if(NOT WIN32)
+      find_package(Threads REQUIRED)
+      target_link_libraries(mimalloc-test-large-fungible PRIVATE Threads::Threads)
+    endif()
+    add_test(NAME test-large-fungible COMMAND mimalloc-test-large-fungible)
+    set_tests_properties(test-large-fungible PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
+  endif()
+
   # test-resident-first-churn (#517): the memory gate's thread-churn scenario must not claim
   # never-dirty (fresh) arena slices once warmed up; small/medium claims taking resident-first
   # runs did (#514). Asserts on the MI_DIAGNOSTICS claim counters, so it needs that build.
@@ -2210,6 +2273,18 @@ if (MI_BUILD_TESTS)
     target_link_libraries(mimalloc-test-arena-layout PRIVATE mimalloc-static ${mi_libraries})
     add_test(NAME test-arena-layout COMMAND mimalloc-test-arena-layout)
     set_tests_properties(test-arena-layout PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
+  endif()
+
+  # test-event-counters (#573 A2): the slow-path event counters and the retire-cascade budget.
+  # Built in EVERY configuration (with MI_DIAGNOSTICS it counts, without it checks the stubs).
+  if(MI_BUILD_STATIC AND NOT MI_DEBUG_TSAN)
+    add_executable(mimalloc-test-event-counters test/test-event-counters.c)
+    target_compile_definitions(mimalloc-test-event-counters PRIVATE ${mi_defines})
+    target_compile_options(mimalloc-test-event-counters PRIVATE ${mi_cflags})
+    target_include_directories(mimalloc-test-event-counters PRIVATE include)
+    target_link_libraries(mimalloc-test-event-counters PRIVATE mimalloc-static ${mi_libraries})
+    add_test(NAME test-event-counters COMMAND mimalloc-test-event-counters)
+    set_tests_properties(test-event-counters PROPERTIES TIMEOUT 60 ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_ZEROES=0")
   endif()
 
   # test-purge-all (#366): `mi_purge_all` / `MI_OWNER_GATE` acceptance, every row of

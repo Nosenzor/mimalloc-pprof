@@ -239,6 +239,9 @@ class VerifyLocalDriftTests(unittest.TestCase):
             "diag",
             "rust",
             "lint",
+            # #573 D: multi-threaded perf_ab rows under a debug build and under TSAN (no CI twin)
+            "stress",
+            "tsan",
             "asan",
         ]
         self.assertEqual(verify_local.CONFIG_NAMES, expected)

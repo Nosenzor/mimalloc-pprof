@@ -20,8 +20,9 @@ uv run ci/verify_local.py --keep-going          # run every config even after on
 uv run ci/verify_local.py --selftest            # trivially fast dry-run, no real builds
 ```
 
-Eleven configs run concurrently (`release`, `off`, `debug-full`, `guarded`, `shared`,
-`bundle`, `memory-gate`, `diag`, `rust`, `lint`, `asan`), each building into its own directory
+Configs run concurrently (`release`, `off`, `debug-full`, `guarded`, `shared`,
+`bundle`, `memory-gate`, `diag`, `rust`, `lint`, `asan`, and `stress` and `tsan`, which have no CI
+twin, #573), each building into its own directory
 under `out/verify/<config>/` (gitignored, incremental across invocations) with Ninja
 and ccache when available. `asan` needs `clang`/`clang++` on `PATH` and reports
 SKIPPED with a reason otherwise. The long tests (`test-profile-race`,
@@ -113,6 +114,178 @@ If Docker Desktop is unavailable, the documented fallback is a host-side soldr
 cross-build followed by a slim Linux runtime container. It is slower because
 the build runs on the Windows filesystem; run the Docker recovery tool first.
 
+## Explaining an allocator change before timing it (#573)
+
+Explain a memory or CPU change with event counts and residency first, and use `perf-ab` to
+confirm it, not to explore. The safety nets that make that cheap:
+
+- **Stats in the untimed replay.** A `perf-ab` dispatch with `holes_report` builds the replay
+  with `MI_DIAGNOSTICS=ON` and `MI_STAT=1` and sets `MIMALLOC_SHOW_STATS=1`, so each row and arm
+  prints the pages, abandoned, reclaim and retire counters next to `mi_purge_holes_report()`.
+  Nothing timed is perturbed.
+- **First-repetition sanity gate.** Repetition 0 of every row is compared before the rest run.
+  A head arm whose peak RSS, RSS after drain or RSS at the release bound exceeds
+  `1.5 x base + 8 MiB` fails the job at once (`SANITY_FACTOR`, `SANITY_SLACK_MIB` in
+  `ci/perf_ab.py`). A dispatch that is meant to trade memory away sets `sanity_gate: false`.
+- **One live run per PR.** `perf-ab` cancels its older run on a new push, and only the
+  `perf-ab` label itself starts a run. Trap (#575): pushing to a PR branch (even a docs or
+  regenerated-amalgamation commit) cancels an in-flight 15-rep run, so do not push until the
+  ledger is in; dispatch against a `head_sha` instead. A guard is on #585. `head_sha` dispatches a commit other than the ref the
+  workflow runs from.
+- **Page-map check.** At `MI_DEBUG>=2`, `_mi_page_init` asserts that the page map resolves the
+  first byte and the last byte of a page's blocks to that page. A re-carve that changes a page's
+  geometry without re-registering it fails on the first local debug ctest, not in a
+  multi-threaded perf run. `test-large-span` case (g2) re-carves every ordered pair of large
+  sizes on one thread at a time.
+- **`mi_theap_t` size budget.** `MI_THEAP_META_MAX_SIZE` (types.h) is a compile-time budget on
+  `sizeof(mi_theap_t) + MI_PADDING_SIZE`: the meta-allocator size class it sits in is the edge
+  that made CI ASan `test-resident-first-churn` flaky. Put new per-thread state in `mi_tld_t`.
+
+## Perf campaign method (#575 retrospective)
+
+The #575 campaign took `large-class-persistent/8` from 2.3-2.5x to about 1.0x jemalloc peak RSS
+in two rounds; the method below is what worked. Data lives on #575 and PRs #582-#584 (#582's commits landed via #584); do not
+copy it here.
+
+1. **Step 0 is attribution, and earlier claims are hypotheses.** #575's issue text said
+   `persistent` "has few retired pages"; the probe showed 43% of its peak RSS was resident,
+   empty, retired large pages. Run `uv run ci/attribution_probe.py --reps 5` before designing
+   anything. The tool is on `main` (landed via #584; #582 was closed as landed). It builds `MI_DIAGNOSTICS=ON MI_STAT=1`, runs `ci/perf_ab.c` rows `large-class/8`
+   and the `sparse-large-buffers/8` twin with `PERF_AB_HOLES_REPORT=1`, and, with every worker
+   still holding its live slots, has each print `mi_purge_holes_report()`, which `mincore`-walks
+   every page. It is untimed, so it may run locally. Buckets (they sum to the snapshot RSS;
+   peak equals snapshot within ~0.3 MiB):
+   - *live requested* and *block rounding*: bytes the application asked for, and the rest of
+     its blocks;
+   - *formed free blocks*: carved, free, resident blocks in pages with a live block or in empty
+     pages;
+   - *empty (retired) pages, resident*: retired pages reset to `capacity = 0` whose old bytes
+     are still resident (reported as "unformed");
+   - *unformed tail*: resident bytes past `capacity` in pages that still have a live block
+     (re-carved over dirty slices);
+   - *page-geometry slack*: bytes past `reserved*block_size`, plus the header;
+   - *free slices queued for purge* and *aged/dirty/fresh*: arena free-slice states (arena walk);
+   - *outside the arena*: meta, stacks, binary (`smaps_rollup` for kernel RSS and
+     AnonHugePages). Varies 27-33 MiB run to run for the queued bucket; the rest is stable to
+     about 1 MiB. Compare ratios across hosts, not absolute MiB.
+2. **Hotness predicts refault cost.** Round 1 returned retired pages to the OS and lost up to
+   10x CPU (+107% to +1080%, refault ~190 us against a ~1 us op) because those bytes were the hot
+   working set, reused within ~10 operations. Before any discard, decommit or purge policy,
+   measure the reuse distance of the target bucket. Prefer zero-refault designs that make
+   resident bytes fungible across bins, spans and sizes (#584: repurpose budget, 1 MiB span cap,
+   `MI_LARGE_AGE_STEP`).
+3. **Rejected, do not retry** (details on #575): discarding retired-page bodies at retire or at
+   a heartbeat, with any keep count or age gate (#583, `mi_option_retired_keep`, default-off);
+   raising the repurpose budget alone (saved 26%, CPU +17.1% against 8.6% allowed); a 2 MiB
+   span cap; budget 256; aging on every large miss; never aging on a large miss
+   (random-large/8 peak +12.3%); aging once per 8 generic mallocs (random-large/1 drain RSS
+   +3.9%). Queued-slice reuse (H1) was already 98% resident-first; THP off saves only ~6%.
+4. **Step 2, "CPU-model noise or real?" is settled by a same-host paired run.** Dispatch
+   `benchmark-scaling` with `mode=diagnostic`, 15 blocks, the cells in question, and read the
+   fork/upstream ratio-of-medians with a 95% block bootstrap. Fork, pinned upstream, jemalloc,
+   TCMalloc and Bun run the same blocks on one VM, so the CPU model cancels. Result (#575
+   comment 5913744857, run 36701407919): fork/upstream throughput 0.925 [0.878, 0.968] at
+   persistent/8 and 0.89-0.96 across the large and larson cells, control 0.99; a real regression
+   in the large/retire/purge paths. Follow-up on #585.
+5. **Tooling traps.**
+   - `benchmark-scaling` above 15 blocks blows the 1500 s shard budget on the 8-worker shard.
+   - Pushing to a PR branch cancels an in-flight `perf-ab` run (see above).
+   - `perf-ab` has no p99 column, although rule 12 demands p99. Until #585 adds one, the PR
+     ledger must say "p99: not measured" instead of omitting it.
+   - The 8-worker cells run on a 4-vCPU EPYC 7763 VM (2 physical cores), 2:1 oversubscribed:
+     they measure contention under oversubscription, not core scaling.
+   - A local untimed residency probe is allowed; timing is CI-only (see the memory gate loop
+     below).
+
+### The perf-ab pipeline (#573 B3-B8)
+
+```bash
+# dispatch, wait, print the rule-12 ledger (the wrapper is the sanctioned way to wait)
+uv run ci/perf_ab_dispatch.py --ref perf/my-branch --reps 15 --null-arm --max-reps 25
+# several knob values in ONE rotation on ONE VM: variants split on ' || '
+uv run ci/perf_ab_dispatch.py --ref perf/my-branch --head-env 'MIMALLOC_X=4 || MIMALLOC_X=16 || MIMALLOC_X=32'
+# re-judge, or pool, downloaded artifacts (pooling refuses another CPU model or other commits)
+uv run ci/perf_ab_dispatch.py --from-json a.json b.json
+```
+
+- **Raw samples.** Every run uploads `perf-ab-samples` (`perf-ab-samples.json`): per-repetition
+  values for every row and arm, the base and head SHAs, defines, environment, CPU model and the
+  RSS floor. `ci/perf_ab_ledger.py` judges them; nothing is scraped from a log.
+- **Rule-12 ledger.** Per row: `saved%` of the reducible peak-RSS gap (against the RSS floor
+  `ci/perf_ab.c` prints: the RSS before the work plus the live requested bytes), then for
+  throughput, CPU, faults, peak and after-drain RSS the paired change, its allowance (`saved%/3`
+  for the first three, noise for memory and for cells that saved nothing) and PASS, FAIL or
+  INCONCLUSIVE. INCONCLUSIVE is not a pass.
+- **Honest intervals.** The interval on a median is the distribution-free sign-test interval, not
+  a percentile bootstrap (anticonservative at 7 or 15 reps). Only the rule-12 metrics are marked.
+- **Noise floor.** `null_arm` measures base a second time in the same rotation; a difference is
+  marked only when it exceeds what base-vs-base produced. A control counts as unchanged when its
+  whole interval lies inside +-`EQUIVALENCE_MARGIN_PCT` (3%, an owner decision that is still open).
+- **Adaptive reps.** `max_reps` adds 5 reps at a time to the rows whose ledger is still
+  INCONCLUSIVE, up to that many; conclusive rows stop at `reps`.
+- **`fp` build.** `--force-kind fp` builds every row with `-fno-omit-frame-pointer`, for
+  `perf record -g` and caller-report shims.
+
+### Local tooling (#573 C)
+
+The dev box is a loaded Ryzen 3700X: never time on it, but attribute on it.
+
+- **Kernel symbols.** `kernel.kptr_restrict=0` (NixOS: `boot.kernel.sysctl."kernel.kptr_restrict" = 0;`)
+  makes kernel samples (faults, madvise, THP zeroing) resolvable; tracefs access gives
+  `perf trace -s` (mmap/madvise/munmap counts) and `perf probe`.
+- **Instructions, not seconds.** `taskset -c 2 perf stat -r 10 -e instructions:u,cycles:u,minor-faults ./perf_ab ...`
+  is largely immune to host load and answers "did this add user instructions per op" in minutes;
+  `valgrind --tool=cachegrind` `Ir` is an exact pre-screen (use single-thread rows, or the
+  scavenger off, for stable counts). Neither replaces perf-ab for cache contention or kernel time.
+- **Call graphs.** `perf record --call-graph dwarf` plus `perf report --inline` replaces the
+  frame-pointer rebuild and the `LD_PRELOAD` `clock_gettime` shim; the `fp` kind above covers
+  `perf record -g`. On Zen2 use `ibs_op//`, not LBR.
+- **Races that never show under gdb.** `rr record --chaos` (after `scripts/zen_workaround.py`) and
+  `rr replay`; fallback `coredumpctl debug -A "-batch -ex 'thread apply all bt full'"`.
+- **Layouts.** `clang -Xclang -fdump-record-layouts -fsyntax-only -Iinclude -D... src/static.c`,
+  or `pahole`, per configuration; `MI_THEAP_META_MAX_SIZE` is the compile-time budget.
+- **Not worth it here:** heaptrack, bytehound and massif profile an application's malloc calls,
+  not the allocator's internals; magic-trace needs Intel PT; `perf c2c` needs `ldlat`, which this
+  `ibs_op` lacks; coz and DAMON are too noisy for these questions.
+
+### Debug stress lane (#573 D)
+
+`uv run ci/verify_local.py --only stress,tsan` runs the multi-threaded perf_ab rows (large-class,
+ephemeral generations, bursty idle drain, random-large, small, larson) at small operation counts
+against a `MI_DEBUG_FULL` build and against a `clang -fsanitize=thread` build (`STRESS_OPS` in
+`ci/verify_local.py`). A row fails on a non-zero exit, an assertion or a TSAN report. These are the
+workloads that exposed #572's page-map extent and retired-slot mask bugs, which only the
+label-gated release-build perf-ab job ran. The inherited TSAN row of `test.yaml` runs only on
+`dev*` pushes and tags, so it never sees this fork's PRs.
+
+**Diagnosis order: events before timing.** Explain a change with event counts and residency
+first; use perf-ab to confirm, not to explore.
+
+### Benchmark scaling: diagnostics, caches and alerts (#573 B7, B9)
+
+- **Diagnostic sweeps take 15 blocks per cell in practice** (`MIN_DISPATCH_BLOCKS` in
+  `ci/scaling_diagnostic.py` enforces only the floor of 15, before anything is built). A 5-block
+  sweep left a 30-45 MiB spread per cell and produced a false +6-12% RSS regression; 15 resolved
+  single cells. More than 15 blocks over the 8-worker shard exceeds the runner's 1500 s projected
+  budget (#575: 30 blocks projected 2150 s, 40 blocks 1503 s, both failed before measuring); the
+  workflow's "15-40" input text is wrong until #585 fixes the cap. Use 15, or narrow
+  `diagnostic_patterns` / `diagnostic_threads` and pool runs.
+- **Two allocator caches.** `benchmark-scaling.yml` restores the four reference allocators (TCMalloc,
+  jemalloc, upstream and Bun mimalloc) keyed on their pins, patches and the builder only, and the
+  fork's tree keyed on its own sources and the diagnostic defines, so a C change no longer rebuilds
+  TCMalloc. `ci/check_benchmark_scaling_workflow.py` pins both keys.
+- **A failing scheduled run opens an issue.** The `alert` job (schedule only) runs
+  `ci/scaling_failure_alert.py`: one open issue, "benchmark-scaling: the scheduled run is
+  failing", collects the run links and failed jobs of a streak; close it when a run succeeds. The
+  RSS-floor validation break of 2026-09-28 failed every daily run for over a day unseen.
+- **The RSS-floor rule cannot drift.** The producer (`scaling.rs`) and the validator
+  (`benchmark_report.py`) decide floor consistency with `floor * 100 <= lowest * (100 + slack)`.
+  `ci/check_benchmark_scaling_workflow.py` compares the constant and the formula on every `ci/` PR,
+  and both test suites load `rust/benchmark-suite/tests/fixtures/rss_floor_vectors.json`.
+- **Multi-threaded stress on PRs.** The `stress` job of `asan.yml` (labels `ci-test` / `ci-full`)
+  runs `ci/verify_local.py --only stress,tsan`: the perf_ab large-size, generation and idle-drain
+  rows under `MI_DEBUG_FULL` and under clang TSAN.
+
 ## Memory gate: fast local loop (#517)
 
 Memory measurements are fine to take locally: a peak RSS on this box is stable to about
@@ -201,3 +374,53 @@ size class (`mi_chunkbin_t`), counts the runs of each kind with power-of-two run
 histograms. #514's signature was queued runs growing while small/medium claims spilled into
 fresh chunks; that shows up here without a bisect. Without `MI_DIAGNOSTICS` the section is
 absent and `mi_holes_report_t.arena_layout` stays zero.
+
+## Events, residency, probes and static checks (#573 A2-A5)
+
+Explain a change with counts and residency before timing it. These need no source patch:
+
+- **Event counters.** Build with `MI_DIAGNOSTICS=ON`; `mi_stats_print` and `mi_purge_holes_report`
+  end with one line, e.g. `events (#573): large_page_request=65 large_repurpose=64
+  large_repurpose_denied=1 ...` (fresh large-page requests, repurposes and denials, retired
+  publish/unpublish, page-map register/re-extent, large-span grow/shrink, arena page alloc/free).
+  The perf-ab `holes_report` replay prints them for both arms. `test-event-counters` uses them as a
+  deterministic budget for the retire cascade of #572 (548K page requests against 292): within one
+  heartbeat a thread repurposes at most `MI_LARGE_REPURPOSE_FRESH` retired pages.
+- **Residency.** The arena layout walk prints `resident (mincore)` per kind (in use, fresh, dirty,
+  queued, aged) next to what the bitmaps say, and the holes report lists per bin the empty pages,
+  the retired pages and the RAM those hold. A "fresh" slice can be resident (THP faults in its whole
+  2 MiB region); this replaces the scratch `mincore` probe.
+- **A failed assertion** prints a backtrace (`backtrace_symbols_fd`, no allocation; `addr2line -e
+  <binary>` resolves it without `-rdynamic`), and a page-map or geometry failure first prints the
+  page with `_mi_page_debug_print`.
+- **USDT probes.** `-DMI_USDT=ON` (needs `<sys/sdt.h>`, `systemtap-sdt-dev`) puts six probes in the
+  slow paths (`page_fresh`, `page_repurpose`, `arena_page_alloc`, `arena_page_free`,
+  `retired_publish`, `retired_release`); a probe is a NOP until a tracer attaches, so
+  `perf stat -e 'sdt_mimalloc:*'` or `bpftrace -e 'usdt:./app:mimalloc:page_fresh { @[arg0] = count(); }'`
+  answers "how often, with what arguments" without a rebuild. The default build has none
+  (`ci/check_usdt_probes.py`).
+
+Static checks that would have caught #572's bugs at compile time or on the first local run:
+
+- **One writer of a page's geometry.** `block_size` and `reserved` change in `mi_page_set_geometry`
+  (src/page.c), which owns the page-map re-registration; the arena writes them only when it creates
+  or frees a page. `ci/check_page_geometry_writes.py` fails any other write to `page->block_size` or
+  `page->reserved` under `src/`.
+- **Retired-slot mask.** At `MI_DEBUG>=2` a publish asserts that the owner-private mask never claims
+  fewer slots than the slots hold, and `_mi_page_unpublish_retired` takes the owner's tld from the
+  caller (`_mi_page_free` clears `page->theap` first).
+- **Struct size budget.** `ci/struct_size_budget.json` and `ci/check_struct_sizes.py` bound
+  `mi_theap_t` (plus padding) and `mi_tld_t`, which sit at the edge of their size classes, in every
+  configuration CI compiles; `MI_THEAP_META_MAX_SIZE` in types.h must equal the budget. To add a
+  field to either: run the script; if it fails, the field does not fit -- put the state in the other
+  struct or shrink something, and only then raise the budget and the constant together, with the
+  size class checked.
+
+**Finding (not fixed here).** A commit-stat reconciliation at `mi_process_done` (asserting
+`stats.committed.current >= 0`) fails in 9 of the 84 debug-full tests, by up to 2.6 MB. It is not an
+allocator bug: on POSIX the arenas are committed at reserve (every commit bit set), so `committed`
+is never credited at claim time, while a debug build's purge decommits (`mprotect`, because
+`_mi_prim_decommit_zero` uses `madvise` only when `!MI_DEBUG`) and debits `committed` for slices that
+were never credited. Release builds never debit, so the statistic there is exact; on Windows the
+arenas start uncommitted. The invariant therefore holds only where the debit path never runs, and
+the check was not shipped.

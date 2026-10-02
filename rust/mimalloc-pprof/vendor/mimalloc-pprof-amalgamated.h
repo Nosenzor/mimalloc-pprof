@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 179880b7 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit ec5b2581 of the public headers (mimalloc.h, mimalloc/profile.h, mimalloc/memory-events.h, mimalloc/dhat.h). Regenerate with: cargo run -p xtask -- amalgamate-h */
 
 /* ---- begin inlined: include/mimalloc.h ---- */
 /* ----------------------------------------------------------------------------
@@ -224,8 +224,7 @@ mi_decl_export void mi_on_thread_idle_end(void) mi_attr_noexcept;
 // `MI_OWNER_GATE=1`, or for threads parked in `mi_on_thread_idle_start`) every other
 // registered thread's pages and holes -- and reports exactly what it could not reach.
 typedef enum mi_purge_flags_e {
-  MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed thread's hole walk and phase checks ignore
-                        // park_reclaim (its collect and abandoned-page pass still stop at the owner's reclaim)
+  MI_PURGE_FORCE = 1,   // ignore purge_delay / hole-purge pacing; a claimed sweep runs to completion (ignores park_reclaim)
   // After the walk (phase F, docs/arena-reclaim.md): give back allocator-owned arenas
   // of every sub-process that are COMPLETELY free. Arenas created through the public
   // reserve/manage APIs are retained, including non-exclusive arenas and those whose
@@ -240,9 +239,8 @@ typedef enum mi_purge_flags_e {
 } mi_purge_flags_t;
 
 typedef struct mi_purge_all_report_s {
-  size_t arena_bytes;        // returned to the OS by the arena passes (plus the sweep's unformed-tail discards)
-  size_t hole_bytes;         // free blocks discarded by hole purging (every swept theap + abandoned pages); the
-                             // sweep's unformed-tail discards are not in it and count in `arena_bytes`
+  size_t arena_bytes;        // returned to the OS by the arena passes
+  size_t hole_bytes;         // returned by hole purging (every swept theap + abandoned pages)
   size_t theaps_swept;       // tlds claimed and swept by this call (the caller included)
   size_t theaps_pending;     // registered tlds not reached within `wait_ms`
   size_t theaps_orphaned;    // pre-fork tlds of vanished threads, never touched
@@ -264,9 +262,7 @@ typedef struct mi_purge_all_report_s {
 mi_decl_export int  mi_purge_all_ex(mi_purge_flags_t flags, size_t wait_ms, mi_purge_all_report_t* report) mi_attr_noexcept;
 // == mi_purge_all_ex(force ? MI_PURGE_FORCE : 0, 100, NULL)
 mi_decl_export void mi_purge_all(bool force) mi_attr_noexcept;
-// Stop the background scavenger thread (see `mi_option_scavenger`). Permanent for this process
-// image: no later park or new thread starts it again (only a fork()ed child starts afresh), and a
-// due purge then runs inline on allocating threads, as upstream does.
+// Stop the background scavenger thread (it restarts on demand; see `mi_option_scavenger`).
 mi_decl_export void mi_scavenger_stop(void)     mi_attr_noexcept;
 
 // imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 / Bun parity P7b).
@@ -283,8 +279,7 @@ typedef struct mi_purge_holes_stats_s {
   size_t pages_freed;         // pages the sweep found completely free and gave back to the arena
   // What hole punching cannot reach: the pages the sweep found ineligible (a huge page, a
   // large page whose OS pages do not fit the bitmap, pinned memory, a custom-commit arena).
-  // Process-wide gauges: every thread's hole sweep zeroes them when it starts, and whatever is
-  // swept after that (another thread's sweep, a busy tick, `mi_purge_all`) adds to them.
+  // Gauges over the last idle sweep (`mi_on_thread_idle`), which resets them.
   size_t ineligible_pages;
   size_t ineligible_bytes;      // total size of those pages
   size_t ineligible_free_bytes; // the free (but not discardable) blocks inside them
@@ -447,11 +442,11 @@ typedef struct mi_heap_area_s {
 typedef bool (mi_cdecl mi_block_visit_fun)(const mi_heap_t* heap, const mi_heap_area_t* area, void* block, size_t block_size, void* arg);
 
 // THREAD SAFETY (#78): these are NOT safe to call while other threads are freeing into
-// `heap`. The implementation says so only in an internal comment -- without `claim_pages`,
-// `mi_heap_visit_os_pages` (the OS-page part of `_mi_heap_visit_blocks`) in src/arena.c reads
-// `heap->os_abandoned_pages` under `os_abandoned_pages_lock`, then walks the `page->next`
-// chain with the lock RELEASED, under the comment "we assume we are the only thread running
-// in this heap".
+// `heap`. The implementation says so only in an internal comment -- `_mi_heap_visit_blocks`
+// in src/arena.c reads `heap->os_abandoned_pages` under `os_abandoned_pages_lock`, then
+// walks the `page->next` chain with the lock RELEASED, above the comment "technically we
+// don't need the initial lock as we assume we are the only thread running in this
+// subproc".
 //
 // Under that assumption the unlocked walk is correct. But nothing in this header said so,
 // and nothing enforces it: a caller who visits a heap while another thread performs the
@@ -462,10 +457,8 @@ typedef bool (mi_cdecl mi_block_visit_fun)(const mi_heap_t* heap, const mi_heap_
 // overstates it -- it is reachable only by violating a precondition the implementation
 // does hold, which upstream simply never wrote down here. Documented rather than locked:
 // taking the lock across the whole walk would serialise visiting against every free on
-// the heap. Heap teardown does not depend on the precondition: `mi_heap_delete` and
-// `mi_heap_destroy` walk with `claim_pages`, which claims each page before visiting it --
-// an OS page under the list lock, an arena page by holding its bitmap bit cleared while it
-// takes ownership (#271).
+// the heap, and the callers that matter (heap teardown, our profiler's snapshot) do
+// satisfy the precondition.
 //
 // If you need to visit a live heap concurrently, that is not supported today.
 mi_decl_export bool   mi_heap_visit_blocks(mi_heap_t* heap, bool visit_blocks, mi_block_visit_fun* visitor, void* arg);
@@ -489,8 +482,11 @@ mi_decl_export void   mi_debug_show_arenas(void) mi_attr_noexcept;
 mi_decl_export void   mi_arenas_print(void) mi_attr_noexcept;
 
 // Write a binary heap snapshot to `fd` for offline analysis (see tools/mi-heapview.c and
-// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Bun parity (#338):
-// format version 1 is byte-identical to oven-sh/mimalloc's.
+// examples/heap-snapshot/). Returns 0 on success, -1 on write error. Covers the arenas and
+// heaps of every sub-process, holding the sub-process registry lock for the whole write: a
+// call from inside a gated allocator operation (a callback) holds up a concurrent
+// mi_purge_all_ex until that purge's deadline. Bun parity (#338): format version 1 is
+// byte-identical to oven-sh/mimalloc's.
 // #414: compiled in only with MI_DIAGNOSTICS=1 (CMake -DMI_DIAGNOSTICS=ON, cargo feature
 // `diagnostics`; default OFF). Without it both entry points link and return -1, and
 // `mi_option_snapshot_on_exit` below still exists but has nothing to run.
@@ -685,7 +681,7 @@ typedef enum mi_option_e {
   mi_option_prof_sample_rate,           // compat alias for the average byte interval between samples (=524288)
   mi_option_prof_bt_max,                // max captured stack depth for the profiler (=32)
   mi_option_prof_accum,                 // keep cumulative (alloc_*) profiler counters until mi_prof_reset (=0)
-  mi_option_prof_seed,                  // profiler sampling PRNG seed; 0 is an ordinary seed (still deterministic per thread) (=0)
+  mi_option_prof_seed,                  // profiler sampling PRNG seed; 0 = nondeterministic (=0)
   mi_option_prof_max_bytes,             // budget (in bytes) for profiler-internal arena memory; 0 = unbudgeted (=0)
   mi_option_memory_events,              // enable opt-in allocation-change accounting/callbacks (MIMALLOC_MEMORY_EVENTS) (=0)
   mi_option_purge_zeroes,               // zero-tracking (=0, #67/#337): after a decommit-purge that the OS documents as zero-filling, forget the slices were dirty so the next
@@ -702,6 +698,7 @@ typedef enum mi_option_e {
   mi_option_page_reserve,               // at thread exit, keep an empty large page for the next thread of the heap instead of freeing it (=1); released after MI_PAGE_RESERVE_RELEASE_MULT (=10) purge delays. 0 = free it (upstream) (#493)
   mi_option_resident_first,             // claim arena slices that are free but still resident (queued for purge) before any other free slices (=1). 0 = the plain search only (#493)
   mi_option_large_span,                 // size a new large page (blocks of ~84-512 KiB) from its size class's demand on the thread: compact first, growing to 4 MiB (=1). 0 = always 4 MiB (upstream) (#532)
+  mi_option_large_span_max,             // the largest span (KiB) a demand-grown large page grows to (=1024: 1 MiB, two blocks of every large bin). 0 = 4 MiB (the #532 policy); a page always holds at least two blocks (#575)
   _mi_option_last,
   // legacy option names
   mi_option_large_os_pages = mi_option_allow_large_os_pages,
@@ -846,7 +843,7 @@ typedef struct mi_prof_config_s {
      snapshot, and profile.proto scratch buffers are transient and always use
      _mi_os_alloc directly, never this arena, so they are never counted here. */
   size_t max_profiler_bytes;
-  uint64_t seed;                // 0 = the prof_seed option (MIMALLOC_PROF_SEED, default 0); sampling is deterministic per thread for every seed
+  uint64_t seed;                // 0 = nondeterministic
   bool accum;
   size_t max_stack_depth;       // 0 = default (32); compile cap 128
   const char* dump_at_exit;     // NULL = none; copied into the internal buffer
@@ -983,10 +980,9 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_modules_visit(mi_prof_module_visit
 
    ## Activation (runtime, once compiled in)
 
-   - `MIMALLOC_MEMORY_EVENTS=1` is read lazily, exactly once, the first time the
-     allocation hook runs (the free/realloc hooks never resolve it) -- never during
-     process startup. The result is cached; later allocator operations never re-read
-     the environment.
+   - `MIMALLOC_MEMORY_EVENTS=1` is read lazily, exactly once, the first time any
+     allocation/free/realloc hook runs -- never during process startup. The result is
+     cached; later allocator operations never re-read the environment.
    - `mi_memory_tracking_set_enabled` can also enable/disable tracking at any time,
      including before the first allocation. An explicit API call is always authoritative:
      if it runs before the first allocation, the later lazy environment read is skipped
@@ -1003,16 +999,10 @@ mi_decl_nodiscard mi_decl_export bool mi_prof_modules_visit(mi_prof_module_visit
 
    ## Callback contract
 
-   - Callbacks are invoked without the callback-table lock (it is acquired only to
-     snapshot the handler pointer, then released before the handler runs), and may
-     themselves call `mi_malloc`/`mi_free`/etc. For a caller's own allocation no
-     allocator lock is held either, but an event raised by the allocator's internal
-     bookkeeping can run under an allocator lock further up the stack: e.g. a non-main
-     heap's `arena_pages_lock` while its per-arena page table is allocated from the main
-     heap, or `mi_subprocs_lock` + `heaps_lock` + `tlds_lock` while `MI_PURGE_RECLAIM`
-     frees those tables. A handler must therefore not create heaps or sub-processes,
-     allocate from a non-main heap, or call `mi_prof_start` (whose walk takes
-     `mi_subprocs_lock`). Callbacks must be short and non-blocking.
+   - Callbacks are invoked with no mimalloc allocator locks held, and may themselves
+     call `mi_malloc`/`mi_free`/etc. without deadlocking (the callback-table lock is
+     acquired only to snapshot the handler pointer, then released before the handler
+     runs). Callbacks must still be short and non-blocking.
    - A memory-change hook invoked while another hook's callback is already running on
      the same thread (including as a side effect of that callback allocating/freeing)
      is suppressed: no accounting update and no nested callback invocation. This bounds
@@ -1094,11 +1084,8 @@ mi_decl_nodiscard mi_decl_export bool mi_memory_snapshot(mi_memory_snapshot_t* o
 
 /* ---------------------------------------------------------------------------------------------
    Best-effort live-allocation visitor (diagnostics only; not a consistent global snapshot).
-   NOT built on mi_heap_visit_blocks: it walks the page queues (`theap->pages[]`) of every
-   theap of the calling thread through the same per-page block walker, so it sees OS-backed
-   pages too. It reports whatever those pages hold, which can include blocks another thread
-   allocated on a page this thread reclaimed, and it misses this thread's own blocks on pages
-   it has abandoned (full pages are abandoned by default). See memory-events.c. */
+   Built on top of this codebase's existing per-heap block-visitation facility
+   (mi_heap_visit_blocks); see memory-events.c for the exact scope this walks. */
 
 // Return false to stop the visit early.
 typedef bool (mi_memory_allocation_visit_fun)(

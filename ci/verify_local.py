@@ -55,6 +55,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from string import Template
 
+import perf_ab
+
 ROOT = Path(__file__).resolve().parents[1]
 OUT_ROOT = ROOT / "out" / "verify"
 
@@ -856,8 +858,23 @@ def run_lint(ctx: RunCtx) -> bool:
         log=ctx.log,
     )
     ok = ok and rc == 0
+    # (pytest and pyyaml in the same environment, as python-lint.yml's single `pip install`:
+    # without them pyright cannot resolve the test modules' imports and reports hundreds of
+    # errors that CI does not see)
     rc, _ = run_logged(
-        ["uv", "run", "--with", "pyright[nodejs]==1.1.411", "pyright"], cwd=ROOT, log=ctx.log
+        [
+            "uv",
+            "run",
+            "--with",
+            "pyright[nodejs]==1.1.411",
+            "--with",
+            "pyyaml==6.0.2",
+            "--with",
+            "pytest==8.3.4",
+            "pyright",
+        ],
+        cwd=ROOT,
+        log=ctx.log,
     )
     ok = ok and rc == 0
 
@@ -900,6 +917,15 @@ def run_lint(ctx: RunCtx) -> bool:
         # -Werror=unused-function when clang is available.
         ["uv", "run", "ci/check_no_diagnostic_suppression.py", "--selftest"],
         ["uv", "run", "ci/check_no_diagnostic_suppression.py"],
+        # #573: page geometry has one writer; the size-class-edge structs stay in budget.
+        ["uv", "run", "ci/check_page_geometry_writes.py", "--selftest"],
+        ["uv", "run", "ci/check_page_geometry_writes.py"],
+        ["uv", "run", "ci/check_struct_sizes.py", "--selftest"],
+        ["uv", "run", "ci/check_struct_sizes.py"],
+        # #573 A5: needs <sys/sdt.h>; without it the check says so and passes (CI requires it).
+        ["uv", "run", "ci/check_usdt_probes.py", "--selftest"],
+        ["uv", "run", "ci/check_usdt_probes.py"],
+        ["uv", "run", "ci/scaling_failure_alert.py", "--selftest"],
         ["uv", "run", "ci/check_macro_case.py", "--selftest"],
         ["uv", "run", "ci/check_macro_case.py"],
         ["uv", "run", "ci/check_release_ratchet.py", "--selftest"],
@@ -947,6 +973,8 @@ def run_lint(ctx: RunCtx) -> bool:
             "pyyaml==6.0.2",
             "--with",
             "pytest==8.3.4",
+            "python",
+            "-m",  # (python -m pytest puts the repository root on sys.path: `from ci import release`)
             "pytest",
             "ci/tests",
             "-q",
@@ -1087,9 +1115,14 @@ def run_asan(ctx: RunCtx) -> bool:
             "-DMI_PPROF=ON",
             "-DMI_DEBUG_FULL=ON",
             "-DMI_DHAT=ON",
+            "-DMI_MEMEVT=ON",
+            "-DMI_DIAGNOSTICS=ON",
             "-DMI_TRACK_ASAN=ON",
         ],
     )
+    # (MI_MEMEVT and MI_DIAGNOSTICS as asan.yml's rows have them: without MI_DIAGNOSTICS
+    # test-resident-first-churn is not even built, and this config once passed while CI's rows
+    # failed it, #573.)
     # `and` in this order, not short-circuited away by `debug_ok and ...`: --keep-going is
     # about seeing every failure in one run, and the release row is the interesting one here.
     release_ok = _run_asan_one(
@@ -1097,7 +1130,14 @@ def run_asan(ctx: RunCtx) -> bool:
         cc,
         cxx,
         "relwithdebinfo",
-        ["-DCMAKE_BUILD_TYPE=RelWithDebInfo", "-DMI_PPROF=ON", "-DMI_TRACK_ASAN=ON"],
+        [
+            "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
+            "-DMI_PPROF=ON",
+            "-DMI_DHAT=ON",
+            "-DMI_MEMEVT=ON",
+            "-DMI_DIAGNOSTICS=ON",
+            "-DMI_TRACK_ASAN=ON",
+        ],
     )
     # #366: the gated Debug row. MI_DEBUG_FULL (MI_DEBUG=3) is what arms the `_mi_gate_held`
     # leaf assertions -- the proof that no path reads owner-private state outside the gate --
@@ -1112,10 +1152,107 @@ def run_asan(ctx: RunCtx) -> bool:
             "-DMI_PPROF=ON",
             "-DMI_DEBUG_FULL=ON",
             "-DMI_OWNER_GATE=ON",
+            "-DMI_DIAGNOSTICS=ON",
             "-DMI_TRACK_ASAN=ON",
         ],
     )
     return release_ok and debug_ok and gated_ok
+
+
+# #573 D: the multi-threaded perf_ab workloads (large sizes, thread generations, idle drain) at
+# small operation counts under a debug build. They exposed two of #572's bugs (the page-map
+# extent, the retired-slot mask) that only the label-gated, release-build perf-ab job ran; here
+# they run locally, with every MI_DEBUG_FULL assertion armed, and under TSAN. A row passes when
+# the child exits 0 and printed no assertion. (`ops` is per thread.)
+STRESS_BOUND_MS = 300
+STRESS_TIMEOUT_S = 600
+STRESS_OPS = {
+    "large-class/8": 3000,
+    "large-class-ephemeral/8": 4000,
+    "random-large/8": 300,
+    "random-large-bursty/8": 240,
+    "small/8 (control)": 20000,
+    "larson/8": 20000,
+}
+
+
+def _stress_rows(ctx: RunCtx, build: Path, exe: Path, env: dict[str, str] | None) -> bool:
+    """Compile ci/perf_ab.c against the library built in `build`, then run the STRESS_OPS rows."""
+    lib = next(build.glob("libmimalloc*.a"))
+    cc = ["clang"] if (env or {}).get("CC") == "clang" else ["cc"]
+    flags = ["-O1", "-g", *(["-fsanitize=thread"] if (env or {}).get("PERF_AB_TSAN") else [])]
+    rc, _ = run_logged(
+        [
+            *cc,
+            *flags,
+            "-I",
+            str(ROOT / "include"),
+            str(ROOT / "ci/perf_ab.c"),
+            str(lib),
+            "-lpthread",
+            "-o",
+            str(exe),
+        ],
+        cwd=ROOT,
+        log=ctx.log,
+    )
+    if rc:
+        return False
+    ok = True
+    for name, ops in STRESS_OPS.items():
+        _kind, params = perf_ab.WORKLOADS[name]
+        cmd = [str(exe), *map(str, params._replace(ops=ops)), str(STRESS_BOUND_MS)]
+        rc, out = run_logged(cmd, cwd=ROOT, log=ctx.log, env=env, timeout=STRESS_TIMEOUT_S)
+        bad = rc != 0 or "assertion" in out or "ThreadSanitizer" in out
+        log_write(
+            ctx.log, f"\n[verify_local] stress {name}: {'FAIL' if bad else 'ok'} (exit {rc})\n"
+        )
+        ok = ok and not bad
+    return ok
+
+
+def run_stress(ctx: RunCtx) -> bool:
+    """Not in CI (#573 D): the multi-threaded perf_ab rows under MI_DEBUG_FULL, Debug."""
+    build = ctx.dir / "build"
+    rc, _ = cmake_configure(
+        ctx,
+        build,
+        [
+            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DMI_DEBUG_FULL=ON",
+            "-DMI_BUILD_TESTS=OFF",
+            "-DMI_BUILD_SHARED=OFF",
+            "-DMI_BUILD_OBJECT=OFF",
+            "-DMI_OVERRIDE=OFF",
+        ],
+    )
+    if rc or cmake_build(ctx, build, config="Debug", target="mimalloc-static"):
+        return False
+    return _stress_rows(ctx, build, ctx.dir / "perf_ab", None)
+
+
+def run_tsan(ctx: RunCtx) -> bool:
+    """Not in CI (#573 D): the same rows under clang -fsanitize=thread (the inherited TSAN row
+    of test.yaml runs only on dev* pushes, so it never sees this fork's PRs)."""
+    build = ctx.dir / "build"
+    env = {"CC": "clang", "PERF_AB_TSAN": "1", "TSAN_OPTIONS": "halt_on_error=1"}
+    rc, _ = cmake_configure(
+        ctx,
+        build,
+        [
+            "-DCMAKE_C_COMPILER=clang",
+            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DMI_DEBUG_TSAN=ON",
+            "-DMI_BUILD_TESTS=OFF",
+            "-DMI_BUILD_SHARED=OFF",
+            "-DMI_BUILD_OBJECT=OFF",
+            "-DMI_OVERRIDE=OFF",
+        ],
+        env=env,
+    )
+    if rc or cmake_build(ctx, build, config="Debug", target="mimalloc-static", env=env):
+        return False
+    return _stress_rows(ctx, build, ctx.dir / "perf_ab", env)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1232,6 +1369,19 @@ CONFIGS: list[ConfigSpec] = [
         "ruff + pyright + gate selftests + pytest",
         run_lint,
         _need_uv,
+    ),
+    ConfigSpec(
+        "stress",
+        "local only: multi-threaded perf_ab rows, MI_DEBUG_FULL (#573)",
+        "large-class, ephemeral generations, bursty idle drain, larson at small op counts",
+        run_stress,
+    ),
+    ConfigSpec(
+        "tsan",
+        "local only: the same rows under TSAN (#573)",
+        "clang -fsanitize=thread, MI_DEBUG_TSAN=ON",
+        run_tsan,
+        _need_clang,
     ),
     ConfigSpec(
         "asan",

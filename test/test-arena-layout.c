@@ -150,6 +150,33 @@ static void test_walk(void) {
   assert(k->max_run[MI_ARENA_LAYOUT_QUEUED] + k->max_run[MI_ARENA_LAYOUT_QUEUED_AGED] == R);
   assert(k->committed_slices[MI_ARENA_LAYOUT_IN_USE] == (TEST_RANGES - 1) * R);   // claimed with commit
 
+  // #573 A3: residency is measured (`mincore`), not inferred from the bitmaps. The claimed ranges
+  // were committed but never touched; touching one makes it resident, in the in-use class.
+  #if !defined(_WIN32)
+  memset(&L, TEST_POISON, sizeof(L));
+  assert(_mi_arena_layout_walk(arena->subproc, arena, &L));
+  assert(L.resident_known);
+  size_t resident_before = 0;
+  for (size_t c = 0; c < MI_CBIN_COUNT; c++) { resident_before += L.cls[c].resident_bytes[MI_ARENA_LAYOUT_IN_USE]; }
+  memset(p[0], 0x5A, R * MI_ARENA_SLICE_SIZE);
+  memset(&L, TEST_POISON, sizeof(L));
+  assert(_mi_arena_layout_walk(arena->subproc, arena, &L));
+  size_t resident_after = 0, resident_fresh = 0;
+  for (size_t c = 0; c < MI_CBIN_COUNT; c++) {
+    resident_after += L.cls[c].resident_bytes[MI_ARENA_LAYOUT_IN_USE];
+    resident_fresh += L.cls[c].resident_bytes[MI_ARENA_LAYOUT_FRESH];
+    for (size_t kind = 0; kind < MI_ARENA_LAYOUT_KIND_COUNT; kind++) {
+      assert(L.cls[c].resident_bytes[kind] <= mi_size_of_slices(L.cls[c].slices[kind]));   // never more than the class holds
+    }
+  }
+  fprintf(stderr, "resident in use: %zu -> %zu bytes after touching %zu; fresh %zu\n", resident_before, resident_after,
+          (size_t)(R * MI_ARENA_SLICE_SIZE), resident_fresh);
+  // (THP may have made more than the touched range resident already: the bound is one-sided)
+  assert(resident_after >= R * MI_ARENA_SLICE_SIZE);                     // the touched range is now resident
+  assert(resident_after <= mi_size_of_slices(total_of(&L, MI_ARENA_LAYOUT_IN_USE)));
+  assert(resident_fresh < mi_size_of_slices(total_of(&L, MI_ARENA_LAYOUT_FRESH)));   // most of a fresh arena is not
+  #endif
+
   // the report carries the same walk (over every arena, so at least ours)
   mi_holes_report_t rep;
   _mi_purge_holes_report_collect(&rep);

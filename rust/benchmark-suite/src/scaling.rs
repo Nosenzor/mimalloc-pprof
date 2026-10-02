@@ -99,6 +99,23 @@ pub fn scaling_thread_points_for_shard(
 }
 /// External RSS sampling cadence while a scaling child runs.
 pub const SCALING_RSS_POLL_INTERVAL_NS: u64 = 5_000_000;
+/// #534: how far (percent) the theoretical-minimum RSS floor may sit above the
+/// lowest RSS measured in its cell before validation refuses the run. The floor
+/// is the smallest baseline plus the concurrent live-byte peak of the separate
+/// live-telemetry replay, while measured peaks are polled every
+/// `SCALING_RSS_POLL_INTERVAL_NS` in other processes. An allocator running close
+/// to the floor (jemalloc on large-class-ephemeral/1: 9.52 MiB measured against a
+/// 9.76 MiB floor) therefore dips under it by measurement noise alone; that
+/// failed every full run from 2026-09-28 on. Keep in sync with
+/// `ci/benchmark_report.py` `SCALING_RSS_FLOOR_SLACK_PERCENT`.
+pub const SCALING_RSS_FLOOR_SLACK_PERCENT: u64 = 10;
+
+/// #534: whether `floor` is consistent with `lowest` measured RSS, within
+/// `SCALING_RSS_FLOOR_SLACK_PERCENT`.
+pub fn rss_floor_within_slack(floor: u64, lowest: u64) -> bool {
+    u128::from(floor) * 100
+        <= u128::from(lowest) * u128::from(100 + SCALING_RSS_FLOOR_SLACK_PERCENT)
+}
 pub const SCALING_RIGOR_LABEL: &str =
     "mixed rigor - 3-block legacy coverage plus 40-repetition distribution bands";
 pub const SCALING_MIN_BLOCK_NS: u64 = 400_000_000;
@@ -2750,8 +2767,9 @@ pub fn build_rss_floors(
 }
 
 /// #534: the floors must be exactly what the raw samples give, non-zero, and
-/// never above an RSS any allocator was measured at -- that could only be a
-/// measurement bug, so it fails the run rather than drawing a wrong floor.
+/// not above the lowest RSS any allocator was measured at by more than
+/// `SCALING_RSS_FLOOR_SLACK_PERCENT` (measurement noise) -- further above could
+/// only be a measurement bug, so it fails the run rather than drawing a wrong floor.
 fn validate_rss_floors(
     rss: &ScalingRssReport,
     samples: &[ScalingRawSample],
@@ -2795,7 +2813,8 @@ fn validate_rss_floors(
         if floor.baseline_rss_bytes == 0
             || (floor.peak_live_requested_bytes == 0) == live_expected
             || floor.floor_rss_bytes != floor.baseline_rss_bytes + floor.peak_live_requested_bytes
-            || lowest_measured.is_none_or(|lowest| floor.floor_rss_bytes > lowest)
+            || lowest_measured
+                .is_none_or(|lowest| !rss_floor_within_slack(floor.floor_rss_bytes, lowest))
         {
             return Err(format!(
                 "scaling RSS floor for {}/{} is missing, inconsistent, or above a measured RSS",

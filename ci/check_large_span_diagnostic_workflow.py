@@ -182,13 +182,19 @@ def parse_policy(value: object) -> WorkflowPolicy:
 def validate(policy: WorkflowPolicy) -> None:
     if policy.trigger_names != ("workflow_dispatch",):
         fail("workflow must be manual-only")
-    if tuple(sorted(item.name for item in policy.inputs)) != ("baseline_sha", "candidate_sha"):
-        fail("workflow must require only explicit baseline and candidate SHA inputs")
-    if any(
-        item.input_type != "string" or not item.required or item.has_default
-        for item in policy.inputs
+    if tuple(sorted(item.name for item in policy.inputs)) != (
+        "baseline_sha",
+        "candidate_sha",
+        "reps",
     ):
-        fail("baseline and candidate SHA inputs must be required strings without defaults")
+        fail("workflow must take only the baseline and candidate SHAs and the repetition count")
+    for item in policy.inputs:
+        if item.name == "reps":
+            # #573 B7: optional, a string with a default, validated 15..40 before any build
+            if item.input_type != "string" or item.required or not item.has_default:
+                fail("the reps input must be an optional string with a default")
+        elif item.input_type != "string" or not item.required or item.has_default:
+            fail("baseline and candidate SHA inputs must be required strings without defaults")
     if policy.permissions != (("contents", "read"),):
         fail("workflow permissions must be contents: read only")
     if tuple(job.name for job in policy.jobs) != ("collect",):
@@ -213,13 +219,14 @@ def validate(policy: WorkflowPolicy) -> None:
         '--output "$OUTPUT_DIR/perf-access.json"',
         '--github-env "$GITHUB_ENV"',
         "ci/large_span_diagnostic.py",
-        "--reps 7",
+        '--reps "$REPS"',
         "--deep-output",
         "benchmark-latency-run",
         "--diagnostic-large-object",
         "--diagnostic-old-fork-provenance",
         "benchmark-scaling-run",
-        "--blocks 7",
+        '--blocks "$REPS"',
+        "ci/scaling_diagnostic.py validate --mode diagnostic",
         "ci/large_span_latency_link.py",
         "latency-large-object-diagnostic.json",
         '--summary "$OUTPUT_DIR/large-span-combined-summary.txt"',
@@ -229,7 +236,8 @@ def validate(policy: WorkflowPolicy) -> None:
         if fragment not in run_scripts:
             fail(f"workflow steps are missing required operation: {fragment}")
     if not {
-        "run seven paired large-span repetitions and untimed deep diagnostics",
+        "validate the repetition count",
+        "run paired large-span repetitions and untimed deep diagnostics",
         "run matched latency sidecar",
         "run same-job diagnostic scaling references",
         "link same-run latency and contextual scaling artifacts",

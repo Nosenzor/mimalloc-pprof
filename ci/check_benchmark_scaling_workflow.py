@@ -22,6 +22,7 @@ from benchmark_report import (
     DISTRIBUTION_BLOCKS,
     SCALING_BLOCKS,
     SCALING_PATTERN_IDS,
+    SCALING_RSS_FLOOR_SLACK_PERCENT,
     SCALING_RSS_SCHEMA,
     SCALING_SCHEMA,
     SCALING_THREAD_POINTS,
@@ -49,6 +50,7 @@ JOBS = {
     "package-pages",
     "deploy-pages",
     "publication-audit",
+    "alert",
 }
 # Coverage mode exists to stay cheap; the budget is part of the contract.
 MAXIMUM_BUILD_TIMEOUT_MINUTES = 30
@@ -247,6 +249,8 @@ def validate(workflow: Mapping[str, object]) -> None:
         if not isinstance(condition, str) or not condition.startswith(PUBLISH_ELIGIBLE):
             fail(f"{job_name} must be gated on {PUBLISH_ELIGIBLE}")
 
+    validate_alert_job(jobs)
+
     publish = mapping(jobs["publish-branch"], "publish-branch")
     if mapping(publish.get("permissions"), "publish permissions") != {"contents": "write"}:
         fail("only publish-branch may use contents: write")
@@ -271,6 +275,34 @@ def validate(workflow: Mapping[str, object]) -> None:
     for required in ("validate-revision", "audit-pages"):
         if required not in audit_text:
             fail(f"publication audit is missing {required}")
+
+
+ALERT_NEEDS = {name for name in JOBS if name != "alert"}
+
+
+def validate_alert_job(jobs: Mapping[str, object]) -> None:
+    """#573 B9: a failed scheduled run opens or updates an issue, and only that."""
+    alert = mapping(jobs["alert"], "alert")
+    condition = str(alert.get("if", ""))
+    for required in (
+        "always()",
+        "github.event_name == 'schedule'",
+        "contains(needs.*.result, 'failure')",
+    ):
+        if required not in condition:
+            fail(f"alert must run on {required} (a failed scheduled run), got {condition!r}")
+    needs = alert.get("needs")
+    if not isinstance(needs, list) or set(cast(list[str], needs)) != ALERT_NEEDS:
+        fail("alert must wait for every other job")
+    if mapping(alert.get("permissions"), "alert permissions") != {
+        "contents": "read",
+        "issues": "write",
+        "actions": "read",
+    }:
+        fail("alert may only add issues: write and actions: read to contents: read")
+    text = str(alert)
+    if "ci/scaling_failure_alert.py" not in text or "GH_TOKEN" not in text:
+        fail("alert must run ci/scaling_failure_alert.py with a token from the environment")
 
 
 def validate_diagnostic_mode(
@@ -305,17 +337,36 @@ def validate_diagnostic_mode(
         '--fork-cppdefs "$DIAGNOSTIC_CPPDEFS"' not in str(native.get("run", ""))
     ):
         fail("diagnostic_cppdefs must reach the builder as --fork-cppdefs through env")
-    cache = next(
-        (
-            step
-            for step in cast(list[object], build["steps"])
-            if "actions/cache@" in str(mapping(step, "build step").get("uses", ""))
-        ),
-        None,
+    # #573 B7: two caches. The fork's tree is keyed on its own sources and the diagnostic
+    # defines (#528); the references' trees are keyed on their pins, patches and the builder only,
+    # so a C change no longer rebuilds them, and they never hold the fork's tree.
+    fork_cache = mapping(build_steps.get("cache fork allocator tree"), "cache fork allocator tree")
+    fork_with = mapping(fork_cache.get("with"), "cache fork allocator tree.with")
+    fork_key = str(fork_with.get("key", ""))
+    if "${{ inputs.diagnostic_cppdefs }}" not in fork_key:
+        fail("the fork allocator cache key must include diagnostic_cppdefs")
+    for source in ("'include/**'", "'src/**'", "'CMakeLists.txt'"):
+        if source not in fork_key:
+            fail(f"the fork allocator cache key must hash {source}")
+    if "mimalloc-pprof" not in str(fork_with.get("path", "")):
+        fail("the fork allocator cache must hold the mimalloc-pprof build tree")
+    reference_cache = mapping(
+        build_steps.get("cache reference allocator trees"), "cache reference allocator trees"
     )
-    cache_with = mapping(mapping(cache, "allocator cache").get("with"), "allocator cache.with")
-    if "${{ inputs.diagnostic_cppdefs }}" not in str(cache_with.get("key", "")):
-        fail("the allocator cache key must include diagnostic_cppdefs")
+    reference_with = mapping(reference_cache.get("with"), "cache reference allocator trees.with")
+    reference_key = str(reference_with.get("key", ""))
+    for fork_only in ("include/**", "src/**", "CMakeLists.txt", "diagnostic_cppdefs"):
+        if fork_only in reference_key:
+            fail(f"the reference allocator cache key must not depend on the fork ({fork_only})")
+    for required in (
+        "allocator-lock.json",
+        "allocators/patches/**",
+        "build_benchmark_allocators.py",
+    ):
+        if required not in reference_key:
+            fail(f"the reference allocator cache key must hash {required}")
+    if "mimalloc-pprof" in str(reference_with.get("path", "")):
+        fail("the reference allocator cache must not hold the fork's build tree")
 
     sweep = mapping(measure_steps.get("run sparse scaling sweep"), "run sparse scaling sweep")
     sweep_env = mapping(sweep.get("env"), "run sparse scaling sweep.env")
@@ -345,6 +396,18 @@ RUST_THREAD_POINTS = re.compile(
 RUST_BLOCKS = re.compile(r"pub const SCALING_BLOCKS:\s*u32\s*=\s*(?P<blocks>\d+);")
 RUST_DISTRIBUTION_BLOCKS = re.compile(
     r"pub const DISTRIBUTION_BLOCKS:\s*u32\s*=\s*(?P<blocks>\d+);"
+)
+RUST_RSS_FLOOR_SLACK = re.compile(
+    r"pub const SCALING_RSS_FLOOR_SLACK_PERCENT:\s*u64\s*=\s*(?P<percent>\d+);"
+)
+# #573 B9: the producer and the validator each decide whether a theoretical-minimum RSS floor is
+# consistent with the lowest RSS measured in its cell. They disagreed once (the validator failed
+# every full run from 2026-09-28 until #574): the constant AND the formula are compared here, on
+# every ci/ PR, instead of by a "keep in sync" comment.
+RUST_RSS_FLOOR_FORMULA = re.compile(
+    r"pub fn rss_floor_within_slack\(floor: u64, lowest: u64\) -> bool \{\s*"
+    r"u128::from\(floor\) \* 100\s*<= u128::from\(lowest\) \* "
+    r"u128::from\(100 \+ SCALING_RSS_FLOOR_SLACK_PERCENT\)\s*\}"
 )
 RUST_SCHEMA = re.compile(r'pub const SCALING_SCHEMA_VERSION:\s*&str\s*=\s*"(?P<schema>[^"]*)";')
 RUST_RSS_SCHEMA = re.compile(
@@ -450,6 +513,17 @@ def validate_source_contract(source: str) -> None:
         or int(distribution_blocks.group("blocks")) != DISTRIBUTION_BLOCKS
     ):
         fail(f"scaling.rs: DISTRIBUTION_BLOCKS must be {DISTRIBUTION_BLOCKS}")
+    slack_match = RUST_RSS_FLOOR_SLACK.search(source)
+    if slack_match is None or int(slack_match.group("percent")) != SCALING_RSS_FLOOR_SLACK_PERCENT:
+        fail(
+            "scaling.rs: SCALING_RSS_FLOOR_SLACK_PERCENT must be "
+            f"{SCALING_RSS_FLOOR_SLACK_PERCENT} (benchmark_report.py)"
+        )
+    if RUST_RSS_FLOOR_FORMULA.search(source) is None:
+        fail(
+            "scaling.rs: rss_floor_within_slack must be floor * 100 <= lowest * (100 + slack), "
+            "the formula benchmark_report.py's rss_floor_within_slack uses"
+        )
     schema_match = RUST_SCHEMA.search(source)
     if schema_match is None or schema_match.group("schema") != SCALING_SCHEMA:
         fail(f"scaling.rs: SCALING_SCHEMA_VERSION must be {SCALING_SCHEMA!r}")
@@ -645,10 +719,45 @@ MUTATIONS: dict[str, Callable[[dict[str, Any]], None]] = {
     "diagnostic run not summarized": lambda wf: _step(
         wf, "summarize diagnostic run", "assemble"
     ).__setitem__("if", "always()"),
+    # #573 B9: the failure alert.
+    "alert runs on dispatches too": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "alert"
+    ].__setitem__("if", "${{ always() && contains(needs.*.result, 'failure') }}"),
+    "alert dropped": lambda wf: cast(dict[str, Any], wf["jobs"]).pop("alert"),
+    "alert over-permissioned": lambda wf: cast(dict[str, Any], wf["jobs"])["alert"].__setitem__(
+        "permissions", {"contents": "write", "issues": "write", "actions": "read"}
+    ),
+    "alert stops waiting for a job": lambda wf: cast(dict[str, Any], wf["jobs"])[
+        "alert"
+    ].__setitem__("needs", ["build", "measure"]),
+    # #573 B7: the split allocator caches.
+    "fork cache stops hashing the C sources": lambda wf: cast(
+        dict[str, Any], _step(wf, "cache fork allocator tree")["with"]
+    ).__setitem__(
+        "key", "benchmark-fork-${{ runner.os }}-cppdefs[${{ inputs.diagnostic_cppdefs }}]"
+    ),
+    "reference cache depends on the C sources": lambda wf: cast(
+        dict[str, Any], _step(wf, "cache reference allocator trees")["with"]
+    ).__setitem__(
+        "key",
+        "benchmark-references-${{ hashFiles('allocator-lock.json', 'allocators/patches/**', "
+        "'build_benchmark_allocators.py', 'src/**') }}",
+    ),
+    "reference cache holds the fork tree": lambda wf: cast(
+        dict[str, Any], _step(wf, "cache reference allocator trees")["with"]
+    ).__setitem__("path", "rust/target/release/build/mimalloc-pprof"),
 }
 
 
 SOURCE_MUTATIONS: dict[str, Callable[[str], str]] = {
+    "rss floor slack diverges": lambda text: text.replace(
+        f"SCALING_RSS_FLOOR_SLACK_PERCENT: u64 = {SCALING_RSS_FLOOR_SLACK_PERCENT};",
+        "SCALING_RSS_FLOOR_SLACK_PERCENT: u64 = 0;",
+    ),
+    "rss floor formula changes": lambda text: text.replace(
+        "u128::from(lowest) * u128::from(100 + SCALING_RSS_FLOOR_SLACK_PERCENT)",
+        "u128::from(lowest) * 100",
+    ),
     "thread points diverge from the validator": lambda text: text.replace(
         f"[u32; {len(SCALING_THREAD_POINTS)}] = [{', '.join(str(p) for p in SCALING_THREAD_POINTS)}]",
         "[u32; 3] = [1, 4, 16]",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+# pyright: reportMissingTypeStubs=false
 import subprocess
 from pathlib import Path
 

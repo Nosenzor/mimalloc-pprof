@@ -40,7 +40,9 @@ class LiveDestination(destinations.ReadOnlyDestination):
 
     @staticmethod
     def _github(*args: str) -> str:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            args, capture_output=True, text=True, check=False, env=release.plain_cli_env()
+        )
         if result.returncode == 0:
             return result.stdout
         message = result.stderr.strip()
@@ -156,9 +158,9 @@ class LiveDestination(destinations.ReadOnlyDestination):
         def release_id_shape(value: dict[str, object]) -> bool:
             return isinstance(value.get("id"), int)
 
-        raw = self._gh_required(
-            f"repos/{release.REPO}/releases/tags/{tag}", validate=release_id_shape
-        )
+        raw = self._release_by_tag(tag, validate=release_id_shape)
+        if raw is None:
+            raise release.ReleaseError("draft release disappeared before finalize")
         release_id = int(json.loads(raw)["id"])
         self._github(
             "gh",

@@ -144,7 +144,7 @@ jobs:
       # during cache restore (issue #55), which skipped the publish job and turned a
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
       # retry action, so attempt it twice explicitly.
-      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75 # merged #518 audit recovery
+      - uses: zackees/setup-soldr@v0
         id: setup_soldr
         continue-on-error: true
         with:
@@ -156,7 +156,7 @@ jobs:
 
       - name: Retry toolchain setup (first attempt failed)
         if: steps.setup_soldr.outcome == 'failure'
-        uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
+        uses: zackees/setup-soldr@v0
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml
@@ -249,7 +249,7 @@ jobs:
         run: |
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA" || { echo '::error::binary checkout differs from candidate_sha'; exit 1; }
       - uses: astral-sh/setup-uv@v3
-      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
+      - uses: zackees/setup-soldr@v0
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           # This job drives CMake directly; there is no `soldr cargo` for zccache to wrap.
@@ -574,6 +574,15 @@ jobs:
             case "$asset" in macos-*) ext=tar.gz ;; *) ext=zip ;; esac
             mv "dist/mimalloc-pprof-${asset}.${ext}" "dist/mimalloc-pprof-${asset}-${tag}.${ext}"
           done
+      # The archives are not byte-reproducible (#564). Once the release issue holds a
+      # freeze, publish the freezing attempt's exact bytes instead of this attempt's
+      # rebuild; the smoke rows and the publisher then handle those bytes.
+      - name: Restore frozen archives when resuming after a freeze
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: python3 ci/release.py restore-frozen-artifacts --issue "$ISSUE_NUMBER" --candidate-sha "$CANDIDATE_SHA" --dist dist
       - name: Record and verify exact archive identities
         env:
           GH_TOKEN: ${{ github.token }}
@@ -672,7 +681,7 @@ jobs:
       # during cache restore (issue #55), which skipped the publish job and turned a
       # tagged release into a silent no-op. A `uses:` step cannot be wrapped by a
       # retry action, so attempt it twice explicitly.
-      - uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
+      - uses: zackees/setup-soldr@v0
         id: setup_soldr
         continue-on-error: true
         with:
@@ -684,7 +693,7 @@ jobs:
 
       - name: Retry toolchain setup (first attempt failed)
         if: steps.setup_soldr.outcome == 'failure'
-        uses: zackees/setup-soldr@f63d8987580fd50667d95b19130e82d9691ddd75
+        uses: zackees/setup-soldr@v0
         with:
           version: v0.9.11  # pinned: v0.9.12 archive lacks the binary (zackees/soldr#3091)
           toolchain-file: rust/rust-toolchain.toml

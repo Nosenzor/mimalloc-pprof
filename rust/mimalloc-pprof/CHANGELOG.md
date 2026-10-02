@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 1.1.0
+
+- **New option `mi_option_large_span_max`** (Rust `Opt::LARGE_SPAN_MAX`,
+  [#575](https://github.com/zackees/mimalloc-pprof/issues/575)): the largest span, in KiB,
+  a demand-grown large page reaches. Default 1024 (1 MiB, two blocks of every large bin);
+  0 restores the 4 MiB policy of #532. Every Rust surface keeps the option in all
+  configurations.
+- **Large-page reuse policy** (#530, #544, #575): retired large pages are repurposed across
+  bins under a per-heartbeat budget, reclaimed on free when their bin has no page left, and
+  aged by the heartbeat; never-used free slices a THP fault made resident are purged. Lower
+  peak and after-drain RSS on large-buffer workloads; per-cell ledgers are on the issues.
+- **Fixes**: a destroyed sub-process no longer clobbers the caller's thread locals (#554);
+  page-map registration of repurposed pages and of a page whose blocks start mid-slice
+  (#573).
+- **Diagnostics** (`diagnostics` feature only): slow-path event counters, measured
+  residency, assertion backtraces, USDT probes and a per-page resident-byte split in the
+  holes report (#573, #575).
+
+## 1.0.1
+
 - **Free arenas can be given back**:
   `PurgeFlags::RECLAIM` / `PurgeFlags::FORCE_RECLAIM` (C: `MI_PURGE_RECLAIM`) makes
   `purge_all_ex` also release the arenas that are **completely free**, their metadata
@@ -23,6 +43,18 @@
     while recording 0 of 1000.
   - A process forked while another thread was inside a DHAT event can stop and restart
     DHAT in the child.
+
+- **Environment options honoured** ([#549](https://github.com/zackees/mimalloc-pprof/issues/549)):
+  `MIMALLOC_DHAT` and `MIMALLOC_PROF_DUMP_FORMAT` were ignored by 1.0.0 and earlier.
+- **Profiler forgets a destroyed heap's samples**
+  ([#550](https://github.com/zackees/mimalloc-pprof/issues/550)), so later dumps no
+  longer report records from a heap that no longer exists.
+- **Heap snapshot and dump fixes** ([#338](https://github.com/zackees/mimalloc-pprof/issues/338)):
+  the snapshot covers every sub-process with a consistent arena count, and skips free
+  slices when walking arena pages; the heap dump never waits for fork orphans.
+- Memory-retention and purge improvements to the allocator core (among them
+  [#497](https://github.com/zackees/mimalloc-pprof/issues/497) and
+  [#532](https://github.com/zackees/mimalloc-pprof/issues/532)).
 
 ## 1.0.0
 

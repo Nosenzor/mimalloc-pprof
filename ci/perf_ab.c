@@ -266,6 +266,21 @@ static void larson_round(table_t* tb, stream_t* st, size_t lo, size_t hi, long n
    holds and mi_purge_holes_report() -- which reads only the calling thread's own pages (plus the
    arenas, the same for every worker), hence one report per worker. Untimed: perf_ab.py runs it
    in a separate replay. */
+/* #575: the kernel's own residency numbers for the whole process, next to the allocator's split */
+static void smaps_rollup_line(void) {
+  FILE* f = fopen("/proc/self/smaps_rollup", "r");
+  if (f == NULL) return;
+  char line[256];
+  long rss = -1, anon_huge = -1, anon = -1;
+  while (fgets(line, sizeof(line), f) != NULL) {
+    sscanf(line, "Rss: %ld kB", &rss);
+    sscanf(line, "Anonymous: %ld kB", &anon);
+    sscanf(line, "AnonHugePages: %ld kB", &anon_huge);
+  }
+  fclose(f);
+  fprintf(stderr, "smaps_rollup: Rss %ld kB, Anonymous %ld kB, AnonHugePages %ld kB\n", rss, anon, anon_huge);
+}
+
 static void report_holes(stream_t* st) {
   size_t live = 0;
   int held = 0;
@@ -280,6 +295,7 @@ static void report_holes(stream_t* st) {
           st->index, threads, held, live, rss_bytes(),
           hs.purged_bytes, hs.purged_blocks, hs.purged_bytes_total, hs.discard_calls, hs.pages_freed,
           hs.unformed_bytes, hs.unformed_bytes_total, hs.pages_skipped, hs.full_sweeps);
+  smaps_rollup_line();   /* #575 */
   fflush(stderr);
   mi_purge_holes_report();
   fflush(stderr);
@@ -442,6 +458,7 @@ int main(int argc, char** argv) {
 #else
   const double start = now_s();
 #endif
+  const long baseline_rss = rss_bytes();   /* #573: the RSS floor is this plus the live requested bytes */
   for (int i = 0; i < threads; i++) pthread_create(&t[i], NULL, &worker_main, &st[i]);
   while (atomic_load(&drained) < threads) usleep(100);
 #if defined(PERF_AB_DIAGNOSTIC)
@@ -467,6 +484,12 @@ int main(int argc, char** argv) {
     }
 #endif
   }
+  long live_bytes = 0;   /* every worker is done and holds its live slots (`drained` was released) */
+  for (int i = 0; i < threads; i++) {
+    for (int k = 0; k < st[i].slots; k++) { if (st[i].slot[k] != NULL) live_bytes += (long)st[i].size[k]; }
+  }
+  const long ideal_rss = baseline_rss + live_bytes;
+  (void)ideal_rss;   /* (printed by the default output only; the diagnostic JSON schema is fixed) */
   const long rss_final = rss_at[samples - 1];
   long release_ms = 0;
   while (release_ms / RELEASE_SAMPLE_MS < samples - 1 && rss_at[release_ms / RELEASE_SAMPLE_MS] > rss_final + RELEASE_TOLERANCE) {
@@ -520,8 +543,8 @@ int main(int argc, char** argv) {
   }
 #else
   {
-    printf("%.1f %.4f %.4f %ld %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
-           owner_cpu, ru.ru_minflt, rss_peak, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms);
+    printf("%.1f %.4f %.4f %ld %ld %ld %ld %ld %ld\n", (double)threads * (double)st[0].ops / elapsed, cpu_of(&ru),
+           owner_cpu, ru.ru_minflt, rss_peak, rss_short, rss_at[bound_ms / RELEASE_SAMPLE_MS], release_ms, ideal_rss);
   }
 #endif
   atomic_store(&release_workers, 1);
