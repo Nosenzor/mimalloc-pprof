@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit a0cf5938 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 14ef7ec5 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -25751,11 +25751,12 @@ static mi_decl_forceinline mi_page_queue_t* mi_page_repurpose_find(
   mi_page_queue_t* best_pq = NULL;
   *best_size = SIZE_MAX;
   if (inspected != NULL) *inspected = 0;
-  // #610: retirement widens these owner-side bounds before returning; collection
-  // only narrows them after checking every retired queue. They may be stale and
-  // over-inclusive, but cover unpublished pages as well as scavenger slots.
+  // #610: retirement lowers this owner-side bound before returning; collection
+  // only raises it after checking every retired queue. It can be stale and
+  // over-inclusive, but covers unpublished pages as well as scavenger slots.
+  // Skip the empty prefix; retain the constant upper limit to avoid computing
+  // a second dynamic loop endpoint for the small remaining suffix.
   if (bin_lo < theap->page_retired_min) bin_lo = theap->page_retired_min;
-  if (bin_hi > theap->page_retired_max) bin_hi = theap->page_retired_max;
   for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
     if (inspected != NULL) (*inspected)++;
     mi_page_queue_t* const q = &theap->pages[bin];
