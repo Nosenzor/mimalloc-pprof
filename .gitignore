@@ -1,10 +1,10 @@
-build
+/build/
 ide/vs20??/*.db
 ide/vs20??/*.opendb
 ide/vs20??/*.user
 ide/vs20??/.vs
 ide/vs20??/VTune*
-out/
+/out/
 rust/target/
 # setup-soldr's cook cache restores its archives beside the target dir (#444).
 rust/target.soldr-*
@@ -19,15 +19,25 @@ docs/
 !ci/tests/fixtures/**/*.gz
 .vscode
 .DS_STore
-__pycache__/
-*.pyc
+# Local Python environments and caches (repository-relative paths).
+/.venv/
+/.pytest_cache/
+/.ruff_cache/
+/ci/__pycache__/
+/ci/tests/__pycache__/
+/ci/spike/__pycache__/
+/examples/heap-snapshot/__pycache__/
+
+# Agent runtime state; keep agent configuration files visible.
+/.claude/scheduled_tasks.lock
+/.claude/worktrees/
 
 # uv run writes an (empty) lock file here; pyproject.toml has no [project] table, so it carries nothing
-uv.lock
+/uv.lock
 
 # clud /grind run records: local only, never committed
-.clud/grind/
-.clud/logs/
+/.clud/grind/
+/.clud/logs/
 
 # Issue 585 retains original measurements before temporary evidence is cleaned.
 !/.github/assets/perf-585/measurements.zip
