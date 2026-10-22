@@ -564,8 +564,6 @@ static bool mi_page_set_geometry(mi_theap_t* theap, mi_page_t* page, size_t bloc
 // peak RSS in perf-ab, but the arena round trip (bitmaps, page map, purge scheduling) cost +76%
 // CPU. Re-carving the empty page for the bin that needs one keeps both: the slices, the page map
 // entries and the ownership stay as they are, only the block geometry changes.
-#include "page-retired-search.h"
-
 static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size) {
   if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
   // Within this heartbeat's budget only. A repurposed page's own bin may need a page again soon and
@@ -591,7 +589,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   }
   if (want < min_bytes) { want = min_bytes; }
   size_t best_size;
-  mi_page_queue_t* const best_pq = mi_page_repurpose_find(theap, pq, bin_lo, bin_hi, want, &best_size, NULL);
+  mi_page_queue_t* const best_pq = _mi_page_repurpose_find(theap, pq, bin_lo, bin_hi, want, &best_size);
   if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;

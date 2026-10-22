@@ -7,6 +7,20 @@
 #if MI_LARGE_REPURPOSE && MI_PAGE_META_IS_SEPARATED
 #include "../src/page-retired-search.h"
 
+// Compare the actual compiled entry point with the same counted loop used for
+// work assertions. This also exercises its C/C++ linkage and output parameter.
+static mi_page_queue_t* retired_search_checked(
+    mi_theap_t* heap, mi_page_queue_t* pq, size_t lo, size_t hi,
+    size_t want, size_t* size, size_t* visits) {
+  mi_page_queue_t* const expected = mi_page_repurpose_find(heap, pq, lo, hi, want, size, visits);
+  size_t compiled_size;
+  mi_page_queue_t* const selected = _mi_page_repurpose_find(heap, pq, lo, hi, want, &compiled_size);
+  CHECK(selected == expected && compiled_size == *size,
+        "(i) compiled selector must match the counted shared body");
+  *size = compiled_size;
+  return selected;
+}
+
 static void case_retired_search(void) {
   mi_theap_t heap;
   mi_page_t records[3];
@@ -26,14 +40,14 @@ static void case_retired_search(void) {
   size_t size = 0, visits = 0;
   heap.page_retired_min = MI_BIN_FULL;
   heap.page_retired_max = 0;
-  mi_page_queue_t* selected = mi_page_repurpose_find(&heap, &heap.pages[lo], lo, hi,
+  mi_page_queue_t* selected = retired_search_checked(&heap, &heap.pages[lo], lo, hi,
                                                     mi_size_of_slices(16), &size, &visits);
   CHECK(selected == NULL, "(i) empty retired range must have no candidate");
   CHECK(visits == 0, "(i) empty retired range inspected %zu bins, expected zero", visits);
 
   heap.pages[first].first = heap.pages[first].last = page;
   heap.page_retired_min = heap.page_retired_max = first;
-  selected = mi_page_repurpose_find(&heap, &heap.pages[lo], lo, hi,
+  selected = retired_search_checked(&heap, &heap.pages[lo], lo, hi,
                                     mi_size_of_slices(16), &size, &visits);
   CHECK(selected == &heap.pages[first] && size == mi_size_of_slices(16),
         "(i) exact-fit unpublished page must remain eligible");
@@ -51,12 +65,12 @@ static void case_retired_search(void) {
   second->retire_expire = 1;
   heap.pages[last].first = heap.pages[last].last = second;
   heap.page_retired_max = last;
-  selected = mi_page_repurpose_find(&heap, &heap.pages[lo], lo, hi,
+  selected = retired_search_checked(&heap, &heap.pages[lo], lo, hi,
                                     mi_size_of_slices(8), &size, &visits);
   CHECK(selected == &heap.pages[first], "(i) equal fits must keep the lowest-bin candidate");
-  CHECK(visits == hi - first + 1,
-        "(i) search inspected %zu bins, expected only the original suffix after the empty prefix", visits);
-  selected = mi_page_repurpose_find(&heap, &heap.pages[first], lo, hi,
+  CHECK(visits == last - first + 1,
+        "(i) search inspected %zu bins outside the retired interval", visits);
+  selected = retired_search_checked(&heap, &heap.pages[first], lo, hi,
                                     mi_size_of_slices(16), &size, &visits);
   CHECK(selected == &heap.pages[last], "(i) destination queue must not serve itself");
   // Publication slots are not the owner queue's candidate index. A full array
@@ -69,20 +83,20 @@ static void case_retired_search(void) {
   for (size_t i = 0; i < MI_RETIRED_PAGE_SLOTS; i++) {
     mi_atomic_store_ptr_relaxed(mi_page_t, &tld.retired_pages[i], second);
   }
-  selected = mi_page_repurpose_find(&heap, &heap.pages[lo], lo, hi,
+  selected = retired_search_checked(&heap, &heap.pages[lo], lo, hi,
                                     mi_size_of_slices(16), &size, &visits);
   CHECK(selected == &heap.pages[first] && page->retired_slot == NULL,
         "(i) full publication slots must not hide an unpublished page");
   // page-holes.c uses pointer value 1 for its transient busy marker.
   mi_atomic_store_ptr_relaxed(mi_page_t, &tld.retired_pages[0], (mi_page_t*)(uintptr_t)1);
   page->retired_slot = &tld.retired_pages[0];
-  selected = mi_page_repurpose_find(&heap, &heap.pages[lo], lo, hi,
+  selected = retired_search_checked(&heap, &heap.pages[lo], lo, hi,
                                     mi_size_of_slices(16), &size, &visits);
   CHECK(selected == &heap.pages[first], "(i) busy publication slot must not hide its owner queue");
   page->retired_slot = NULL;
   page->used = 1;
   second->retire_expire = 0;
-  selected = mi_page_repurpose_find(&heap, &heap.pages[lo], lo, hi,
+  selected = retired_search_checked(&heap, &heap.pages[lo], lo, hi,
                                     mi_size_of_slices(16), &size, &visits);
   CHECK(selected == NULL, "(i) active or expired pages must not be selected");
   fprintf(stderr, "(i) retired-search selection and bounded bin visits checked\n");
