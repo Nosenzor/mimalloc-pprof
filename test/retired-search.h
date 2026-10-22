@@ -54,7 +54,8 @@ static void case_retired_search(void) {
   selected = mi_page_repurpose_find(&heap, &heap.pages[lo], lo, hi,
                                     mi_size_of_slices(8), &size, &visits);
   CHECK(selected == &heap.pages[first], "(i) equal fits must keep the lowest-bin candidate");
-  CHECK(visits == last - first + 1, "(i) search inspected %zu bins outside the retired interval", visits);
+  CHECK(visits == hi - first + 1,
+        "(i) search inspected %zu bins, expected only the original suffix after the empty prefix", visits);
   selected = mi_page_repurpose_find(&heap, &heap.pages[first], lo, hi,
                                     mi_size_of_slices(16), &size, &visits);
   CHECK(selected == &heap.pages[last], "(i) destination queue must not serve itself");
