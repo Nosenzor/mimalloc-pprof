@@ -48,6 +48,8 @@ import perf_ab_stats
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAGS = [
+    "-DCMAKE_C_COMPILER=soldr",
+    "-DCMAKE_C_COMPILER_ARG1=cc",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DMI_BUILD_SHARED=OFF",
     "-DMI_BUILD_OBJECT=OFF",
@@ -264,6 +266,7 @@ def build(
     lib = next(out.glob("libmimalloc*.a"))
     run(
         [
+            "soldr",
             "cc",
             "-O2",
             *(["-DPERF_AB_DIAGNOSTIC=1"] if diagnostic else []),
@@ -281,6 +284,7 @@ def build(
         # throughput/RSS executable free of latency clocks and buffers.
         run(
             [
+                "soldr",
                 "cc",
                 "-O2",
                 "-DPERF_AB_LATENCY=1",

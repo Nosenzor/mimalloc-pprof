@@ -50,8 +50,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "complete": False,
         "diagnostic": "build-only; no measurements or regression verdict",
         "harness_sha": perf_ab.run(["git", "rev-parse", "HEAD"], cwd=perf_ab.ROOT).strip(),
-        "compiler": perf_ab.run(["cc", "--version"]),
-        "linker": perf_ab.run(["ld", "--version"]),
+        "compiler": perf_ab.run(["soldr", "cc", "--version"]),
+        "linker": perf_ab.run(
+            ["soldr", "cc", "-Wl,--version", "-x", "c", "/dev/null", "-o", "/dev/null"]
+        ),
         "cmake": perf_ab.run(["cmake", "--version"]),
         "runner": {
             key: os.environ.get(key, "")

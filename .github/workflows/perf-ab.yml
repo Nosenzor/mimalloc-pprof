@@ -96,6 +96,12 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - uses: zackees/setup-soldr@6bf04d4196ee26fe9d51550187013a7f32955e20 # v0
+        with:
+          cache: false
+          toolchain-file: rust/rust-toolchain.toml
+          lockfile: rust/Cargo.lock
+          target-dir: rust/target
       - name: paired A/B
         env:
           BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base }}
