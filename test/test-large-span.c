@@ -561,6 +561,8 @@ static void case_off(void) {
   #endif
 }
 
+#include "retired-search.h"
+
 int main(void) {
   #if !MI_ENABLE_LARGE_PAGES
   fprintf(stderr, "skipped: no large pages in this build\n");
@@ -592,6 +594,8 @@ int main(void) {
   case_repurpose();
   case_recarve_matrix();
   case_slots();
+  case_retired_search();
+  case_retired_search_budget();
   #endif
   if (failures > 0) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
   fprintf(stderr, "ok\n");
