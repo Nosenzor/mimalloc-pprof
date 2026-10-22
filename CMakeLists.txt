@@ -104,6 +104,7 @@ set(mi_sources
     src/options.c
     src/os.c
     src/page.c
+    src/page-retired-search.c
     src/page-map.c
     src/page-holes.c
     src/large-span.c
@@ -491,7 +492,8 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
                       src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
-                      src/arena-layout.c src/event-counters.c src/large-span.c)
+                      src/arena-layout.c src/event-counters.c src/large-span.c
+                      src/page-retired-search.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()

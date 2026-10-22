@@ -38,8 +38,8 @@ def test_preserved_children_match_actual_linked_executables(
 
 @pytest.fixture(scope="module")
 def latency_children(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    if shutil.which("cc") is None or shutil.which("cmake") is None:
-        pytest.skip("requires a C compiler and CMake")
+    if shutil.which("soldr") is None or shutil.which("cmake") is None:
+        pytest.skip("requires soldr and CMake")
     out = tmp_path_factory.mktemp("perf-ab-latency")
     subprocess.run(
         ["cmake", "-S", str(ROOT), "-B", str(out), *perf_ab.FLAGS],
@@ -54,6 +54,7 @@ def latency_children(tmp_path_factory: pytest.TempPathFactory) -> Path:
     for name, defines in (("perf_ab", []), ("perf_ab_latency", ["-DPERF_AB_LATENCY=1"])):
         subprocess.run(
             [
+                "soldr",
                 "cc",
                 "-O2",
                 "-Wall",

@@ -588,25 +588,8 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
     return NULL;
   }
   if (want < min_bytes) { want = min_bytes; }
-  mi_page_queue_t* best_pq = NULL;
-  size_t best_size = SIZE_MAX;
-  for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
-    mi_page_queue_t* const q = &theap->pages[bin];
-    mi_page_t* const page = q->first;
-    // only a retired page (the bin's only one, empty) whose meta lives outside its slices, so the
-    // block area starts at the slice start whatever the block size
-    if (q == pq || page == NULL || page != q->last || page->retire_expire == 0 || page->used != 0) continue;
-    if (page->memid.memkind != MI_MEM_ARENA || !mi_page_meta_is_separated(page)) continue;
-    #if MI_PPROF
-    if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
-    #endif
-    const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
-    if (size < want || size >= best_size) continue;
-    best_pq = q; best_size = size;   // best fit: the smallest that is large enough
-    // #585: no later page can improve an exact fit. Keep the same first-best
-    // selection while avoiding the remaining bins on every such re-carve.
-    if (size == want) break;
-  }
+  size_t best_size;
+  mi_page_queue_t* const best_pq = _mi_page_repurpose_find(theap, pq, bin_lo, bin_hi, want, &best_size);
   if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;

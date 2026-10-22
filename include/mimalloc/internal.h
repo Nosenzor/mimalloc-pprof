@@ -480,6 +480,14 @@ void          _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head);
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page);
 bool          _mi_page_queue_is_valid(mi_theap_t* theap, const mi_page_queue_t* pq);
 
+#if MI_LARGE_REPURPOSE
+// #610: keep the bounded selector outside the page-allocation caller, including
+// in the single-TU Rust build. The selector never allocates or changes queues.
+mi_decl_noinline mi_page_queue_t* _mi_page_repurpose_find(
+    mi_theap_t* theap, mi_page_queue_t* pq, size_t bin_lo, size_t bin_hi,
+    size_t want, size_t* best_size);
+#endif
+
 size_t        _mi_page_stats_bin(const mi_page_t* page); // for stats
 size_t        _mi_bin_size(size_t bin);                  // for stats
 size_t        _mi_bin(size_t size);                      // for stats

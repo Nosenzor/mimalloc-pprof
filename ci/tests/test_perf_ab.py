@@ -88,7 +88,10 @@ def test_diagnostic_child_compile_flag_does_not_change_default_child(
         (tmp_path / f"bin-{arm}-plain").mkdir()
     perf_ab.build("base", "OLD", tmp_path, "plain", [])
     perf_ab.build("head", "NEW", tmp_path, "plain", [], diagnostic=True)
-    compiles = [call for call in calls if call and call[0] == "cc"]
+    configure = [call for call in calls if call[:2] == ["cmake", "-S"]]
+    assert all("-DCMAKE_C_COMPILER=soldr" in call for call in configure)
+    assert all("-DCMAKE_C_COMPILER_ARG1=cc" in call for call in configure)
+    compiles = [call for call in calls if call[:2] == ["soldr", "cc"]]
     assert len(compiles) == 3
     assert "-DPERF_AB_DIAGNOSTIC=1" not in compiles[0]
     assert "-DPERF_AB_LATENCY=1" not in compiles[0]
