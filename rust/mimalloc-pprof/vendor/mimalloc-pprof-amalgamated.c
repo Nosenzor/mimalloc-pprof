@@ -1,4 +1,4 @@
-/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 14ef7ec5 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
+/* GENERATED FILE -- DO NOT EDIT. Produced by rust/xtask from commit 52eab5b3 of src/static.c. Regenerate with: cargo run -p xtask -- amalgamate-c */
 
 /* ---- begin inlined: src/static.c ---- */
 /* ----------------------------------------------------------------------------
@@ -5176,6 +5176,14 @@ void          _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force);
 void          _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head);
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page);
 bool          _mi_page_queue_is_valid(mi_theap_t* theap, const mi_page_queue_t* pq);
+
+#if MI_LARGE_REPURPOSE
+// #610: keep the bounded selector outside the page-allocation caller, including
+// in the single-TU Rust build. The selector never allocates or changes queues.
+mi_decl_noinline mi_page_queue_t* _mi_page_repurpose_find(
+    mi_theap_t* theap, mi_page_queue_t* pq, size_t bin_lo, size_t bin_hi,
+    size_t want, size_t* best_size);
+#endif
 
 size_t        _mi_page_stats_bin(const mi_page_t* page); // for stats
 size_t        _mi_bin_size(size_t bin);                  // for stats
@@ -25738,49 +25746,6 @@ static bool mi_page_set_geometry(mi_theap_t* theap, mi_page_t* page, size_t bloc
 // peak RSS in perf-ab, but the arena round trip (bitmaps, page map, purge scheduling) cost +76%
 // CPU. Re-carving the empty page for the bin that needs one keeps both: the slices, the page map
 // entries and the ownership stay as they are, only the block geometry changes.
-/* ---- begin inlined: src/page-retired-search.h ---- */
-/* #610: shared selection logic for the owner-side retired-page reuse slow path.
-   The optional inspection count is used by structural tests; production passes NULL,
-   and force-inlining removes both counter branches and writes from that call. */
-#ifndef MI_PAGE_RETIRED_SEARCH_H
-#define MI_PAGE_RETIRED_SEARCH_H
-
-static mi_decl_forceinline mi_page_queue_t* mi_page_repurpose_find(
-    mi_theap_t* theap, mi_page_queue_t* pq, size_t bin_lo, size_t bin_hi,
-    size_t want, size_t* best_size, size_t* inspected) {
-  mi_page_queue_t* best_pq = NULL;
-  *best_size = SIZE_MAX;
-  if (inspected != NULL) *inspected = 0;
-  // #610: retirement lowers this owner-side bound before returning; collection
-  // only raises it after checking every retired queue. It can be stale and
-  // over-inclusive, but covers unpublished pages as well as scavenger slots.
-  // Skip the empty prefix; retain the constant upper limit to avoid computing
-  // a second dynamic loop endpoint for the small remaining suffix.
-  if (bin_lo < theap->page_retired_min) bin_lo = theap->page_retired_min;
-  for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
-    if (inspected != NULL) (*inspected)++;
-    mi_page_queue_t* const q = &theap->pages[bin];
-    mi_page_t* const page = q->first;
-    // only a retired page (the bin's only one, empty) whose meta lives outside its slices, so the
-    // block area starts at the slice start whatever the block size
-    if (q == pq || page == NULL || page != q->last || page->retire_expire == 0 || page->used != 0) continue;
-    if (page->memid.memkind != MI_MEM_ARENA || !mi_page_meta_is_separated(page)) continue;
-    #if MI_PPROF
-    if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
-    #endif
-    const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
-    if (size < want || size >= *best_size) continue;
-    best_pq = q; *best_size = size;   // best fit: the smallest that is large enough
-    // #585: no later page can improve an exact fit. Keep the same first-best
-    // selection while avoiding the remaining bins on every such re-carve.
-    if (size == want) break;
-  }
-  return best_pq;
-}
-
-#endif
-/* ---- end inlined: src/page-retired-search.h ---- */
-
 static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* pq, size_t block_size) {
   if (block_size <= MI_MEDIUM_MAX_OBJ_SIZE || block_size > MI_LARGE_MAX_OBJ_SIZE) return NULL;
   // Within this heartbeat's budget only. A repurposed page's own bin may need a page again soon and
@@ -25806,7 +25771,7 @@ static mi_page_t* mi_page_repurpose_retired(mi_theap_t* theap, mi_page_queue_t* 
   }
   if (want < min_bytes) { want = min_bytes; }
   size_t best_size;
-  mi_page_queue_t* const best_pq = mi_page_repurpose_find(theap, pq, bin_lo, bin_hi, want, &best_size, NULL);
+  mi_page_queue_t* const best_pq = _mi_page_repurpose_find(theap, pq, bin_lo, bin_hi, want, &best_size);
   if (best_pq == NULL) { MI_EVENT(MI_EVENT_LARGE_REPURPOSE_NONE); return NULL; }
   (void)_mi_large_span_slices(theap, block_size, 0);   // it is the bin's page request: account it
   mi_page_t* const page = best_pq->first;
@@ -26636,6 +26601,67 @@ void* _mi_malloc_generic(mi_theap_t* theap, size_t size, size_t zero_huge_alignm
   return mi_malloc_generic_fallback(theap,size,zero, huge_alignment,ppage);
 }
 /* ---- end inlined: src/page.c ---- */
+/* ---- begin inlined: src/page-retired-search.c ---- */
+/* Owner-side retired-page selection, shared by the C and single-TU builds. */
+
+#if MI_LARGE_REPURPOSE
+/* ---- begin inlined: src/page-retired-search.h ---- */
+/* #610: shared selection logic for the owner-side retired-page reuse slow path.
+   The optional inspection count is used by structural tests; production passes NULL,
+   and force-inlining removes both counter branches and writes from that call. */
+#ifndef MI_PAGE_RETIRED_SEARCH_H
+#define MI_PAGE_RETIRED_SEARCH_H
+
+static mi_decl_forceinline mi_page_queue_t* mi_page_repurpose_find(
+    mi_theap_t* theap, mi_page_queue_t* pq, size_t bin_lo, size_t bin_hi,
+    size_t want, size_t* best_size, size_t* inspected) {
+  mi_page_queue_t* best_pq = NULL;
+  *best_size = SIZE_MAX;
+  if (inspected != NULL) *inspected = 0;
+  // #610: retirement widens these owner-side bounds before returning; collection
+  // only narrows them after checking every retired queue. They may be stale and
+  // over-inclusive, but cover unpublished pages as well as scavenger slots.
+  if (bin_lo < theap->page_retired_min) bin_lo = theap->page_retired_min;
+  if (bin_hi > theap->page_retired_max) bin_hi = theap->page_retired_max;
+  for (size_t bin = bin_lo; bin <= bin_hi; bin++) {
+    if (inspected != NULL) (*inspected)++;
+    mi_page_queue_t* const q = &theap->pages[bin];
+    mi_page_t* const page = q->first;
+    // only a retired page (the bin's only one, empty) whose meta lives outside its slices, so the
+    // block area starts at the slice start whatever the block size
+    if (q == pq || page == NULL || page != q->last || page->retire_expire == 0 || page->used != 0) continue;
+    if (page->memid.memkind != MI_MEM_ARENA || !mi_page_meta_is_separated(page)) continue;
+    #if MI_PPROF
+    if (page->has_metadata) continue;   // (an empty page holds no sample record, but be sure)
+    #endif
+    const size_t size = mi_size_of_slices(page->memid.mem.arena.slice_count);
+    if (size < want || size >= *best_size) continue;
+    best_pq = q; *best_size = size;   // best fit: the smallest that is large enough
+    // #585: no later page can improve an exact fit. Keep the same first-best
+    // selection while avoiding the remaining bins on every such re-carve.
+    if (size == want) break;
+  }
+  return best_pq;
+}
+
+#endif
+/* ---- end inlined: src/page-retired-search.h ---- */
+
+// #610: outlining keeps the bounded loop out of mi_page_fresh_alloc. The inline
+// body remains shared with structural tests; NULL removes its inspection counter.
+mi_decl_noinline mi_page_queue_t* _mi_page_repurpose_find(
+    mi_theap_t* theap, mi_page_queue_t* pq, size_t bin_lo, size_t bin_hi,
+    size_t want, size_t* best_size) {
+  // A local running minimum lets the compiler keep it in a register and write
+  // the caller's output only once after selection.
+  size_t size;
+  mi_page_queue_t* const selected = mi_page_repurpose_find(
+      theap, pq, bin_lo, bin_hi, want, &size, NULL);
+  *best_size = size;
+  return selected;
+}
+#endif
+/* ---- end inlined: src/page-retired-search.c ---- */
 /* ---- begin inlined: src/page-map.c ---- */
 /*----------------------------------------------------------------------------
 Copyright (c) 2023-2026, Microsoft Research, Daan Leijen
