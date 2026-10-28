@@ -246,11 +246,18 @@ void          _mi_fork_lock_order_observe(const mi_lock_t* lock);
 // #270: test-only hooks (test/test-fork-locks.c) that let a test GUARANTEE the main
 // subprocess's `heaps_lock` is held -- and the list it guards visibly poisoned -- at the
 // moment of fork(), instead of relying on a probabilistic race. See fork.c's
-// "MI_DEBUG-only test hooks" section.
+// "MI_DEBUG-only test hooks" section. C linkage, so a C test links them even when the
+// library is compiled as C++ (#619).
+#ifdef __cplusplus
+extern "C" {
+#endif
 void          _mi_test_hold_heaps_lock(void);
 bool          _mi_test_heaps_lock_is_held(void);
 void          _mi_test_release_heaps_lock(void);
 bool          _mi_test_heaps_lock_poison_observed(void);
+#ifdef __cplusplus
+}
+#endif
 #endif
 
 void*         _mi_meta_zalloc( mi_subproc_t* subproc, size_t size, mi_memid_t* memid );
@@ -479,6 +486,14 @@ void          _mi_page_free_collect_no_unpurge(mi_page_t* page, bool force);
 void          _mi_page_free_collect_partly(mi_page_t* page, mi_block_t* head);
 mi_decl_nodiscard bool _mi_page_init(mi_theap_t* theap, mi_page_t* page);
 bool          _mi_page_queue_is_valid(mi_theap_t* theap, const mi_page_queue_t* pq);
+
+#if MI_LARGE_REPURPOSE
+// #610: keep the bounded selector outside the page-allocation caller, including
+// in the single-TU Rust build. The selector never allocates or changes queues.
+mi_decl_noinline mi_page_queue_t* _mi_page_repurpose_find(
+    mi_theap_t* theap, mi_page_queue_t* pq, size_t bin_lo, size_t bin_hi,
+    size_t want, size_t* best_size);
+#endif
 
 size_t        _mi_page_stats_bin(const mi_page_t* page); // for stats
 size_t        _mi_bin_size(size_t bin);                  // for stats

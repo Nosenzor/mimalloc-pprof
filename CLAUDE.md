@@ -33,6 +33,12 @@ explicitly say `- State: **ready-to-publish**.`; a dry run never sets that state
 See
 `docs/ci-gates.md` and `ci/release_full_ci_manifest.v1.json`.
 
+0. **Stamp every PR head with the local gate** (zackees/ci.yml#166/#190/#198). Before each push run
+   `uvx --from git+https://github.com/zackees/ci.yml@0d0c5545b0f574f31c70fae2f961863984a13eae ci-lint local-gate run`
+   on a clean, committed tree (it runs `ci/local_gate.py`, the python-lint job's checks, and adds
+   `Local-Gate:`/`Ci-Attestation:` trailers). `python-lint.yml`'s `ci-mode` fails an unstamped PR
+   head, and skips the remote `lint` job for a stamped in-policy one; main pushes always run it.
+   See `local-gate.toml` and `ci-attestations.yml`.
 1. **Never commit directly to `main`.** Feature branch → PR → merge. Branch names come from
    the sub-issue. One PR per phase. Conventional commits (`feat:`, `fix:`, `ci:`, `docs:`, `test:`).
 2. **Never mix C-core paths (`src/`, `include/`, `test/`, `CMakeLists.txt`) and `rust/` paths
@@ -147,9 +153,9 @@ See
    (`-DMI_SCAVENGER_MAX_WAIT_MS=5000`, including from the Rust crate's build script). Make it an
    `mi_option` when it should be settable at run time, from C or Rust. Never write the value inline.
 
-12. **Performance accounting: memory buys CPU at 3:1, nothing else is free (owner rule,
-   2026-09-28).** Every allocator perf change reports a per-cell ledger against its fixed
-   baseline (the previous merged policy, exact SHA, same run/host): throughput, CPU per
+12. **Performance accounting: small measured gains are worthwhile; memory buys CPU at 3:1
+   (owner rules, 2026-09-28 and 2026-10-21).** Every allocator perf change reports a per-cell
+   ledger against its fixed baseline (the previous merged policy, exact SHA, same run/host): throughput, CPU per
    operation, minor faults, peak and after-drain RSS, p99 latency.
    - **Memory credit.** `saved%` = the cell's peak-RSS reduction as a share of the reducible
      gap, `(baseline - candidate) / (baseline - ideal)`, where `ideal` is the theoretical floor
@@ -158,16 +164,55 @@ See
      most +25% CPU/op (and at most -25% throughput); saving 30% allows 10%.
    - **Cells with no memory credit** (controls such as `small/8`, `larson/8`, and any cell whose
      RSS did not fall) allow **no** regression: a CPU/op or throughput change whose 95% CI lies
-     beyond perf-ab noise is a regression. INCONCLUSIVE is not a pass; rerun or narrow it.
+     beyond perf-ab noise is a regression. Keep INCONCLUSIVE labels; apply the acceptance
+     guidance below instead of automatically rerunning or blocking the whole PR.
+   - **Accept incremental gains.** Small, statistically supported CPU/throughput improvements
+     in intended workloads are valuable without a new RSS win or an arbitrary minimum gain.
+     Report improved, within-noise, inconclusive and regressed metrics separately. Never average
+     away a bad scenario or combine percentages from different hosts into an overall speedup.
+   - **Bounded uncertainty need not stall delivery.** With correctness/platform gates green,
+     supported target gains, passing CPU/throughput controls and no confirmed per-cell FAIL,
+     limited INCONCLUSIVE ancillary metrics may be accepted when their full intervals fit the
+     campaign's declared risk bounds, or the owner explicitly accepts the stated uncertainty.
+     Record the disposition in the PR and parent issue, retaining the numeric verdicts and raw
+     evidence. Do not retry merely to turn every label green. Wide intervals, missing coverage
+     and unexplained potential spikes still require attribution or a bounded follow-up.
+   - **Reject scenario spikes.** Reject confirmed CPU/throughput regressions beyond a cell's
+     noise/memory allowance, p99 regressions beyond noise (no memory credit), and peak/drain
+     RSS growth beyond noise. Fault regressions must fit the cell's existing memory allowance;
+     refault storms, service-bound violations, correctness failures and default/control-path
+     regressions cannot be paid for by gains elsewhere. Fix or remove the offending policy;
+     no aggregate score, relaxed threshold or repeated sampling erases a FAIL. Define service
+     and material-risk bounds before the next campaign, not after seeing a failed result.
+   - **Accepted example (#585 / PR #609, owner decision 2026-10-21).** Six workloads show
+     significant throughput gains and six show CPU/op gains, roughly 1–3% on the improved
+     paths: 75/78 metric checks PASS, three INCONCLUSIVE, zero FAIL. The owner accepted
+     profiler p99 (+0.51%, 95% CI -1.72% to +3.37%), chart-ephemeral faults (+0.39%,
+     0% to +1.18%) and peak RSS (-0.003%, -0.089% to +0.117%) with zero memory credit.
+     This accepts the candidate, not equivalence, a new memory win, or these bounds as universal
+     tolerances. See `docs/dev-loop.md` for the decision table and evidence.
    - **Regressions in the baseline are debts, not allowances.** The previous PR's measured costs
      (for example #538's exact-128-KiB +4.6% CPU, `random-large-bursty/8` +55% minor faults,
      `larson/8` +3.7% CPU) are the floor to improve, not a budget to spend.
-   - **p99:** perf-ab has no p99 column yet (#585); until it does, state "p99: not measured"
-     in the ledger rather than omitting it.
+   - **p99:** perf-ab measures sampled stream-operation p99 in separate replays (#585),
+     leaving throughput/RSS runs uninstrumented. Latency gets no memory credit. For older
+     artifacts, state "p99: not measured"; never invent a value or silently omit it.
    - **Attribute before designing, and measure reuse distance before any discard policy:** hot
      bytes refault at ~10x CPU (#575). See "Perf campaign method" in `docs/dev-loop.md`.
    - After the memory win lands, spend dedicated rounds cutting its CPU cost; reaching the 1/3
      ceiling is a limit, not a target. Put the ledger table in the PR and on the parent issue.
+
+## Design principles (fleet directives, zackees/ci.yml#163)
+
+Agent and review guidance from zackees/ci.yml `docs/policy-rust.md` ("Design principles, narrowed"). Not enforced by ci-lint; no rule ID.
+
+1. **Search before you add.** Before adding a resolver, detector, predicate, guard or path helper, `rg` for an existing one. Reuse it, or say in the PR why it does not fit.
+2. **Conflicting implementations get a research issue, not an inline winner.** If the same concept is implemented more than once with observably different behaviour and fixing it needs a design decision, file `research: N conflicting implementations of X -- which is canonical?` listing every copy (`file:line`) and what the difference does to real input; cross-reference it and carry on with your task. Copies that behave identically are a refactor, not an issue.
+3. **Keep behaviour changes and refactors apart.** Separate commits, preferably separate PRs, never one mixed diff. This sits beside hard rule 2 (never mix C-core and `rust/` paths in one commit); both apply.
+4. **Refactor first only when you would grow a giant function.** If a fix would add more than 50 lines to a function already over 200 lines, extract first in a separate behaviour-preserving change with characterization tests written first (RED -> GREEN). Otherwise fix it where it belongs; no unrequested restructures. Upstream mimalloc files are never restructured at all (hard rule 6): new logic goes in new files.
+5. **Function and file size follow `RUST-018`'s ceilings.** The `rust/` workspace does not run the ratchet yet (no clippy `too_many_lines`/`cognitive_complexity` lint config), so nothing mechanical holds this line. New functions still stay under clippy's `too_many_lines` (100) and `cognitive_complexity` (25), and an existing function over them must not grow. Never split a file with `include!` fragments to dodge a length ceiling. Before splitting a hot file, check `git branch -a --contains` for in-flight branches -- a split is a rename and conflicts destructively.
+6. **Fail fast, and delete before you abstract.** Reject invalid input at the boundary with a typed error; never fall back silently to a degraded path. Prefer deleting code to adding a layer. No new trait until there are two real implementations (a test double does not count). When reality diverges from a sub-issue, hard rule 7 still applies: escalate on the issue, do not improvise a fallback.
+7. **Existing boundaries beat generic DRY.** The upstream overlay boundary (hard rules 2 and 6: fork logic in new files, guarded one-line hooks in upstream files), the Rust/C crate split in `rust/`, and documented deliberate copies win over removing duplication. Do not copy code across a crate boundary to get around it -- say the boundary hurts. An undocumented copy is a finding under 2; a documented one is not.
 
 ## Repo facts
 

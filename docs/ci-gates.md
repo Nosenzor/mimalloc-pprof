@@ -72,7 +72,7 @@ verifying nothing**, each discovered by asking "has this ever actually failed?":
 | **fuzz** (`test/fuzz/`) | crashes from structured random allocator-API sequences, with ASan as the oracle | builds with a planted use-after-free and requires an anchored `(ERROR\|SUMMARY): AddressSanitizer:` report naming it |
 | **amalgamation-drift** | a C change that never reached the vendored copy the Rust crate compiles — which broke `main` twice before this gate existed | — |
 | **doc-snippets** (`ci/check_doc_snippets.py`) | fenced ```c examples in `README.md`/`docs/*.md` that don't compile against the real headers — caught one in PR #259 (a snippet using `mi_prof_config_t_decl`/`mi_prof_start_ex` with no `#include` at all) | `--self-test` plants a snippet calling an undeclared mimalloc function; the checker must reject it, on both gcc and clang |
-| **python-lint** | the gate scripts themselves — `ruff` + `pyright --strict` | — |
+| **python-lint** (`ci/local_gate.py --lane lint`) | the gate scripts themselves — `ruff` + `pyright --strict`, every `ci/` gate script's `--selftest`, the committed charts and README feature table re-rendering from their data, the release-time ratchet, the USDT-probe and struct-size checks, and `pytest ci/tests`. The same command is the local gate (`local-gate.toml`): an attested, in-policy PR head skips the remote `lint` job (zackees/ci.yml GATE-008/010); pushes to `main` always run it | `python-lint.yml`'s `ci-mode` job fails a PR head without a valid `Local-Gate:` trailer; `ci/tests/test_local_gate.py` keeps the workflow on exactly the gate lane |
 | **zero-tracking** | correctness and footprint of `mi_option_purge_zeroes`, reported as paired interleaved A/B medians with the within-arm spread alongside. Linux runs it in its own path-filtered workflow; Windows runs it as a gated step inside `run-windows` (#277 phase E), and the *correctness* half is unconditional there because `test-zero-tracking*` are ordinary ctest tests carried in every bundle | — |
 | **bun-surface** (`ci/check_bun_surface.py`) | whether `oven-sh/bun`'s exact `scripts/build/deps/mimalloc.ts` DirectBuild (`src/static.c` compiled as C++ with Bun's define set) can actually link against every `mi_*` symbol Bun's Rust FFI and C++ consumers reference, plus `MI_MAX_ALIGN_SIZE` / `mi_heap_area_t` / `mi_option_t` slot-0-42 ABI drift via `test/test-bun-surface.cpp`'s `static_assert`s | the script's own exit code already reflects reality (1 on any missing symbol or failed assert) |
 
@@ -935,11 +935,12 @@ Stated rather than gated:
 
 The win-gnu lane asks for `ci/memory-baselines/windows-x64-soldr-mingw-gcc-15-pprof1.json`
 via `--arch x64 --compiler soldr-mingw-gcc-15`, so it cannot borrow
-`windows-pprof1.json`, which MSVC recorded on the same runner. That file does not exist
-yet, so the first runs take the "no baseline → bootstrap it" path (`memory_gate.py where`
-exits 3) and upload their JSON; the positive control is skipped with a warning until the
-baseline is committed, because `control` requires `check` to *fail* and a missing baseline
-is not a failure.
+`windows-pprof1.json`, which MSVC recorded on the same runner. The reference is
+recorded from eight runs of the previous merged allocator; its source, artifact and
+input hashes are in [the baseline provenance](../ci/memory-baselines/README.md).
+Both the normal comparison and the injected-leak positive control are now enforced.
+A future toolchain key with no reference takes the bootstrap path (`where` exits 3)
+and warns that its comparison and positive control have not run.
 
 ### Rollout
 
@@ -1213,11 +1214,12 @@ The MSVC bundle lane asks for
 `ci/memory-baselines/windows-x64-soldr-clang-cl-21-pprof1.json` via
 `--arch x64 --compiler soldr-clang-cl-21`. It must **not** borrow `windows-pprof1.json`,
 which native `cl` recorded on the same runner — that would be a cross-toolchain comparison
-dressed as a regression check. That file does not exist yet, so the first runs take the
-"no baseline → bootstrap it" path (`memory_gate.py where` exits 3) and upload their JSON;
-the positive control is skipped with a warning until the baseline is committed, because
-`control` requires `check` to *fail* and a missing baseline is not a failure. Same
-follow-up as phase B's correction 8 and phase C's correction 7.
+dressed as a regression check. The reference is recorded from eight runs of the
+previous merged allocator; see [the baseline provenance](../ci/memory-baselines/README.md).
+The comparison and injected-leak positive control are enforced for this key.
+Future keys without a reference still take the bootstrap path (`where` exits 3)
+and warn that neither comparison nor positive control has run. Never initialize
+the reference from an allocator candidate merely to make its gate pass.
 
 ### Rollout
 

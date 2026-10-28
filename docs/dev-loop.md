@@ -127,11 +127,15 @@ confirm it, not to explore. The safety nets that make that cheap:
   A head arm whose peak RSS, RSS after drain or RSS at the release bound exceeds
   `1.5 x base + 8 MiB` fails the job at once (`SANITY_FACTOR`, `SANITY_SLACK_MIB` in
   `ci/perf_ab.py`). A dispatch that is meant to trade memory away sets `sanity_gate: false`.
-- **One live run per PR.** `perf-ab` cancels its older run on a new push, and only the
-  `perf-ab` label itself starts a run. Trap (#575): pushing to a PR branch (even a docs or
-  regenerated-amalgamation commit) cancels an in-flight 15-rep run, so do not push until the
-  ledger is in; dispatch against a `head_sha` instead. A guard is on #585. `head_sha` dispatches a commit other than the ref the
-  workflow runs from.
+- **One live run per PR.** `perf-ab` queues new pushes behind the running measurement
+  instead of cancelling it (#585). Only the `perf-ab` label starts a labelled run;
+  dispatches have independent concurrency groups. A `head_sha` dispatch always uses
+  the dispatch ref's measurement harness, even when the measured allocator is older.
+- **p99 latency.** A separate replay executable samples stream-operation latency
+  (free or replacement, including page touches), using a deterministic power-of-two
+  stride and at most 4096 samples per worker. The throughput/RSS executable has no
+  latency clocks or sample buffers. Each paired repetition includes a latency replay;
+  its p99 is reported and judged against the null-arm noise, with no memory credit.
 - **Page-map check.** At `MI_DEBUG>=2`, `_mi_page_init` asserts that the page map resolves the
   first byte and the last byte of a page's blocks to that page. A re-carve that changes a page's
   geometry without re-registering it fails on the first local debug ctest, not in a
@@ -189,13 +193,61 @@ copy it here.
    in the large/retire/purge paths. Follow-up on #585.
 5. **Tooling traps.**
    - `benchmark-scaling` above 15 blocks blows the 1500 s shard budget on the 8-worker shard.
-   - Pushing to a PR branch cancels an in-flight `perf-ab` run (see above).
-   - `perf-ab` has no p99 column, although rule 12 demands p99. Until #585 adds one, the PR
-     ledger must say "p99: not measured" instead of omitting it.
+   - Pushes now queue behind in-flight `perf-ab` measurements; label and dispatch runs
+     keep their isolated groups.
+   - Artifacts from before #585 have no p99 measurement. Do not supply a synthetic
+     latency value to re-judge them with the new harness.
    - The 8-worker cells run on a 4-vCPU EPYC 7763 VM (2 physical cores), 2:1 oversubscribed:
      they measure contention under oversubscription, not core scaling.
    - A local untimed residency probe is allowed; timing is CI-only (see the memory gate loop
      below).
+
+### Accepting incremental performance improvements (owner decision 2026-10-21)
+
+Small improvements are useful: there is no minimum percentage gain and a CPU optimization
+need not also reduce RSS. Require a statistically supported gain on intended workloads,
+representative controls, the fixed-baseline per-cell ledger, and green correctness/platform
+gates. A PASS means the regression gate passed; it does not prove improvement or equality.
+A beneficial point estimate whose interval crosses zero is not a demonstrated gain.
+
+| Evidence | Disposition |
+|---|---|
+| Supported target gains; remaining metrics PASS | Accept a small improvement; report its size and scope |
+| Limited INCONCLUSIVE ancillary metrics; CPU/throughput and controls PASS; no confirmed FAIL | Accept when the full intervals fit declared campaign risk bounds, or with explicit owner acceptance of the stated uncertainty; preserve INCONCLUSIVE labels |
+| Wide uncertainty, missing relevant coverage, or an interval allowing a material scenario spike | Attribute or run a bounded, planned follow-up; do not claim equivalence |
+| CPU/throughput FAIL beyond that cell's noise and permitted memory credit | Reject or revise, even if other workloads improve |
+| p99 FAIL beyond noise, peak/drain RSS FAIL beyond noise, or faults beyond the existing per-cell allowance | Reject or revise; p99 receives no memory credit |
+| Refault storm, declared service-bound violation, or correctness/platform failure | Reject or fix before acceptance; an average win cannot compensate |
+
+Declare intended workloads, controls, sampling limits and material-risk/service bounds before
+the campaign. Keep the existing 3:1 memory-credit rule; credit belongs only to the cell that
+saved memory. Do not introduce a post-result tolerance, pool incompatible hosts, discard failed
+runs, or retry unchanged code until a FAIL disappears. An INCONCLUSIVE result is neither PASS
+nor a confirmed regression. Do not automatically stall a useful change or exhaustively rerun
+all metrics just because a few remain uncertain. Record accepted uncertainty in the PR and
+parent issue; otherwise narrow the unresolved risk with a specific attribution question.
+
+**Accepted example: #585 / PR #609.** The owner accepted this candidate on 2026-10-21:
+13 workload rows, 78 metric checks, 75 PASS, three INCONCLUSIVE, zero FAIL. Six workloads have
+significant throughput gains and six have significant CPU/op gains; improved paths are roughly
+1–3% faster or cheaper. All CPU/throughput checks pass. There is no established new memory win
+and memory credit is zero. These counts are not an aggregate performance score.
+
+| Accepted uncertainty | Paired estimate | 95% interval | Existing noise allowance |
+|---|---:|---:|---:|
+| Profiler-on large-class/8 p99 | +0.51% | -1.72% to +3.37% | 2.25% |
+| Chart ephemeral/8 minor faults | +0.39% | 0% to +1.18% | 0.79% |
+| Chart ephemeral/8 peak RSS | -0.003% | -0.089% to +0.117% | 0.097% |
+
+The owner accepted those explicit risks; the ledger remains unchanged. This does not establish
+universal tolerances or complete the remaining memory investigations. In contrast, the rejected
+aging-setting-2 trial saved 3.9% peak RSS but worsened p99 by 9.8% [7.6%, 10.8%], against 1.4%
+noise: the memory gain cannot buy that tail-latency spike. Earlier retired-body discard trials
+cost +107% to +1080% CPU and remain rejected.
+
+Evidence: [combined current ledger](https://github.com/zackees/mimalloc-pprof/issues/422#issuecomment-6329851624),
+[full uncertainty ledger](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6328936369),
+and [rejected aging trial](https://github.com/zackees/mimalloc-pprof/issues/585#issuecomment-6304942092).
 
 ### The perf-ab pipeline (#573 B3-B8)
 
@@ -208,14 +260,39 @@ uv run ci/perf_ab_dispatch.py --ref perf/my-branch --head-env 'MIMALLOC_X=4 || M
 uv run ci/perf_ab_dispatch.py --from-json a.json b.json
 ```
 
+For one exact workload, prefix its full name with `=`:
+`--workloads '=large-class-ephemeral/8'`. Unprefixed terms still match substrings;
+`|` combines either form. This permits attribution of the plain row without also
+selecting its chart variants. Long adaptive groups can approach the 90-minute job
+limit with separate latency replays; select individual rows while preserving their
+original parameters, seeds and touch policy.
+
 - **Raw samples.** Every run uploads `perf-ab-samples` (`perf-ab-samples.json`): per-repetition
   values for every row and arm, the base and head SHAs, defines, environment, CPU model and the
-  RSS floor. `ci/perf_ab_ledger.py` judges them; nothing is scraped from a log.
+  RSS floor. An atomic checkpoint is saved after each completed timing/latency pair,
+  starting with an empty checkpoint before measurement. Checkpoints remain
+  `complete: false` until the whole run finishes; interrupted or unbalanced data
+  cannot receive a regression verdict or be pooled. Parent progress lines identify
+  the workload, repetition and arm being measured. `ci/perf_ab_ledger.py` judges
+  completed data; nothing is scraped from a log.
+  CI also uploads `perf-ab-builds`: the exact timing and latency executables by arm/build
+  kind, with SHA-256 digests. They are copied before the first measurement so forced
+  CI termination can retain them even when Python cleanup never runs. A copy error
+  aborts before measurements. Local runs opt in with
+  `--preserve-builds <new-directory>`.
+- **Arm order (#585).** Each block of `len(arms)` repetitions rotates every arm through
+  every execution position; alternate blocks reverse direction. For three arms the six-run
+  cycle covers all permutations. This removes the old endpoint-only reversal's confound,
+  which always left head in the middle. Extra variants retain position balance, without
+  guaranteeing all possible carryover pairings. Artifacts record `arm_order_protocol`;
+  pooling refuses a different or missing protocol. Old failures remain evidence, and this
+  correction alone does not explain them. Use complete blocks when selecting repetition counts.
 - **Rule-12 ledger.** Per row: `saved%` of the reducible peak-RSS gap (against the RSS floor
   `ci/perf_ab.c` prints: the RSS before the work plus the live requested bytes), then for
   throughput, CPU, faults, peak and after-drain RSS the paired change, its allowance (`saved%/3`
   for the first three, noise for memory and for cells that saved nothing) and PASS, FAIL or
-  INCONCLUSIVE. INCONCLUSIVE is not a pass.
+  INCONCLUSIVE. INCONCLUSIVE is not a statistical pass; delivery disposition follows
+  the incremental-improvement guidance above without changing that verdict.
 - **Honest intervals.** The interval on a median is the distribution-free sign-test interval, not
   a percentile bootstrap (anticonservative at 7 or 15 reps). Only the rule-12 metrics are marked.
 - **Noise floor.** `null_arm` measures base a second time in the same rotation; a difference is
@@ -225,6 +302,13 @@ uv run ci/perf_ab_dispatch.py --from-json a.json b.json
   INCONCLUSIVE, up to that many; conclusive rows stop at `reps`.
 - **`fp` build.** `--force-kind fp` builds every row with `-fno-omit-frame-pointer`, for
   `perf record -g` and caller-report shims.
+- **Linked-build attribution (#585).** Dispatch `perf-ab.yml` with `build_report_only=true`
+  and exact `base` / `head_sha` revisions to preserve the plain timing and latency executables,
+  static libraries, symbols, disassembly, hashes, compiler versions, runner image and CMake
+  settings in `perf-ab-build-report`. It runs no workloads and produces no performance verdict;
+  its metadata is explicitly incomplete for ledger purposes. These are fresh builds, so they
+  cannot establish the exact layout of binaries discarded by an earlier measurement. Compare
+  compiler/image identity before using their layout to explain an earlier result.
 
 ### Local tooling (#573 C)
 
@@ -264,11 +348,11 @@ first; use perf-ab to confirm, not to explore.
 ### Benchmark scaling: diagnostics, caches and alerts (#573 B7, B9)
 
 - **Diagnostic sweeps take 15 blocks per cell in practice** (`MIN_DISPATCH_BLOCKS` in
-  `ci/scaling_diagnostic.py` enforces only the floor of 15, before anything is built). A 5-block
+  `ci/scaling_diagnostic.py` enforces exactly 15 blocks, before anything is built). A 5-block
   sweep left a 30-45 MiB spread per cell and produced a false +6-12% RSS regression; 15 resolved
   single cells. More than 15 blocks over the 8-worker shard exceeds the runner's 1500 s projected
   budget (#575: 30 blocks projected 2150 s, 40 blocks 1503 s, both failed before measuring); the
-  workflow's "15-40" input text is wrong until #585 fixes the cap. Use 15, or narrow
+  dispatch input is capped at 15 (#585). Use 15, or narrow
   `diagnostic_patterns` / `diagnostic_threads` and pool runs.
 - **Two allocator caches.** `benchmark-scaling.yml` restores the four reference allocators (TCMalloc,
   jemalloc, upstream and Bun mimalloc) keyed on their pins, patches and the builder only, and the

@@ -36,7 +36,7 @@ jobs:
     outputs:
       sha: ${{ steps.identity.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.sha }}
           fetch-depth: 0
@@ -94,8 +94,7 @@ jobs:
           # diagnostics were unconditional C), so cross coverage is unchanged. `owner-gate`
           # is deliberately not here -- it changes allocator behaviour and has its own rows.
           - target: x86_64-unknown-linux-gnu
-            # Plain cargo, not `soldr cargo`: see the comment on cmd= in build-cross.
-            command: cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run
+            command: soldr cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run
             cflags: ""
           - target: aarch64-unknown-linux-gnu
             command: soldr cargo zigbuild -p mimalloc-pprof --features pprof,memory-events,diagnostics --tests
@@ -104,7 +103,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -163,7 +162,7 @@ jobs:
             ls -1 "dist/$TARGET" || echo "  (none)"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-bins-${{ matrix.target }}
           path: rust/dist/${{ matrix.target }}
@@ -187,7 +186,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -197,6 +196,11 @@ jobs:
           version: "0.9.27"
           save-cache: ${{ env.ACT && 'true' || 'auto' }}
           cache: true
+          # #585: the restored cache claims Windows ARM64 std is installed but
+          # soldr cargo fails E0463 (run 39496161094). Targets added after setup
+          # can have metadata without their libraries (setup-soldr#507, soldr#3793).
+          # Use a fresh toolchain for this row until upstream repairs that cache.
+          solo-toolchain-cache: ${{ matrix.target != 'aarch64-pc-windows-msvc' }}
           toolchain-file: rust/rust-toolchain.toml
           lockfile: rust/Cargo.lock
           target-dir: rust/target
@@ -205,16 +209,14 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: soldr prepare --target "$TARGET" --github-env "$GITHUB_ENV"
-      - name: Add the musl target to the pinned toolchain (#273 8a)
-        # rust-toolchain.toml's `targets` list does not carry x86_64-unknown-linux-musl
-        # (it would then be fetched for every contributor, not just this CI job), and
-        # `soldr prepare --target x86_64-unknown-linux-musl` provisions the musl-gcc
-        # cross toolchain and its env vars but does NOT itself add the target to the
-        # pinned rustc's sysroot -- confirmed locally: without this step, `cargo build
-        # --target x86_64-unknown-linux-musl` fails E0463 "can't find crate for `core`"
-        # even right after a successful `soldr prepare`.
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: soldr rustup target add x86_64-unknown-linux-musl
+      - name: Add the matrix target to the pinned Rust toolchain
+        # `soldr prepare` provisions the C cross toolchain, but does not add Rust's
+        # standard library to the pinned sysroot. The contributor toolchain's target
+        # list omits musl and Windows ARM64; both need an explicit CI installation
+        # (#273 8a; #585 full-matrix run 39491173013 failed E0463 on Windows ARM64).
+        env:
+          TARGET: ${{ matrix.target }}
+        run: soldr rustup target add "$TARGET"
       - name: Keep the Apple + musl builds unwindable (frame pointers)
         # #277 §4: build-linux sets RUSTFLAGS/CFLAGS at job level and this job set
         # neither, so the Apple test binaries were built without frame pointers while the
@@ -287,20 +289,11 @@ jobs:
             fi
             return "$rc"
           }
-          # Plain `cargo`, NOT `soldr cargo`. setup-soldr still provisions the
-          # toolchain above; only the build wrapper is dropped.
-          #
-          # Every `soldr cargo test --no-run` target has been failing to link since
-          # ~23:10 with `undefined reference to mi_prof_is_enabled` and friends, while
-          # the two targets that do NOT use it (aarch64-linux via zigbuild, and the
-          # MinGW job) keep passing. build.rs defines MI_PPROF=1 unconditionally and the
-          # vendored amalgamation contains every missing symbol, so the C is right and
-          # something in the wrapper is dropping it.
-          #
-          # Already tested and disproved: build-cache:false, linker:platform-default,
-          # and cache:false (the action's own "skip zccache wrapping entirely" switch).
+          # #585 owner direction: install and build through soldr so both commands
+          # use the same toolchain binding. Plain cargo could not see the Windows
+          # ARM64 std that soldr rustup reported installed (run 39495221785).
           # #414: name the features explicitly -- `default = []` since 0.12.0.
-          cmd="cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run"
+          cmd="soldr cargo test -p mimalloc-pprof --features pprof,memory-events,diagnostics --no-run"
           if ! run_build "$cmd"; then
             echo "::warning::build failed; retrying with the soldr compile cache bypassed (soldr#1969)"
             run_build "${cmd/soldr/soldr --no-cache}"
@@ -315,7 +308,7 @@ jobs:
             ls -1 "dist/$TARGET" || echo "  (none)"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-bins-${{ matrix.target }}
           path: rust/dist/${{ matrix.target }}
@@ -337,7 +330,7 @@ jobs:
       run:
         working-directory: rust
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve-candidate.outputs.sha }}
       - uses: zackees/setup-soldr@v0
@@ -369,7 +362,7 @@ jobs:
           $dist = Join-Path $PWD 'dist/x86_64-pc-windows-gnu'
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           $bins | ForEach-Object { Copy-Item $_ -Destination $dist }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-bins-x86_64-pc-windows-gnu
           path: rust/dist/x86_64-pc-windows-gnu
@@ -423,7 +416,7 @@ jobs:
             runner: windows-latest
             pprof: true
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: test-bins-${{ matrix.target }}
           path: dist/${{ matrix.target }}
@@ -443,7 +436,7 @@ jobs:
             & $_.FullName --test-threads=4
             if ($LASTEXITCODE -ne 0) { throw "test failed: $($_.Name)" }
           }
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: matrix.pprof
         with:
           go-version: stable

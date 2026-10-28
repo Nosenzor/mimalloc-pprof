@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -88,14 +91,19 @@ def test_diagnostic_child_compile_flag_does_not_change_default_child(
         (tmp_path / f"bin-{arm}-plain").mkdir()
     perf_ab.build("base", "OLD", tmp_path, "plain", [])
     perf_ab.build("head", "NEW", tmp_path, "plain", [], diagnostic=True)
-    compiles = [call for call in calls if call and call[0] == "cc"]
-    assert len(compiles) == 2
+    configure = [call for call in calls if call[:2] == ["cmake", "-S"]]
+    assert all("-DCMAKE_C_COMPILER=soldr" in call for call in configure)
+    assert all("-DCMAKE_C_COMPILER_ARG1=cc" in call for call in configure)
+    compiles = [call for call in calls if call[:2] == ["soldr", "cc"]]
+    assert len(compiles) == 3
     assert "-DPERF_AB_DIAGNOSTIC=1" not in compiles[0]
-    assert "-DPERF_AB_DIAGNOSTIC=1" in compiles[1]
+    assert "-DPERF_AB_LATENCY=1" not in compiles[0]
+    assert "-DPERF_AB_LATENCY=1" in compiles[1]
+    assert "-DPERF_AB_DIAGNOSTIC=1" in compiles[2]
 
 
 def run_main(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *argv: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *argv: str, expected_status: int = 0
 ) -> tuple[str, list[tuple[str, list[str]]], list[list[str]]]:
     """main() with the builds and children faked: which arm got which defines, the child
     command lines, and the summary."""
@@ -107,6 +115,8 @@ def run_main(
         return work / f"bin-{arm}-{kind}" / "perf_ab"
 
     def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
+        if Path(cmd[0]).name == "perf_ab_latency":
+            return "1000\n"
         if cmd[1:2] == ["probe"]:
             arm = "head" if "bin-head" in cmd[0] else "base"
             kind = "singleton" if arm == "head" else "large"
@@ -123,12 +133,17 @@ def run_main(
 
     monkeypatch.setattr(perf_ab, "build", build)
     monkeypatch.setattr(perf_ab, "run", run)
+
+    def run_measured(cmd: list[str], env: dict[str, str]) -> str:
+        return run(cmd, env=env)
+
+    monkeypatch.setattr(perf_ab, "run_measured", run_measured)
     monkeypatch.setattr(perf_ab, "run_stderr", run_stderr)
     monkeypatch.setattr(perf_ab, "cpu_model", lambda: "test CPU")
     summary = tmp_path / "summary.md"
     argv_full = ["perf_ab.py", "--base", "B", "--head", "H", "--reps", "1", "--summary"]
     monkeypatch.setattr("sys.argv", [*argv_full, str(summary), *argv])
-    assert perf_ab.main() == 0
+    assert perf_ab.main() == expected_status
     return summary.read_text(), builds, children
 
 
@@ -171,6 +186,20 @@ def test_probe_table_marks_the_arms_that_differ(
     # every diagnostic size is probed once a diagnostic row runs
     for size in perf_ab.DIAGNOSTIC_SIZES.values():
         assert f"| {size:,} |" in table
+
+
+def test_exact_workload_selector_runs_only_the_named_plain_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = "large-class-ephemeral/8"
+    table, builds, children = run_main(tmp_path, monkeypatch, "--workloads", f"={name}")
+    assert f"| {name} |" in table
+    assert "(chart build)" not in table
+    assert len(builds) == len(children) == 2
+    for child in children:
+        assert child[1:-1] == list(map(str, perf_ab.WORKLOADS[name][1]))
+        assert "-plain/" in child[0]
+    assert set(perf_ab.select(f"={name}|=larson/1")) == {name, "larson/1"}
 
 
 def test_diagnostic_rows_are_opt_in() -> None:
@@ -247,6 +276,10 @@ def test_workflow_passes_head_cppdefs_through_the_environment() -> None:
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["head_cppdefs"]["default"] == ""
     step = ab_step(workflow)
+    assert step["env"]["HEAD_REF"] == "${{ inputs.head_sha || 'HEAD' }}"
+    assert '--head "$HEAD_REF"' in step["run"]
+    checkout = workflow["jobs"]["ab"]["steps"][0]
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
     assert step["env"]["HEAD_CPPDEFS"] == "${{ inputs.head_cppdefs }}"
     assert '--head-cppdefs "$HEAD_CPPDEFS"' in step["run"]
     assert "${{" not in step["run"]  # inputs reach the shell as data, never as script
@@ -340,6 +373,19 @@ def test_sanity_gate_ignores_cpu_and_throughput() -> None:
     assert perf_ab.sanity_failures(_first(base, head), ["row"]) == []
 
 
+def test_sanity_gate_reference_absorbs_null_arm_spread() -> None:
+    # #620: run 39896572843 -- base 48.3, head 208.5, null (same base binary) 208.0 MiB
+    drain = "RSS_0.5_s_after_drain_MiB"
+    base = _metrics(**{drain: 48.3})
+    head = _metrics(**{drain: 208.5})
+    null = _metrics(**{drain: 208.0})
+    assert perf_ab.sanity_failures(_first(base, head), ["row"])
+    reference = perf_ab.sanity_reference(base, null)
+    assert perf_ab.sanity_failures(_first(reference, head), ["row"]) == []
+    # without a null arm the reference is base itself, so the gate keeps its teeth
+    assert perf_ab.sanity_reference(base, None) is base
+
+
 def test_replay_build_counts_events_and_prints_them() -> None:
     # #573 A1: the untimed replay carries MI_STAT=1 and asks for the statistics at exit
     assert "MI_STAT=1" in perf_ab.KIND_CPPDEFS[perf_ab.HOLES_KIND]
@@ -348,12 +394,12 @@ def test_replay_build_counts_events_and_prints_them() -> None:
     assert set(perf_ab.KIND_CPPDEFS) == {perf_ab.HOLES_KIND}
 
 
-def test_workflow_gates_and_cancels_per_pr() -> None:
+def test_workflow_gates_and_preserves_running_measurements() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["sanity_gate"]["default"] is True
     assert inputs["head_sha"]["default"] == ""
-    assert workflow["concurrency"]["cancel-in-progress"] is True
+    assert workflow["concurrency"]["cancel-in-progress"] is False
     # another label's (skipped) run must not share the group of a live perf-ab run
     assert "github.event.label.name != 'perf-ab'" in workflow["concurrency"]["group"]
     condition = workflow["jobs"]["ab"]["if"]
@@ -409,6 +455,7 @@ def metric_columns(
         return {
             "ops/s": [ops[index] * (1 + 0.001 * i) for i in range(7)],
             "cpu s": [cpu[index] * (1 + 0.001 * i) for i in range(7)],
+            "p99 operation ns": [1000.0] * 7,
             "minor faults": [1000.0 * (1 + 0.001 * i) for i in range(7)],
             perf_ab_ledger.PEAK: [peak[index] * (1 + 0.001 * i) for i in range(7)],
             perf_ab_ledger.DRAIN: [50.0 * (1 + 0.001 * i) for i in range(7)],
@@ -510,6 +557,154 @@ def test_null_arm_reuses_the_base_binary(tmp_path: Path, monkeypatch: pytest.Mon
     assert len(exes) == 3 and len(set(exes)) == 2  # base twice, head once
 
 
+@pytest.mark.parametrize("failed_sanity", [False, True])
+def test_preserves_measured_children_on_success_and_sanity_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_sanity: bool
+) -> None:
+    captured: list[tuple[set[tuple[str, str]], Path]] = []
+
+    def capture(exes: dict[tuple[str, str], Path], output: Path) -> None:
+        captured.append((set(exes), output))
+
+    def sanity(*_: object) -> list[str]:
+        return ["test failure"] if failed_sanity else []
+
+    monkeypatch.setattr(perf_ab, "preserve_builds", capture)
+    monkeypatch.setattr(perf_ab, "sanity_failures", sanity)
+    output = tmp_path / "builds"
+    run_main(
+        tmp_path,
+        monkeypatch,
+        "--workloads",
+        "small",
+        "--null-arm",
+        "--preserve-builds",
+        str(output),
+        expected_status=int(failed_sanity),
+    )
+    assert captured == [({("base", "plain"), ("head", "plain"), ("null", "plain")}, output)]
+
+
+def test_build_preservation_error_stops_before_measurements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_copy(*_: object) -> None:
+        raise OSError("test copy failure")
+
+    monkeypatch.setattr(perf_ab, "preserve_builds", fail_copy)
+    output = tmp_path / "samples.json"
+    with pytest.raises(OSError, match="test copy failure"):
+        run_main(
+            tmp_path,
+            monkeypatch,
+            "--workloads",
+            "small",
+            "--json",
+            str(output),
+            "--preserve-builds",
+            str(tmp_path / "builds"),
+        )
+    data = json.loads(output.read_text())
+    assert data["complete"] is False
+    assert all(not rows for rows in data["samples"]["small/8 (control)"].values())
+
+
+def test_preserves_executables_before_the_first_measurement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preserved = False
+    observed: list[bool] = []
+    original_measure = perf_ab.measure
+
+    def capture(*_: object) -> None:
+        nonlocal preserved
+        preserved = True
+
+    def measure(*args: Any) -> list[float]:
+        observed.append(preserved)
+        return original_measure(*args)
+
+    monkeypatch.setattr(perf_ab, "preserve_builds", capture)
+    monkeypatch.setattr(perf_ab, "measure", measure)
+    run_main(
+        tmp_path, monkeypatch, "--workloads", "small", "--preserve-builds", str(tmp_path / "builds")
+    )
+    assert observed and all(observed)
+
+
+@pytest.mark.parametrize("completed", [0, 1, 4])
+def test_interruption_retains_completed_measurements_as_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completed: int
+) -> None:
+    original_measure = perf_ab.measure
+    measured: list[list[float]] = []
+
+    def measure(*args: Any) -> list[float]:
+        if len(measured) == completed:
+            raise KeyboardInterrupt("simulated CI termination")
+        values = original_measure(*args)
+        measured.append(values)
+        return values
+
+    monkeypatch.setattr(perf_ab, "measure", measure)
+    out = tmp_path / "interrupted.json"
+    with pytest.raises(KeyboardInterrupt, match="simulated CI termination"):
+        run_main(
+            tmp_path,
+            monkeypatch,
+            "--workloads",
+            "small",
+            "--null-arm",
+            "--reps",
+            "6",
+            "--json",
+            str(out),
+        )
+    data = json.loads(out.read_text())
+    assert data["complete"] is False
+    arms = data["samples"]["small/8 (control)"]
+    saved = [row for rows in arms.values() for row in rows]
+    assert len(saved) == len(measured) == completed
+    assert all(row == measured[0] for row in saved)
+
+
+def test_candidate_occupies_every_execution_position(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, children = run_main(
+        tmp_path, monkeypatch, "--workloads", "small", "--null-arm", "--reps", "6"
+    )
+    positions = [
+        next(i for i, cmd in enumerate(children[start : start + 3]) if "bin-head" in cmd[0])
+        for start in range(0, len(children), 3)
+    ]
+    assert [positions.count(i) for i in range(3)] == [2, 2, 2]
+
+
+def test_three_arm_order_covers_all_permutations() -> None:
+    arms = ["base", "head", "null"]
+    assert [perf_ab.arm_order(arms, rep) for rep in range(6)] == [
+        ["base", "head", "null"],
+        ["head", "null", "base"],
+        ["null", "base", "head"],
+        ["null", "head", "base"],
+        ["head", "base", "null"],
+        ["base", "null", "head"],
+    ]
+    assert arms == ["base", "head", "null"]
+
+
+@pytest.mark.parametrize("count", [2, 3, 4, 5, 6])
+def test_arm_positions_are_balanced_with_additional_variants(count: int) -> None:
+    arms = [f"arm{i}" for i in range(count)]
+    for block in range(4):
+        orders = [perf_ab.arm_order(arms, rep) for rep in range(block * count, (block + 1) * count)]
+        assert all(sorted(order) == arms for order in orders)
+        for position in range(count):
+            assert sorted(order[position] for order in orders) == arms
+    assert perf_ab.arm_order(arms, 1) == perf_ab.arm_order(arms, 1 + 2 * count)
+
+
 def test_adaptive_reps_extend_only_the_inconclusive_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -520,6 +715,8 @@ def test_adaptive_reps_extend_only_the_inconclusive_rows(
     ) -> str:
         if cmd[0] == "git":
             return ""
+        if Path(cmd[0]).name == "perf_ab_latency":
+            return "1000\n"
         if cmd[1:2] == ["probe"]:
             return ""
         arm = "head" if "bin-head" in cmd[0] else "base"
@@ -538,6 +735,11 @@ def test_adaptive_reps_extend_only_the_inconclusive_rows(
 
     monkeypatch.setattr(perf_ab, "build", fake_build)
     monkeypatch.setattr(perf_ab, "run", noisy_run)
+
+    def run_measured(cmd: list[str], env: dict[str, str]) -> str:
+        return noisy_run(cmd, env=env)
+
+    monkeypatch.setattr(perf_ab, "run_measured", run_measured)
     monkeypatch.setattr(perf_ab, "cpu_model", lambda: "test CPU")
     summary = tmp_path / "summary.md"
     monkeypatch.setattr(
@@ -579,6 +781,10 @@ def test_json_artifact_holds_the_raw_samples(
     assert all(len(reps) == 1 and len(reps[0]) == len(data["fields"]) for reps in row.values())
     assert data["workloads"]["small/8 (control)"]["params"]["threads"] == 8
     assert data["variants"] == [{"arm": "head", "env": {}, "cppdefs": []}]
+    assert data["arm_order_protocol"] == {
+        "version": "rotating-reversed-blocks-v1",
+        "arms": ["base", "head", "null"],
+    }
 
 
 def test_force_kind_builds_every_row_with_frame_pointers(
@@ -594,10 +800,88 @@ def test_workflow_uploads_the_samples_and_takes_the_new_inputs() -> None:
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["null_arm"]["default"] is False
     assert inputs["max_reps"]["default"] == "0"
+    assert inputs["build_report_only"]["default"] is False
     step = ab_step(workflow)
     assert " $NULL_ARM " in step["run"] and '--max-reps "$MAX_REPS"' in step["run"]
     assert "--json perf-ab-samples.json" in step["run"]
+    assert "--preserve-builds perf-ab-builds" in step["run"]
     assert "${{" not in step["run"]
-    (upload,) = [s for s in workflow["jobs"]["ab"]["steps"] if "upload" in s.get("name", "")]
+    (upload,) = [
+        s
+        for s in workflow["jobs"]["ab"]["steps"]
+        if s.get("with", {}).get("name") == "perf-ab-samples"
+    ]
     assert upload["if"] == "always()"  # a failed sanity gate still leaves its samples
     assert upload["with"]["name"] == "perf-ab-samples"
+    (executables,) = [
+        s
+        for s in workflow["jobs"]["ab"]["steps"]
+        if s.get("with", {}).get("name") == "perf-ab-builds"
+    ]
+    assert executables["if"] == "always()"
+
+
+def test_p99_cannot_spend_memory_credit() -> None:
+    base, head = metric_columns((200.0, 100.0), (10.0, 10.0), (1000.0, 1000.0))
+    head["p99 operation ns"] = [1100.0] * 7
+    latency = next(
+        c for c in perf_ab_ledger.cells(base, head, 50.0) if c.metric == "p99 operation ns"
+    )
+    assert latency.allowance == 0
+    assert latency.verdict == "FAIL"
+
+
+def test_sanity_failure_saves_all_partial_arms_without_claiming_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def injected_failure(*_: object) -> list[str]:
+        return ["injected memory failure"]
+
+    monkeypatch.setattr(perf_ab, "sanity_failures", injected_failure)
+    out = tmp_path / "partial.json"
+    run_main(
+        tmp_path,
+        monkeypatch,
+        "--workloads",
+        "small/8",
+        "--reps",
+        "15",
+        "--null-arm",
+        "--json",
+        str(out),
+        expected_status=1,
+    )
+    data = json.loads(out.read_text())
+    assert data["complete"] is False
+    assert data["requested_reps"] == 15 and data["reps"] == 1
+    assert "injected memory failure" in data["failure"]
+    arms = data["samples"]["small/8 (control)"]
+    assert set(arms) == {"base", "head", "null"}
+    assert all(len(values) == 1 for values in arms.values())
+
+
+def test_budget_allows_only_a_step_that_fits() -> None:
+    assert perf_ab.budget_allows(100.0, 50.0, 0)  # no budget
+    assert perf_ab.budget_allows(4000.0, 800.0, 4800.0)
+    assert not perf_ab.budget_allows(4100.0, 800.0, 4800.0)
+
+
+def test_run_child_returns_output() -> None:
+    out, err = perf_ab.run_child(["sh", "-c", "echo 1 2; echo e >&2"], dict(os.environ))
+    assert out.split() == ["1", "2"] and err.strip() == "e"
+
+
+def test_run_child_failure_raises() -> None:
+    with pytest.raises(subprocess.CalledProcessError):
+        perf_ab.run_child(["sh", "-c", "exit 3"], dict(os.environ))
+
+
+def test_lockup_dumps_stacks_and_kills(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(perf_ab, "CHILD_TIMEOUT_S", 0.5)
+    started = time.monotonic()
+    with pytest.raises(perf_ab.ChildHung) as hung:
+        perf_ab.run_child(["sleep", "30"], dict(os.environ))
+    assert time.monotonic() - started < 25  # killed, not waited out
+    text = str(hung.value)
+    assert "lock-up" in text and "sleep 30" in text
+    assert "#0" in text or "thread " in text  # a gdb backtrace or the /proc fallback
