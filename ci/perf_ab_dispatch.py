@@ -44,13 +44,22 @@ def pool(datas: Sequence[dict[str, Any]]) -> dict[str, Any]:
     repetitions are concatenated. Anything else is refused."""
     if not datas:
         raise SystemExit("nothing to pool")
+    if any(data.get("complete") is False for data in datas):
+        raise SystemExit("incomplete perf-ab samples are diagnostic only; refusing to pool")
     first = datas[0]
     for other in datas[1:]:
-        for key in ("cpu", "base", "head"):
-            if other[key] != first[key]:
+        for key in (
+            "cpu",
+            "base",
+            "head",
+            "logical_cpus",
+            "latency_protocol",
+            "arm_order_protocol",
+        ):
+            if other.get(key) != first.get(key):
                 raise SystemExit(
                     f"refusing to pool runs with a different {key}: "
-                    f"{first[key]!r} vs {other[key]!r} (numbers from different hosts or commits "
+                    f"{first.get(key)!r} vs {other.get(key)!r} (numbers from different hosts or commits "
                     "are not comparable)"
                 )
         if other["fields"] != first["fields"] or other["variants"] != first["variants"]:
@@ -68,6 +77,10 @@ def pool(datas: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def ledger_lines(data: dict[str, Any]) -> list[str]:
     """The ledger table of every head arm in an artifact, computed from its raw samples."""
+    if data.get("complete") is False:
+        raise SystemExit("incomplete perf-ab samples are diagnostic only; no regression verdict")
+    if data["fields"] != [*perf_ab.METRICS, "ideal RSS MiB"]:
+        raise SystemExit("artifact fields do not match this harness; p99 must not be invented")
     lines: list[str] = []
     for variant in data["variants"]:
         rows: dict[str, tuple[float, list[perf_ab_ledger.Cell]]] = {}
@@ -85,6 +98,14 @@ def ledger_lines(data: dict[str, Any]) -> list[str]:
         f"{data['reps']} reps"
         + (f" (up to {data['max_reps']})" if data.get("max_reps", 0) > data["reps"] else "")
     )
+    if data.get("logical_cpus"):
+        header += (
+            f"; {data['logical_cpus']} logical CPUs, "
+            f"8-worker cells have {8 / data['logical_cpus']:.2f} workers per logical CPU "
+            "(above 1 means oversubscription)"
+        )
+    order = data.get("arm_order_protocol")
+    header += f"; arm order: {order['version'] if order else 'legacy alternating endpoints'}"
     return [header, *lines]
 
 
@@ -174,7 +195,9 @@ def main() -> int:
     parser.add_argument("--head-sha", default="")
     parser.add_argument("--reps", type=int, default=15)
     parser.add_argument("--max-reps", type=int, default=0)
-    parser.add_argument("--workloads", default="")
+    parser.add_argument(
+        "--workloads", default="", help="name substrings separated by '|'; '=name' matches exactly"
+    )
     parser.add_argument("--head-env", default="")
     parser.add_argument("--head-cppdefs", default="")
     parser.add_argument("--holes-report", action="store_true")

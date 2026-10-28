@@ -104,6 +104,7 @@ set(mi_sources
     src/options.c
     src/os.c
     src/page.c
+    src/page-retired-search.c
     src/page-map.c
     src/page-holes.c
     src/large-span.c
@@ -491,7 +492,8 @@ if(MI_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "AppleClang|Clang|GNU" AND
   foreach(f IN ITEMS src/profile.c src/profile-stack.c src/profile-maps.c src/memory-events.c
                       src/dhat.c src/dhat-stack.c src/scavenger.c src/page-holes.c
                       src/purge-all.c src/heap-snapshot.c src/heap-dump.c src/diagnostic.c
-                      src/arena-layout.c src/event-counters.c src/large-span.c)
+                      src/arena-layout.c src/event-counters.c src/large-span.c
+                      src/page-retired-search.c)
     if(f IN_LIST mi_sources)
       list(APPEND mi_strict_fork_sources ${f})
     endif()
@@ -1569,6 +1571,21 @@ if (MI_BUILD_TESTS)
       add_test(NAME test-purge-holes-off COMMAND mimalloc-test-purge-holes)
       set_tests_properties(test-purge-holes-off PROPERTIES TIMEOUT 600
                            ENVIRONMENT "MIMALLOC_PURGE_HOLES=0")
+      # #493's serial-thread handoff must have no concurrent scanner: the scanner's
+      # temporary ownership makes a reserved page unavailable without releasing it.
+      # Use a fresh process, preserving both same-page and zero-new-pages assertions.
+      # The existing purge-holes tests retain all background release cases above.
+      add_test(NAME test-reserved-page-reuse COMMAND mimalloc-test-purge-holes --serial-reserve-reuse)
+      set_tests_properties(test-reserved-page-reuse PROPERTIES TIMEOUT 600
+                           ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=1")
+      add_test(NAME test-reserved-page-reuse-off COMMAND mimalloc-test-purge-holes --serial-reserve-reuse)
+      set_tests_properties(test-reserved-page-reuse-off PROPERTIES TIMEOUT 600
+                           ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=0")
+      # #618: the #478 owner-side pacing case counts process-wide discards, so a background
+      # scavenger sweep during the measured thread's life polluted it. Fresh process, no scanner.
+      add_test(NAME test-new-thread-pacing COMMAND mimalloc-test-purge-holes --new-thread-pacing)
+      set_tests_properties(test-new-thread-pacing PROPERTIES TIMEOUT 600
+                           ENVIRONMENT "MIMALLOC_SCAVENGER=0;MIMALLOC_PURGE_HOLES=1")
     endif()
 
     # test-purge-zero: imported from oven-sh/mimalloc @ 942b8342, MIT (issue #272 /

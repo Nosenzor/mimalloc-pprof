@@ -29,14 +29,18 @@ ci/perf_ab.c); the text is appended to the table, one collapsed block per row an
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import math
 import os
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -46,6 +50,8 @@ import perf_ab_stats
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAGS = [
+    "-DCMAKE_C_COMPILER=soldr",
+    "-DCMAKE_C_COMPILER_ARG1=cc",
     "-DCMAKE_BUILD_TYPE=Release",
     "-DMI_BUILD_SHARED=OFF",
     "-DMI_BUILD_OBJECT=OFF",
@@ -196,6 +202,7 @@ METRICS = (
     "RSS 0.5 s after drain MiB",
     "RSS at release bound MiB",
     "release ms",
+    "p99 operation ns",
 )
 IN_MIB = {"peak RSS MiB", "RSS 0.5 s after drain MiB", "RSS at release bound MiB"}
 # ci/perf_ab.c prints one more number (#573): the RSS floor -- the RSS before the work plus the
@@ -212,7 +219,98 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = No
 
 def run_stderr(cmd: list[str], env: dict[str, str]) -> str:
     """#529: a --holes-report child; its report is on stderr, its stdout line is not used."""
-    return subprocess.run(cmd, env=env, check=True, capture_output=True, text=True).stderr
+    return run_child(cmd, env)[1]
+
+
+# A measured child takes under 10 s (run 39897074404: 858 children, 5.4-9.8 s each). One that
+# outlives this is hung, not slow: dump its threads and fail, rather than let it silently eat
+# the job's 90 minutes and leave no evidence.
+CHILD_TIMEOUT_S = float(os.environ.get("PERF_AB_CHILD_TIMEOUT_S", "180"))
+STACK_DUMP_TIMEOUT_S = 60
+PR_SET_PTRACER = 0x59616D61  # Yama: let a non-ancestor (gdb) attach to this child
+PR_SET_PTRACER_ANY = -1
+
+
+class ChildHung(RuntimeError):
+    """A measured child outlived CHILD_TIMEOUT_S; the message carries its thread stacks."""
+
+
+def allow_ptrace() -> None:
+    """preexec_fn: under Yama ptrace_scope=1 only an ancestor may attach, and gdb is a sibling."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(
+            PR_SET_PTRACER, ctypes.c_ulong(PR_SET_PTRACER_ANY), 0, 0, 0
+        )
+    except (OSError, AttributeError):
+        pass  # no Yama or no libc prctl: gdb may still attach, else the /proc fallback reports
+
+
+def proc_stacks(pid: int) -> str:
+    """Fallback without gdb: each thread's state, wait channel and (if readable) kernel stack."""
+    out: list[str] = []
+    for task in sorted(Path(f"/proc/{pid}/task").glob("*")):
+        parts = [f"thread {task.name}"]
+        for name in ("comm", "wchan", "stack"):
+            with contextlib.suppress(OSError):
+                parts.append(f"{name}: {(task / name).read_text().strip()}")
+        with contextlib.suppress(OSError, IndexError):
+            parts.append(f"state: {(task / 'stat').read_text().split(')')[1].split()[0]}")
+        out.append("\n  ".join(parts))
+    return "\n".join(out) or f"(no /proc/{pid}/task)"
+
+
+def dump_stacks(pid: int) -> str:
+    """Every thread's user-space backtrace via gdb, or the /proc view when gdb cannot attach."""
+    gdb = shutil.which("gdb")
+    if gdb:
+        cmd = [gdb, "-nx", "-batch", "-p", str(pid), "-ex", "thread apply all bt"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=STACK_DUMP_TIMEOUT_S)
+            if "#0" in res.stdout:
+                return res.stdout
+            note = f"gdb could not attach (exit {res.returncode}): {res.stderr.strip()[-400:]}"
+        except subprocess.TimeoutExpired:
+            note = f"gdb did not finish within {STACK_DUMP_TIMEOUT_S} s"
+    else:
+        note = "gdb not installed"
+    return f"{note}\n{proc_stacks(pid)}"
+
+
+def run_child(cmd: list[str], env: dict[str, str]) -> tuple[str, str]:
+    """Run one measured child under the lock-up detector; returns (stdout, stderr)."""
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        preexec_fn=allow_ptrace,
+    )
+    try:
+        out, err = proc.communicate(timeout=CHILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        stacks = dump_stacks(proc.pid)
+        proc.kill()
+        out, err = proc.communicate()
+        raise ChildHung(
+            f"lock-up: `{' '.join(cmd)}` still running after {CHILD_TIMEOUT_S:g} s "
+            f"(pid {proc.pid}); thread stacks:\n{stacks}\nchild stderr tail:\n{err[-2000:]}"
+        ) from None
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, out, err)
+    return out, err
+
+
+def run_measured(cmd: list[str], env: dict[str, str]) -> str:
+    """A timed or latency child's stdout, under the lock-up detector."""
+    return run_child(cmd, env)[0]
+
+
+def budget_allows(elapsed_s: float, step_s: float, budget_s: float) -> bool:
+    """--budget-minutes: start another adaptive step only if it ends inside the budget."""
+    return budget_s <= 0 or elapsed_s + step_s <= budget_s
 
 
 def holes_rows(reports: dict[tuple[str, str], str]) -> list[str]:
@@ -261,6 +359,7 @@ def build(
     lib = next(out.glob("libmimalloc*.a"))
     run(
         [
+            "soldr",
             "cc",
             "-O2",
             *(["-DPERF_AB_DIAGNOSTIC=1"] if diagnostic else []),
@@ -273,6 +372,24 @@ def build(
             str(exe),
         ]
     )
+    if not diagnostic:
+        # #585: a separate replay samples operation latency, leaving every timed
+        # throughput/RSS executable free of latency clocks and buffers.
+        run(
+            [
+                "soldr",
+                "cc",
+                "-O2",
+                "-DPERF_AB_LATENCY=1",
+                "-I",
+                str(tree / "include"),
+                str(ROOT / "ci/perf_ab.c"),
+                str(lib),
+                "-lpthread",
+                "-o",
+                str(exe.with_name("perf_ab_latency")),
+            ]
+        )
     return exe
 
 
@@ -281,6 +398,15 @@ def build(
 # release bound +1989% and the job still passed); noise on a 1-rep sample is far below this.
 SANITY_FACTOR = 1.5
 SANITY_SLACK_MIB = 8.0
+
+
+def sanity_reference(base: list[float], null: list[float] | None) -> list[float]:
+    """The first-repetition sample head is screened against (#620).
+
+    With a null arm, base's own spread is measured: take the worse of the two base runs per
+    metric, so a bimodal base sample cannot abort a campaign the null arm reproduces.
+    """
+    return base if null is None else [max(b, n) for b, n in zip(base, null)]
 
 
 def sanity_failures(
@@ -346,13 +472,19 @@ def parse_cppdefs(text: str) -> list[str]:
 
 
 def select(pattern: str) -> dict[str, tuple[str, Params]]:
-    """The rows whose name contains one of the '|'-separated alternatives; by default the gating
-    rows only (the diagnostic rows must be named)."""
+    """Match '|'-separated substrings, or an exact name when a term starts with '='.
+
+    By default select gating rows only; diagnostic rows must be named.
+    """
     if not pattern:
         return dict(WORKLOADS)
     alternatives = pattern.split("|")
     rows = {**WORKLOADS, **DIAGNOSTIC_WORKLOADS}
-    return {name: w for name, w in rows.items() if any(a in name for a in alternatives)}
+    return {
+        name: w
+        for name, w in rows.items()
+        if any(name == a[1:] if a.startswith("=") else a in name for a in alternatives)
+    }
 
 
 def probe_sizes(workloads: dict[str, tuple[str, Params]], cppdefs: list[str]) -> list[int]:
@@ -390,6 +522,22 @@ def probe_rows(sizes: list[int], base: dict[int, str], head: dict[int, str]) -> 
     return rows
 
 
+ARM_ORDER_VERSION = "rotating-reversed-blocks-v1"
+
+
+def arm_order(arms: list[str], rep: int) -> list[str]:
+    """Balance execution positions in each block, reversing alternate blocks.
+
+    Reversing a three-arm sequence alone leaves its middle arm in the same
+    position every time. Rotations give every arm every position; reversing
+    alternate blocks also reverses the adjacent pairs. With more than three
+    arms this balances positions, not every possible carryover pairing.
+    """
+    block, shift = divmod(rep, len(arms))
+    ordered = arms if block % 2 == 0 else list(reversed(arms))
+    return ordered[shift:] + ordered[:shift]
+
+
 def header(
     base: str, head: str, head_env: str, cppdefs: list[str], cpu: str, reps: int
 ) -> list[str]:
@@ -404,10 +552,16 @@ def header(
             "",
         ]
     rows += [
-        arms + f" on {cpu}, {reps} paired reps, alternating order. "
+        arms + f" on {cpu}, {reps} paired reps, order protocol {ARM_ORDER_VERSION}. "
         "Median base -> head, then median paired difference [95% sign-test interval]; "
         "**bold** when the interval excludes 0 (and, with a null arm, exceeds its noise floor) "
         "on a rule-12 metric.",
+        f"Host exposes {logical_cpus()} logical CPUs; an 8-worker row has "
+        f"{8 / logical_cpus():.2f} workers per logical CPU. Ratios above 1 are "
+        "oversubscription, not scaling on dedicated cores.",
+        "p99 is the nearest-rank percentile of sampled stream operations in a separate "
+        "replay (free or replace, including page touches); sampling buffers and clocks "
+        "are absent from the throughput/RSS runs.",
         "",
         "| workload | " + " | ".join(METRICS) + " |",
         "|---|" + "---|" * len(METRICS),
@@ -422,6 +576,10 @@ def cpu_model() -> str:
         if line.startswith("model name"):
             return line.split(":", 1)[1].strip()
     return "unknown CPU"
+
+
+def logical_cpus() -> int:
+    return len(os.sched_getaffinity(0))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -468,7 +626,17 @@ def parse_variants(head_env: str, head_cppdefs: str) -> list[Variant]:
 
 def measure(exe: Path, params: Params, env: dict[str, str], bound_ms: int) -> list[float]:
     """One child run: the METRICS, then the RSS floor; byte counts in MiB."""
-    values = list(map(float, run([str(exe), *map(str, params), str(bound_ms)], env=env).split()))
+    values = list(
+        map(float, run_measured([str(exe), *map(str, params), str(bound_ms)], env).split())
+    )
+    latency = float(
+        run_measured(
+            [str(exe.with_name("perf_ab_latency")), *map(str, params), str(bound_ms)], env
+        ).strip()
+    )
+    if not math.isfinite(latency) or latency <= 0:
+        raise ValueError(f"invalid p99 latency: {latency}")
+    values.insert(METRICS.index("p99 operation ns"), latency)
     for index, metric in enumerate(METRICS):
         if metric in IN_MIB:
             values[index] /= 2**20
@@ -571,6 +739,31 @@ def render_variant(
     return rows, not late
 
 
+def preserve_builds(exes: dict[tuple[str, str], Path], output: Path) -> None:
+    """Keep the exact children before measurements can be forcibly terminated."""
+    output.mkdir(parents=True, exist_ok=False)
+    digests: dict[str, str] = {}
+    for (arm, kind), exe in sorted(exes.items()):
+        if arm == NULL_ARM:  # aliases base's executable
+            continue
+        destination = output / arm / kind
+        destination.mkdir(parents=True)
+        for source in (exe, exe.with_name("perf_ab_latency")):
+            target = destination / source.name
+            shutil.copy2(source, target)
+            digests[str(target.relative_to(output))] = hashlib.sha256(
+                target.read_bytes()
+            ).hexdigest()
+    (output / "sha256.json").write_text(json.dumps(digests, indent=2) + "\n")
+
+
+def save_artifact(output: Path, data: dict[str, Any]) -> None:
+    """An interrupted write leaves the previous complete JSON checkpoint readable."""
+    pending = output.with_name(output.name + ".tmp")
+    pending.write_text(json.dumps(data, indent=1) + "\n")
+    pending.replace(output)
+
+
 def artifact(
     args: argparse.Namespace,
     variants: list[Variant],
@@ -589,6 +782,19 @@ def artifact(
         "base": {"ref": args.base, "sha": rev(args.base)},
         "head": {"ref": args.head, "sha": rev(args.head)},
         "cpu": cpu,
+        "logical_cpus": logical_cpus(),
+        "arm_order_protocol": {
+            "version": ARM_ORDER_VERSION,
+            "arms": ["base", *(v.arm for v in variants), *([NULL_ARM] if args.null_arm else [])],
+        },
+        "latency_protocol": {
+            "version": "sampled-stream-operation-v2",
+            "percentile": 99,
+            "replay": "separate executable; timing/RSS executable has no sampling",
+            "operation": "free or replace, including page touches",
+            "sampling": "power-of-two stride targeting at most 4096 samples per worker",
+            "drain": "replay exits after the drain; no release-bound RSS sampling window",
+        },
         "reps": args.reps,
         "max_reps": args.max_reps,
         "release_bound_ms": bound_ms,
@@ -628,10 +834,15 @@ def main() -> int:
     parser.add_argument(
         "--workloads",
         default="",
-        help="only the workloads whose name contains this text ('|' separates alternatives); "
+        help="workload name substrings ('|' separates alternatives; '=name' matches exactly); "
         f"the diagnostic rows ('{DIAGNOSTIC_TAG}') run only when named",
     )
     parser.add_argument("--summary", type=Path)
+    parser.add_argument(
+        "--preserve-builds",
+        type=Path,
+        help="copy the exact timing/latency executables and SHA-256 digests here after measurements",
+    )
     parser.add_argument(
         "--json",
         type=Path,
@@ -663,11 +874,20 @@ def main() -> int:
         f"{SANITY_FACTOR}x base + {SANITY_SLACK_MIB:g} MiB (#573)",
     )
     parser.add_argument(
+        "--budget-minutes",
+        type=float,
+        default=0,
+        help="wall-clock budget for the whole run (0: none). --max-reps adds another step only "
+        "when its projected time fits, so the run finishes with complete, verdict-eligible data "
+        "instead of being killed by the job timeout with every row one rep short",
+    )
+    parser.add_argument(
         "--force-kind",
         choices=sorted(BUILDS),
         help="build every row with this BUILDS kind (e.g. fp: frame pointers for perf/callers, #573 A4)",
     )
     args = parser.parse_args()
+    started = time.monotonic()
     variants = parse_variants(args.head_env, args.head_cppdefs)
     workloads = select(args.workloads)
     if not workloads:
@@ -682,12 +902,14 @@ def main() -> int:
     cpu = cpu_model()
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
+        exes: dict[tuple[str, str], Path] = {}
         try:
             wanted: set[str] = {k for k, _ in workloads.values()}
             if args.holes_report:
                 wanted.add(HOLES_KIND)
             kinds = sorted(wanted)
-            exes = {("base", kind): build("base", args.base, work, kind, []) for kind in kinds}
+            for kind in kinds:
+                exes[("base", kind)] = build("base", args.base, work, kind, [])
             for v in variants:
                 for kind in kinds:
                     exes[(v.arm, kind)] = build(
@@ -704,27 +926,71 @@ def main() -> int:
             samples: dict[tuple[str, str], list[list[float]]] = {
                 (w, a): [] for w in workloads for a in arms
             }
+            # Cache metadata once; the artifact holds the live sample lists. Keep
+            # checkpoints ineligible for a verdict until the entire run finishes.
+            checkpoint = (
+                artifact(args, variants, workloads, samples, bound_ms, cpu) if args.json else None
+            )
+            if args.json and checkpoint is not None:
+                checkpoint["complete"] = False
+                save_artifact(args.json, checkpoint)
+            if args.preserve_builds:
+                preserve_builds(exes, args.preserve_builds)
+
+            row_secs: dict[str, list[float]] = {w: [] for w in workloads}
 
             def run_rep(rep: int, rows: Iterable[str]) -> None:
                 for workload in rows:
                     kind, params = workloads[workload]
-                    for arm in arms if rep % 2 == 0 else reversed(arms):
+                    t0 = time.monotonic()
+                    for arm in arm_order(arms, rep):
                         env = {**os.environ, **BUILDS[kind][1], **env_of[arm]}
-                        samples[(workload, arm)].append(
-                            measure(exes[(arm, kind)], params, env, bound_ms)
-                        )
+                        print(f"repetition {rep + 1}: {workload} [{arm}]", flush=True)
+                        try:
+                            sample = measure(exes[(arm, kind)], params, env, bound_ms)
+                        except ChildHung as hung:
+                            print(hung, flush=True)
+                            if args.json:
+                                partial = artifact(
+                                    args, variants, workloads, samples, bound_ms, cpu
+                                )
+                                partial.update(complete=False, failure=str(hung))
+                                save_artifact(args.json, partial)
+                            if args.summary:
+                                args.summary.write_text(f"```\n{hung}\n```\n")
+                            raise
+                        samples[(workload, arm)].append(sample)
+                        if args.json and checkpoint is not None:
+                            save_artifact(args.json, checkpoint)
+                    row_secs[workload].append(time.monotonic() - t0)
 
             for rep in range(args.reps):
                 run_rep(rep, workloads)
                 if rep == 0 and not args.no_sanity_gate:
                     broken: list[str] = []
+                    reference = {
+                        w: sanity_reference(
+                            samples[(w, "base")][0],
+                            samples[(w, NULL_ARM)][0] if args.null_arm else None,
+                        )
+                        for w in workloads
+                    }
                     for arm in head_arms:
-                        first = {(w, "base"): samples[(w, "base")][0] for w in workloads}
+                        first = {(w, "base"): reference[w] for w in workloads}
                         first |= {(w, "head"): samples[(w, arm)][0] for w in workloads}
                         broken += [f"[{arm}] {m}" for m in sanity_failures(first, workloads)]
                     if broken:  # fail in minutes, not after the whole run (#573)
                         message = "sanity gate (first repetition, #573):\n  " + "\n  ".join(broken)
                         print(message)
+                        if args.json:
+                            partial = artifact(args, variants, workloads, samples, bound_ms, cpu)
+                            partial.update(
+                                complete=False,
+                                failure=message,
+                                requested_reps=args.reps,
+                                reps=rep + 1,
+                            )
+                            save_artifact(args.json, partial)
                         if args.summary:
                             args.summary.write_text(message + "\n")
                         return 1
@@ -747,6 +1013,19 @@ def main() -> int:
                 ]
                 if not pending:
                     break
+                step = min(ADAPTIVE_STEP, args.max_reps - done)
+                step_s = step * sum(max(row_secs[w]) for w in pending)
+                elapsed = time.monotonic() - started
+                if not budget_allows(elapsed, step_s, args.budget_minutes * 60):
+                    print(
+                        f"budget: stopping at {done} reps; {len(pending)} row(s) still inconclusive, "
+                        f"another step needs ~{step_s:.0f} s after {elapsed:.0f} s of "
+                        f"{args.budget_minutes:g} min",
+                        flush=True,
+                    )
+                    if checkpoint is not None:
+                        checkpoint["stopped_by_budget"] = done
+                    break
                 for rep in range(done, min(done + ADAPTIVE_STEP, args.max_reps)):
                     run_rep(rep, pending)
                 done = min(done + ADAPTIVE_STEP, args.max_reps)
@@ -760,11 +1039,12 @@ def main() -> int:
             data = (
                 artifact(args, variants, workloads, samples, bound_ms, cpu) if args.json else None
             )
+            if args.json and data is not None:
+                data["complete"] = True
+                save_artifact(args.json, data)
         finally:  # unregister the trees while they still exist: a prune here would find nothing to prune
             for tree in work.glob("src-*"):
                 run(["git", "worktree", "remove", "--force", str(tree)], cwd=ROOT)
-    if args.json and data is not None:
-        args.json.write_text(json.dumps(data, indent=1) + "\n")
     rows: list[str] = []
     held = True
     for variant in variants:
